@@ -5,7 +5,19 @@ use std::{
 };
 
 fn main() {
-    build_graphql_if_needed();
+    println!("cargo:rerun-if-env-changed=RINDEXER_GRAPHQL_PREBUILT");
+    if let Some(prepared) = env::var_os("RINDEXER_GRAPHQL_PREBUILT") {
+        let prepared = PathBuf::from(prepared);
+        assert!(
+            prepared.is_file(),
+            "RINDEXER_GRAPHQL_PREBUILT must name a regular file; no automatic fallback is allowed"
+        );
+        let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR not set"));
+        create_embedded_binary(&prepared, &out_dir);
+        println!("cargo:rerun-if-changed={}", prepared.display());
+    } else {
+        build_graphql_if_needed();
+    }
     build_blockclock_if_needed();
 }
 
