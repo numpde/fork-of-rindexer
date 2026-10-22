@@ -31,6 +31,12 @@ if ! test -f "$RINDEXER_GRAPHQL_PREBUILT" || ! test -f /build/graphql/input.sha2
 fi
 case "$1" in
   compile) exec cargo nextest run --frozen -p rindexer --test postgres_bytea_array --no-run ;;
+  dynamic-bytes-array)
+    # Exercise the decoder/converter regression only; no database is required.
+    exec timeout --signal=TERM --kill-after=20s 900s cargo nextest run --frozen \
+      -p rindexer --lib \
+      -E 'test(/^database::dynamic_bytes_array_tests::abi_dynamic_bytes_array_preserves_elements$/)' --no-capture
+    ;;
   postgres)
     : "${RINDEXER_TEST_POSTGRES_URL:?missing explicit PostgreSQL fixture}"
     exec timeout --signal=TERM --kill-after=20s 900s cargo nextest run --frozen -p rindexer --test postgres_bytea_array --test-threads 2 --no-capture ;;

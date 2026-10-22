@@ -1,6 +1,6 @@
 # Development entrypoints. Container preparation, copied inputs and lifecycle are
 # owned here; Compose defines services and containers/development/run.sh runs
-# commands inside them.
+# commands inside them. The /native regression target uses installed build tools.
 SHELL := /bin/bash
 .SHELLFLAGS := -euo pipefail -c
 # Each recipe needs one shell so setup variables and cleanup traps survive until
@@ -10,7 +10,8 @@ SHELL := /bin/bash
 # Serialize this Make invocation; run.sh separately locks the shared build cache.
 .NOTPARALLEL:
 .PHONY: help dev/image/build deps/install deps/locks/update deps/check \
-        tests/checks tests/posture rust/format/check rust/checks tests/postgres tests ci
+        tests/checks tests/posture rust/format/check rust/checks tests/postgres \
+        tests/dynamic-bytes-array/native tests/dynamic-bytes-array/docker tests ci
 
 # Rendering, execution and teardown always address the same file and project.
 compose = docker compose --env-file containers/development/images.env \
@@ -246,7 +247,19 @@ tests/postgres: tests/posture ## Run PostgreSQL round trips and fixture isolatio
 	$(compose) up -d --no-build --pull never --wait --wait-timeout 90 postgres
 	$(compose) run --rm --no-deps -T postgres-tests postgres
 
-# These aggregates cover only the migrated slice, not the full upstream suite.
+# Run only the loss-of-elements regression. A nonzero result is expected while
+# the production converter remains unfixed; neither target needs PostgreSQL.
+tests/dynamic-bytes-array/native: ## Run the dynamic bytes-array red test with native tools
+	@cargo nextest run -p rindexer --lib \
+	  -E 'test(/^database::dynamic_bytes_array_tests::abi_dynamic_bytes_array_preserves_elements$$/)' --no-capture
+
+# Use prepared images, without image acquisition or database startup.
+tests/dynamic-bytes-array/docker: tests/posture ## Run the dynamic bytes-array red test in the prepared offline container
+	@$(call offline_runner,$$dependency_image)
+	$(compose) run --rm --no-deps -T offline dynamic-bytes-array
+
+# These aggregates cover only the migrated slice, not the upstream workspace or
+# ABI regression library tests. The focused red-test targets stay separate.
 tests: tests/checks tests/posture tests/postgres ## Run the currently migrated container suites only
 
 ci: rust/checks tests ## Validate the first container-development slice (not all upstream suites)
