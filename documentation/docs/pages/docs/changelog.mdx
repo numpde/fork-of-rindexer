@@ -16,6 +16,7 @@
 
 ### Bug fixes
 -------------------------------------------------
+- fix: historical backfill with `config.fetch_concurrency` greater than one now keeps delayed workers in their range plan's generation. A worker scheduled after rollback can no longer present an obsolete later range as current and checkpoint ahead of unfinished recovery history.
 - fix: a native-transfer publisher behind the network fork now keeps its earlier block-request position when consuming a reorg notification or detecting a reorg itself, so unqueued pre-fork blocks are still requested.
 - fix: event-stream reorg recovery now refetches from the earlier of the fork and the stream's first unfinished callback range, including buffered pre-fork logs discarded by the generation fence. Historical, live and dependency event processing retain their own completion boundaries instead of jumping lagging streams to the fork. Previously skipped history still needs reviewed repair.
 - fix: PostgreSQL reorg rollback now preserves a stream checkpoint that is already below the fork instead of advancing it to the rollback boundary. Existing gaps created by earlier versions require review or reindexing.

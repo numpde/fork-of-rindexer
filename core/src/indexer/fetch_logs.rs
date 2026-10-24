@@ -85,6 +85,10 @@ pub fn fetch_logs_stream(
     tokio::spawn(async move {
         let mut current_filter = config.to_event_filter().unwrap();
         reorgs.start_at(current_filter.from_block().to::<u64>());
+        let (backfill_generation, rewind) = reorgs.snapshot();
+        if let Some(resume_from) = rewind {
+            current_filter = current_filter.set_from_block(U64::from(resume_from));
+        }
 
         let snapshot_to_block = current_filter.to_block();
         let from_block = current_filter.from_block();
@@ -137,12 +141,17 @@ pub fn fetch_logs_stream(
                 let dispatcher_controller = Arc::clone(&ADAPTIVE_CONCURRENCY);
                 let dispatcher_active = Arc::clone(&active_workers);
                 let dispatcher_notify = Arc::clone(&worker_done_notify);
+                let dispatcher_network = config.network_contract().network.clone();
                 let dispatcher_handle = tokio::spawn(async move {
                     let mut next_from = from_block;
                     let mut sequence_id: u64 = 0;
 
                     while next_from <= snapshot_to_block {
-                        if !is_running() || dispatcher_cancel.is_cancelled() {
+                        if !is_running()
+                            || dispatcher_cancel.is_cancelled()
+                            || crate::indexer::reorg::reorg_generation(&dispatcher_network)
+                                != backfill_generation
+                        {
                             break;
                         }
 
@@ -173,6 +182,7 @@ pub fn fetch_logs_stream(
                             .set_to_block(sub_to);
 
                         let worker_state = WorkerState {
+                            reorg_generation: backfill_generation,
                             sequence_id,
                             filter: worker_filter,
                             max_block_range_limitation: original_max_limit,
@@ -707,6 +717,8 @@ impl ReorderBuffer {
 }
 
 struct WorkerState {
+    // The range plan predates worker scheduling and owns this generation.
+    reorg_generation: u64,
     sequence_id: u64,
     filter: RindexerEventFilter,
     max_block_range_limitation: Option<U64>,
@@ -776,8 +788,8 @@ async fn parallel_worker(
 
     // Hoist per-worker constants out of the fetch loop — each one costs
     // heap allocations or Arc refcount bumps on every iteration.
-    let reorg_generation =
-        crate::indexer::reorg::reorg_generation(&config.network_contract().network);
+    let reorg_generation = state.reorg_generation;
+    let network = config.network_contract().network.clone();
     let timestamps = config.timestamps();
     let block_clock = config.network_contract().block_clock.clone();
     let cached_provider = Arc::clone(&config.network_contract().cached_provider);
@@ -792,7 +804,10 @@ async fn parallel_worker(
     let mut last_range: Option<(U64, U64)> = None;
 
     while current_filter.from_block() <= sub_range_end {
-        if !is_running() || cancel_token.is_cancelled() {
+        if !is_running()
+            || cancel_token.is_cancelled()
+            || crate::indexer::reorg::reorg_generation(&network) != reorg_generation
+        {
             break;
         }
 
@@ -2869,6 +2884,7 @@ mod tests {
         // The range was planned before rollback, but its worker was not scheduled yet.
         let planned_generation = crate::indexer::reorg::reorg_generation("ethereum");
         let state = WorkerState {
+            reorg_generation: planned_generation,
             sequence_id: 0,
             filter: RindexerEventFilter::empty_for_test()
                 .set_from_block(U64::from(1))
@@ -2916,7 +2932,7 @@ mod tests {
         )
         .await;
         let batch = rx.recv().await.unwrap();
-        assert!(!batch.results.is_empty());
+        assert!(batch.is_final, "an obsolete worker must finish so recovery can begin");
         for result in batch.results {
             assert_eq!(
                 result.unwrap().reorg_generation,
