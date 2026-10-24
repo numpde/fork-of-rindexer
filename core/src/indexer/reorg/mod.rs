@@ -35,20 +35,25 @@ pub use window::BlockChainWindow;
 static EVENT_WRITER_BARRIERS: LazyLock<StdMutex<HashMap<String, Arc<RwLock<()>>>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 
-type PendingRewind = StdMutex<Option<u64>>;
+#[derive(Default)]
+struct StreamRecovery {
+    next_unfinished: Option<u64>,
+    pending_rewind: Option<u64>,
+}
 #[derive(Default)]
 struct NetworkRecovery {
     generation: u64,
-    subscribers: Vec<Weak<PendingRewind>>,
+    subscribers: Vec<Weak<StdMutex<StreamRecovery>>>,
 }
 static NETWORK_RECOVERY: LazyLock<StdMutex<HashMap<String, NetworkRecovery>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 
-/// Each fetcher consumes its own pending rewind. Coalescing to the earliest fork
-/// preserves recovery when several rollbacks finish before a slow fetcher polls.
+/// Each fetcher consumes its own recovery boundary. Include unfinished queued
+/// work, and retain the earliest required block across several rollbacks.
+#[derive(Clone)]
 pub(crate) struct ReorgSubscription {
     network: String,
-    pending: Arc<PendingRewind>,
+    position: Arc<StdMutex<StreamRecovery>>,
 }
 
 impl ReorgSubscription {
@@ -57,8 +62,29 @@ impl ReorgSubscription {
     pub(crate) fn snapshot(&self) -> (u64, Option<u64>) {
         let recovery = NETWORK_RECOVERY.lock().unwrap_or_else(|e| e.into_inner());
         let generation = recovery.get(&self.network).map_or(0, |state| state.generation);
-        let rewind = self.pending.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let rewind = self.position.lock().unwrap_or_else(|e| e.into_inner()).pending_rewind.take();
         (generation, rewind)
+    }
+
+    /// Fetching ahead does not finish a range. Only ordered callback completion
+    /// advances this boundary, so discarded queued work stays scheduled on rollback.
+    pub(crate) fn start_at(&self, first_unfinished: u64) {
+        let mut position = self.position.lock().unwrap_or_else(|e| e.into_inner());
+        if position.next_unfinished.is_none() {
+            position.next_unfinished = Some(first_unfinished);
+            if let Some(rewind) = position.pending_rewind.as_mut() {
+                *rewind = (*rewind).min(first_unfinished);
+            }
+        }
+    }
+
+    /// The caller must hold the current generation's writer read guard so an old
+    /// callback cannot raise this boundary after rollback has lowered it.
+    pub(crate) fn completed_through(&self, block: u64) {
+        let mut position = self.position.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(next) = position.next_unfinished.as_mut() {
+            *next = (*next).max(block.saturating_add(1));
+        }
     }
 
     pub(crate) fn take_rewind(&self) -> Option<u64> {
@@ -77,12 +103,12 @@ pub fn reorg_generation(network: &str) -> u64 {
 }
 
 pub(crate) fn subscribe_reorgs(network: &str) -> ReorgSubscription {
-    let pending = Arc::new(StdMutex::new(None));
+    let position = Arc::new(StdMutex::new(StreamRecovery::default()));
     let mut recovery = NETWORK_RECOVERY.lock().unwrap_or_else(|e| e.into_inner());
     let state = recovery.entry(network.to_string()).or_default();
     state.subscribers.retain(|entry| entry.strong_count() > 0);
-    state.subscribers.push(Arc::downgrade(&pending));
-    ReorgSubscription { network: network.to_string(), pending }
+    state.subscribers.push(Arc::downgrade(&position));
+    ReorgSubscription { network: network.to_string(), position }
 }
 
 fn publish_rewind(network: &str, fork_point: u64) {
@@ -91,8 +117,13 @@ fn publish_rewind(network: &str, fork_point: u64) {
     state.generation = state.generation.checked_add(1).expect("reorg generation exhausted");
     state.subscribers.retain(|entry| {
         let Some(pending) = entry.upgrade() else { return false };
-        let mut rewind = pending.lock().unwrap_or_else(|e| e.into_inner());
-        *rewind = Some(rewind.map_or(fork_point, |old| old.min(fork_point)));
+        let mut position = pending.lock().unwrap_or_else(|e| e.into_inner());
+        let resume = position.next_unfinished.map_or(fork_point, |next| next.min(fork_point));
+        if position.next_unfinished.is_some() {
+            position.next_unfinished = Some(resume);
+        }
+        position.pending_rewind =
+            Some(position.pending_rewind.map_or(resume, |old| old.min(resume)));
         true
     });
 }
@@ -378,6 +409,21 @@ pub fn reorg_safe_distance_for_chain(chain_id: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stream_recovery_uses_completed_callbacks_instead_of_fetched_ranges() {
+        let stream = super::subscribe_reorgs("completed-prefix-recovery");
+        stream.start_at(81);
+        let dispatcher = stream.clone();
+        super::publish_rewind("completed-prefix-recovery", 98);
+        assert_eq!(stream.take_rewind(), Some(81), "buffered work is unfinished");
+        dispatcher.completed_through(90);
+        super::publish_rewind("completed-prefix-recovery", 98);
+        assert_eq!(stream.take_rewind(), Some(91), "completed prefix need not be refetched");
+        dispatcher.completed_through(100);
+        super::publish_rewind("completed-prefix-recovery", 98);
+        assert_eq!(stream.take_rewind(), Some(98), "completed history is rewound to the fork");
+    }
+
     #[test]
     fn fetchers_consume_rewinds_independently_and_keep_the_earliest_fork() {
         let a = super::subscribe_reorgs("coalesced-rewinds");

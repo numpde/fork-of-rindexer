@@ -112,13 +112,15 @@ async fn process_event_logs(
     };
 
     let callback_permits = Arc::new(Semaphore::new(callback_concurrency));
-    let mut checkpoints = CallbackCheckpoints::default();
+    let reorgs = crate::indexer::reorg::subscribe_reorgs(&config.network_contract().network);
+    let mut checkpoints = CallbackCheckpoints::with_recovery(reorgs.clone());
 
     let mut logs_stream = fetch_logs_stream(
         Arc::clone(&config),
         force_no_live_indexing,
         reorg_coordinator,
         trace_registry,
+        reorgs,
     );
     // Drain inline so handles don't accumulate during infinite live indexing.
     let mut in_flight: FuturesUnordered<JoinHandle<()>> = FuturesUnordered::new();
@@ -367,6 +369,7 @@ pub enum ProcessContractEventsWithDependenciesError {
 pub struct OrderedLiveIndexingDetails {
     pub filter: RindexerEventFilter,
     pub last_seen_block_number: U64,
+    recovery: crate::indexer::reorg::ReorgSubscription,
 }
 
 async fn process_contract_events_with_dependencies(
@@ -530,9 +533,15 @@ async fn live_indexing_for_contract_event_dependencies(
 
         filter = filter.set_from_block(next_block_number).set_to_block(next_block_number);
 
+        let recovery = crate::indexer::reorg::subscribe_reorgs(&network);
+        recovery.start_at(next_block_number.to::<u64>());
         ordering_live_indexing_details_map.insert(
             config.processor_id(),
-            Arc::new(Mutex::new(OrderedLiveIndexingDetails { filter, last_seen_block_number })),
+            Arc::new(Mutex::new(OrderedLiveIndexingDetails {
+                filter,
+                last_seen_block_number,
+                recovery,
+            })),
         );
     }
 
@@ -545,7 +554,6 @@ async fn live_indexing_for_contract_event_dependencies(
 
     let reorg_coordinator = reorg_coordinator;
     let writer_barrier = event_writer_barrier(&network);
-    let reorgs = crate::indexer::reorg::subscribe_reorgs(&network);
 
     let (pg_client, ch_client, event_registry) = events
         .first()
@@ -572,15 +580,6 @@ async fn live_indexing_for_contract_event_dependencies(
         }
 
         let iteration_start = Instant::now();
-
-        let (reorg_generation, rewind) = reorgs.snapshot();
-        if let Some(fork_point) = rewind {
-            for details in ordering_live_indexing_details_map.values() {
-                let mut details = details.lock().await;
-                details.filter = details.filter.clone().set_from_block(U64::from(fork_point));
-                details.last_seen_block_number = U64::from(fork_point.saturating_sub(1));
-            }
-        }
 
         // a consistent latest block number across all events in the batch is required to avoid race conditions
         let latest_block = match cached_provider.get_latest_block().await {
@@ -629,20 +628,7 @@ async fn live_indexing_for_contract_event_dependencies(
             )
             .await
             {
-                Ok(Some(fork_point)) => {
-                    // Rewind all event filters to re-fetch logs for the corrected blocks
-                    for (config, _) in events.iter() {
-                        let mut details = ordering_live_indexing_details_map
-                            .get(&config.processor_id())
-                            .expect("Failed to get ordering_live_indexing_details_map")
-                            .lock()
-                            .await;
-                        details.filter =
-                            details.filter.clone().set_from_block(U64::from(fork_point));
-                        details.last_seen_block_number = U64::from(fork_point.saturating_sub(1));
-                    }
-                    continue;
-                }
+                Ok(Some(_)) => continue,
                 Ok(None) => {}
                 Err(e) => {
                     error!("{} - Reorg handling failed, pausing before retry: {:?}", network, e);
@@ -681,6 +667,19 @@ async fn live_indexing_for_contract_event_dependencies(
                 .lock()
                 .await
                 .clone();
+
+            let (reorg_generation, rewind) = ordering_live_indexing_details.recovery.snapshot();
+            if let Some(resume) = rewind {
+                ordering_live_indexing_details.filter =
+                    ordering_live_indexing_details.filter.set_from_block(U64::from(resume));
+                ordering_live_indexing_details.last_seen_block_number =
+                    U64::from(resume.saturating_sub(1));
+                *ordering_live_indexing_details_map
+                    .get(&config.processor_id())
+                    .unwrap()
+                    .lock()
+                    .await = ordering_live_indexing_details.clone();
+            }
 
             if ordering_live_indexing_details.last_seen_block_number == latest_block_number {
                 debug!(
@@ -789,6 +788,13 @@ async fn live_indexing_for_contract_event_dependencies(
                 }
                 let _activity = ActiveCallback::start();
                 update_progress_and_last_synced_task(Arc::clone(config), to_block, || {}).await;
+                ordering_live_indexing_details_map
+                    .get(&config.processor_id())
+                    .unwrap()
+                    .lock()
+                    .await
+                    .recovery
+                    .completed_through(to_block.to::<u64>());
                 continue;
             }
 
@@ -842,7 +848,9 @@ async fn live_indexing_for_contract_event_dependencies(
                     let result = handle_logs_result(
                         Arc::clone(config),
                         callback_permits.clone(),
-                        &mut CallbackCheckpoints::default(),
+                        &mut CallbackCheckpoints::with_recovery(
+                            ordering_live_indexing_details.recovery.clone(),
+                        ),
                         fetched_logs,
                     )
                     .await;
@@ -973,7 +981,7 @@ async fn trigger_event(
         // Independent outputs and custom Rust handlers retain their own replay
         // semantics; this checkpoint does not make their effects idempotent.
         let update = update_progress_and_last_synced_task(config.clone(), to_block, || {});
-        if checkpoint.commit(update).await.is_err() {
+        if checkpoint.commit(to_block, update).await.is_err() {
             error!(
                 "{} - Cannot advance cursor because an earlier callback did not complete",
                 config.info_log_name()

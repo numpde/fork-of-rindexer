@@ -216,8 +216,14 @@ async fn dispatch_buffered_after_rollback(fixture: &mut Fixture, empty: bool) {
         BlockChainWindow, ReorgBlockHashPersistence, ReorgContext, ReorgCoordinator,
     };
     use futures::StreamExt;
-    let mut stream =
-        crate::indexer::fetch_logs::fetch_logs_stream(fixture.config.clone(), true, None, None);
+    let reorgs = crate::indexer::reorg::subscribe_reorgs("ethereum");
+    let mut stream = crate::indexer::fetch_logs::fetch_logs_stream(
+        fixture.config.clone(),
+        true,
+        None,
+        None,
+        reorgs,
+    );
     let mut batch = timeout(Duration::from_secs(5), stream.next())
         .await
         .expect("fetch completes")
@@ -332,8 +338,15 @@ pub(crate) async fn replay_lagging_buffer_after_rollback(
     network.block_clock = BlockClock::new(None, None, provider.clone());
     network.start_block = Some(U64::from(81));
     network.end_block = Some(U64::from(100));
-    let mut fetched =
-        crate::indexer::fetch_logs::fetch_logs_stream(fixture.config.clone(), false, None, None);
+    let reorgs = crate::indexer::reorg::subscribe_reorgs("ethereum");
+    fixture.checkpoints = CallbackCheckpoints::with_recovery(reorgs.clone());
+    let mut fetched = crate::indexer::fetch_logs::fetch_logs_stream(
+        fixture.config.clone(),
+        false,
+        None,
+        None,
+        reorgs,
+    );
     let buffered = timeout(Duration::from_secs(5), fetched.next()).await.unwrap().unwrap().unwrap();
     assert_eq!((buffered.from_block, buffered.to_block), (U64::from(81), U64::from(90)));
     let old_generation = buffered.reorg_generation;

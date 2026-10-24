@@ -15,6 +15,17 @@ Use one writer process; this change does not coordinate cursor
 publication between independent processes.
 
 Network rollback now notifies every running fetcher to refetch replacement history.
+PostgreSQL checkpoint rollback takes the lesser of the existing checkpoint and
+the block before the fork. A stream at block 80 therefore stays at 80 when another
+stream triggers rollback of 98–100; it is not advanced to 97.
+
+Event fetching also keeps each stream's first unfinished callback range separate
+from its fetch position. Recovery resumes at the earlier of that range and the
+fork. For example, a queued 81–90 batch discarded during rollback at 98 is refetched
+from 81 before that stream can checkpoint beyond it. This applies across historical
+and live fetching and to dependency event processing. Completed callbacks advance
+the recovery boundary in checkpoint order while holding the writer read barrier.
+
 Event batches carry the rollback generation captured before their fetch. The
 dispatcher checks it while holding the same read barrier that protects writes;
 stale batches, including empty checkpoint batches, do not run callbacks or advance

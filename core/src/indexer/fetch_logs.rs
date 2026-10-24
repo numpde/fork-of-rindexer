@@ -66,6 +66,7 @@ pub fn fetch_logs_stream(
     force_no_live_indexing: bool,
     reorg_coordinator: Option<Arc<Mutex<ReorgCoordinator>>>,
     trace_registry: Option<Arc<TraceCallbackRegistry>>,
+    reorgs: crate::indexer::reorg::ReorgSubscription,
 ) -> impl tokio_stream::Stream<Item = Result<FetchLogsResult, Box<dyn Error + Send>>> + Send + Unpin
 {
     // If the sink is slower than the producer it can lead to unbounded memory growth and
@@ -83,7 +84,7 @@ pub fn fetch_logs_stream(
 
     tokio::spawn(async move {
         let mut current_filter = config.to_event_filter().unwrap();
-        let reorgs = crate::indexer::reorg::subscribe_reorgs(&config.network_contract().network);
+        reorgs.start_at(current_filter.from_block().to::<u64>());
 
         let snapshot_to_block = current_filter.to_block();
         let from_block = current_filter.from_block();
@@ -255,9 +256,9 @@ pub fn fetch_logs_stream(
 
         loop {
             let (reorg_generation, rewind) = reorgs.snapshot();
-            if let Some(fork_point) = rewind {
+            if let Some(resume_from) = rewind {
                 current_filter = current_filter
-                    .set_from_block(U64::from(fork_point))
+                    .set_from_block(U64::from(resume_from))
                     .set_to_block(snapshot_to_block);
             }
             if current_filter.from_block() > snapshot_to_block {
@@ -1202,6 +1203,7 @@ async fn live_indexing_stream(
     registry: &EventCallbackRegistry,
     trace_registry: Option<&TraceCallbackRegistry>,
 ) {
+    reorgs.start_at(current_filter.from_block().to::<u64>());
     let mut last_seen_block_number = last_seen_block_number;
     let mut log_response_to_large_to_block: Option<U64> = None;
     let tip_logs = cached_provider.shared_tip_logs();
@@ -1242,13 +1244,13 @@ async fn live_indexing_stream(
         }
 
         let (reorg_generation, rewind) = reorgs.snapshot();
-        if let Some(fork_point) = rewind {
-            current_filter = current_filter.set_from_block(U64::from(fork_point));
-            last_seen_block_number = U64::from(fork_point.saturating_sub(1));
+        if let Some(resume_from) = rewind {
+            current_filter = current_filter.set_from_block(U64::from(resume_from));
+            last_seen_block_number = U64::from(resume_from.saturating_sub(1));
             log_response_to_large_to_block = None;
             block_cache.clear();
             if let Some(tip_logs) = tip_logs.as_deref() {
-                tip_logs.invalidate_from(fork_point);
+                tip_logs.invalidate_from(resume_from);
             }
         }
 
@@ -1386,9 +1388,8 @@ async fn live_indexing_stream(
                                 if let Some(tip_logs) = tip_logs.as_deref() {
                                     tip_logs.invalidate_from(fork_point);
                                 }
-                                current_filter =
-                                    current_filter.set_from_block(U64::from(fork_point));
-                                last_seen_block_number = U64::from(fork_point.saturating_sub(1));
+                                // The published per-stream boundary also includes
+                                // unfinished pre-fork batches; consume it next iteration.
                                 continue;
                             }
                             Ok(None) => {}
