@@ -398,6 +398,10 @@ mod input_validation_tests;
 #[path = "permanent_failure_tests.rs"]
 mod permanent_failure_tests;
 
+#[cfg(test)]
+#[path = "postgres_replay_tests.rs"]
+mod postgres_replay_tests;
+
 fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
     let shared_callback = Arc::new(move |results| {
         let params = Arc::clone(&params);

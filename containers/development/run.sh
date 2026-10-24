@@ -35,6 +35,14 @@ if ! test -f "$RINDEXER_GRAPHQL_PREBUILT" || ! test -f /build/graphql/input.sha2
   printf '%s\n' "$key" > /build/graphql/input.sha256
 fi
 case "$1" in
+  postgres-replay-compile)
+    exec cargo nextest run --frozen -p rindexer --lib --no-run -E 'test(/postgres_replay_tests::/)'
+    ;;
+  postgres-replay)
+    : "${RINDEXER_TEST_POSTGRES_URL:?missing explicit PostgreSQL fixture}"
+    exec timeout --signal=TERM --kill-after=20s 900s cargo nextest run --frozen \
+      -p rindexer --lib --no-fail-fast --no-capture -E 'test(/postgres_replay_tests::/)'
+    ;;
   trace-bindings)
     exec python3 -B containers/development/typings.py check-traces --root /work ;;
   codegen-typings)

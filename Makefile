@@ -340,6 +340,13 @@ ci: rust/checks tests ## Validate the first container-development slice (not all
 
 .PHONY: tests/permanent-failures/docker tests/permanent-failures/postgres
 
+.PHONY: tests/postgres-replay/docker
+tests/postgres-replay/docker: tests/posture ## Check uncertain PostgreSQL commits, replayed events and derived effects
+	@$(call offline_runner,$$dependency_image)
+	$(compose) run --rm --no-deps -T offline postgres-replay-compile
+	$(compose) up -d --no-build --pull never --wait --wait-timeout 90 postgres
+	$(compose) run --rm --no-deps -T postgres-tests postgres-replay
+
 tests/permanent-failures/docker: tests/posture ## Check terminal callback handling, transient retries and stream health offline
 	@$(call offline_runner,$$dependency_image)
 	$(compose) run --rm --no-deps -T offline permanent-failures
