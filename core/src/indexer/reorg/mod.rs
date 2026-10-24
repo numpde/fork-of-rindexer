@@ -3,6 +3,9 @@ pub mod persistence;
 pub mod task;
 pub mod window;
 
+#[cfg(test)]
+mod same_height_tests;
+
 use alloy::primitives::{B256, U64};
 use anyhow::Context;
 use serde::Serialize;
