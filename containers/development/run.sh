@@ -31,6 +31,16 @@ if ! test -f "$RINDEXER_GRAPHQL_PREBUILT" || ! test -f /build/graphql/input.sha2
 fi
 case "$1" in
   compile) exec cargo nextest run --frozen -p rindexer --test postgres_bytea_array --no-run ;;
+  postgres-tls-compile)
+    exec cargo nextest run --frozen -p rindexer --lib --no-run \
+      -E 'test(/^database::postgres::client::tls_policy_tests::/)'
+    ;;
+  postgres-tls)
+    : "${RINDEXER_TEST_POSTGRES_URL:?missing explicit PostgreSQL fixture}"
+    exec timeout --signal=TERM --kill-after=20s 900s cargo nextest run --frozen \
+      -p rindexer --lib --no-fail-fast --no-capture \
+      -E 'test(/^database::postgres::client::tls_policy_tests::/)'
+    ;;
   unsigned-integers)
     # A cold dependency compilation is not part of the test execution timeout.
     cargo nextest run --frozen -p rindexer --lib --no-run \

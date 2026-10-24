@@ -23,6 +23,10 @@ use crate::database::generate::generate_event_table_columns_names_sql;
 use crate::database::sql_type_wrapper::EthereumSqlTypeWrapper;
 use crate::metrics::database::{self as db_metrics, ops};
 
+#[cfg(test)]
+#[path = "tls_policy_tests.rs"]
+mod tls_policy_tests;
+
 pub fn connection_string() -> Result<String, env::VarError> {
     dotenv().ok();
     let connection = env::var("DATABASE_URL")?;

@@ -263,6 +263,15 @@ tests: tests/checks tests/posture tests/postgres ## Run the currently migrated c
 
 ci: rust/checks tests ## Validate the first container-development slice (not all upstream suites)
 
+.PHONY: tests/postgres-tls/docker
+
+# Inject TLS negotiation failures in a loopback proxy to the disposable fixture.
+tests/postgres-tls/docker: tests/posture ## Check PostgreSQL TLS policy and reconnect behavior
+	@$(call offline_runner,$$dependency_image)
+	$(compose) run --rm --no-deps -T offline postgres-tls-compile
+	$(compose) up -d --no-build --pull never --wait --wait-timeout 90 postgres
+	$(compose) run --rm --no-deps -T postgres-tests postgres-tls
+
 # Unsigned integer regressions: no dependency acquisition and no Docker access
 # inside tests. Keep pure encoding checks separate from real PostgreSQL readback.
 .PHONY: tests/unsigned-integers/docker tests/unsigned-integers/postgres
