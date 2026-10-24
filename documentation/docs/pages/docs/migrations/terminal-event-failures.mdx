@@ -49,6 +49,15 @@ repair. Review previously indexed history before rebuilding affected data. Healt
 status does not establish general per-stream freshness or detect every stalled
 RPC request or retryable error.
 
+Native-transfer block fetching also requires exactly one response for every
+requested block and full transaction objects. Missing or repeated blocks and
+hashes-only responses return a fetch error before any block or transfer callback
+and leave the cursor unchanged. The processor retries the same range; these
+errors do not themselves establish a terminal failure. Complete blocks with an
+empty transaction list still succeed. A healthy response does not prove that an
+RPC provider has stopped returning incomplete ranges. Review and reindex history
+already skipped by an earlier version; this validation does not repair it.
+
 ## Rust projects
 
 Run `rindexer codegen typings` to regenerate event and trace registration adapters

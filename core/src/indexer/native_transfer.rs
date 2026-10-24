@@ -1,4 +1,10 @@
-use std::{cmp, collections::VecDeque, ops::RangeInclusive, sync::Arc, time::Duration};
+use std::{
+    cmp,
+    collections::{HashSet, VecDeque},
+    ops::RangeInclusive,
+    sync::Arc,
+    time::Duration,
+};
 
 use alloy::consensus::Transaction;
 use alloy::transports::{RpcError, TransportErrorKind};
@@ -492,7 +498,31 @@ pub async fn native_transfer_block_consumer(
     if let Some(failure) = config.terminal_failure() {
         return Err(failure.into());
     }
+    if block_numbers.is_empty() {
+        return Ok(());
+    }
     let blocks = provider.get_block_by_number_batch(block_numbers, true).await?;
+    // A successful RPC call is not proof that every requested block and its
+    // transactions arrived. Validate the whole response before either handler.
+    let mut remaining: HashSet<_> = block_numbers.iter().map(|number| number.to::<u64>()).collect();
+    for block in &blocks {
+        let number = block.header.number;
+        if !remaining.remove(&number) {
+            return Err(ProviderError::CustomError(format!(
+                "Cannot process native-transfer blocks on network {network_name:?}: RPC response contains unrequested or repeated block {number}; the requested range cannot be checkpointed"
+            )).into());
+        }
+        if !matches!(&block.transactions, alloy::rpc::types::BlockTransactions::Full(_)) {
+            return Err(ProviderError::CustomError(format!(
+                "Cannot process native transfers on network {network_name:?}, block {number}: RPC response omitted full transaction objects despite requesting them; the block cannot be checkpointed"
+            )).into());
+        }
+    }
+    if let Some(number) = remaining.iter().min() {
+        return Err(ProviderError::CustomError(format!(
+            "Cannot process native-transfer blocks on network {network_name:?}: RPC response omitted requested block {number}; the requested range cannot be checkpointed"
+        )).into());
+    }
     let (from_block, to_block) = block_numbers
         .iter()
         .fold((U64::MAX, U64::ZERO), |(min, max), &num| (cmp::min(min, num), cmp::max(max, num)));
@@ -1063,6 +1093,54 @@ mod tests {
     #[tokio::test]
     async fn hash_only_native_blocks_do_not_call_handlers_or_checkpoint() {
         assert_incomplete_native_response("hashes").await;
+    }
+
+    #[tokio::test]
+    async fn empty_native_request_keeps_cursor_unchanged() {
+        use futures::FutureExt;
+        let (_directory, config, provider, path) = callback_case(Arc::new(|_| {
+            async { panic!("empty request cannot invoke a callback") }.boxed()
+        }))
+        .await;
+        native_transfer_block_consumer(provider, &[], "ethereum", &config).await.unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "1");
+        assert_eq!(crate::indexer::task_tracker::active_indexing_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn complete_native_response_can_arrive_out_of_order() {
+        use futures::FutureExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let (_directory, config, _, path) = callback_case(Arc::new(move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            async { Ok(()) }.boxed()
+        }))
+        .await;
+        let blocks = [43, 42]
+            .into_iter()
+            .map(|number| {
+                make_block_with_native_transfer(
+                    number,
+                    Address::ZERO,
+                    Address::repeat_byte(1),
+                    U256::ONE,
+                )
+            })
+            .collect();
+        let provider = Arc::new(MockChainProvider::new(1).with_blocks(blocks));
+        native_transfer_block_consumer(
+            provider,
+            &[U64::from(42), U64::from(43)],
+            "ethereum",
+            &config,
+        )
+        .await
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "block and transfer batches both complete");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "43");
+        assert_eq!(crate::indexer::task_tracker::active_indexing_count(), 0);
     }
 
     async fn assert_incomplete_native_response(case: &str) {
