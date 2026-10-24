@@ -283,9 +283,19 @@ async fn relay(
 
 #[tokio::test]
 async fn postgres_lost_commit_response_replay_preserves_rows_and_additive_effects() {
+    assert_lost_commit_replay(false).await;
+}
+
+#[tokio::test]
+async fn postgres_lost_commit_response_with_deferred_cursor_preserves_effects() {
+    assert_lost_commit_replay(true).await;
+}
+
+async fn assert_lost_commit_replay(deferred_cursor: bool) {
     let fixture = Fixture::new().await;
     let proxy = LostCommitResponse::start(&fixture.url).await;
     let mut params = fixture.params.clone();
+    params.atomic_safe_concurrency = !deferred_cursor;
     params.postgres = Some(client(&proxy.url).await);
     let callback = no_code_callback(Arc::new(params)).event_callback;
     let first = tokio::time::timeout(Duration::from_secs(20), callback(fixture.events(&[1, 2])))
@@ -302,7 +312,7 @@ async fn postgres_lost_commit_response_replay_preserves_rows_and_additive_effect
     assert!(first.is_err(), "client must see an uncertain commit outcome");
     assert_eq!(
         after_server_commit,
-        (2, "3".to_string(), "2".to_string()),
+        (2, "3".to_string(), if deferred_cursor { "0" } else { "2" }.to_string()),
         "server committed every effect before disconnecting"
     );
     replay.expect("retry the uncertain outcome");

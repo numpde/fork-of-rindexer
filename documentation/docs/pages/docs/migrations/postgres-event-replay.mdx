@@ -1,26 +1,34 @@
 # PostgreSQL event replay receipts
 
-Serialized no-code contract-event indexing can now retry a PostgreSQL COMMIT with
+No-code contract-event indexing can now retry a PostgreSQL COMMIT with
 an unknown outcome without duplicating its raw events or applying derived
 operations again. This includes a connection failure after PostgreSQL commits but
 before the client receives confirmation.
 
 ## Supported path
 
-This guarantee currently applies when PostgreSQL stores raw contract events and
-is the only configured sink: no ClickHouse, CSV, streams or chat clients. Effective
-callback concurrency must be one, either through `index_event_in_order` or
-`config.callback_concurrency` (whose default remains one). Factory discovery,
-native-transfer/block traces, custom Rust callbacks, and the other no-code
-configuration paths retain their previous replay behavior. Use one writer process;
-this change does not coordinate cursor publication between independent processes.
+This guarantee applies to managed PostgreSQL raw contract events and their derived
+operations, including factory-discovery callbacks, higher callback concurrency,
+and configurations with ClickHouse, CSV, streams or chat clients. Native-transfer
+and block traces and custom Rust callbacks retain their previous PostgreSQL replay
+behavior. Use one writer process; this change does not coordinate cursor
+publication between independent processes.
 
 A receipt identifies the event stream namespace, network, block hash, transaction
 hash and log index. The receipt, selected raw rows, derived-table operations and
-cursor commit in one transaction. Only newly claimed events enter aggregation,
+an eligible cursor commit in one transaction. Only newly claimed events enter aggregation,
 so regrouping an overlapping batch does not reapply old additions. A transaction
 failure rolls back its claims too. A cursor already ahead of an unseen event does
 not suppress that event.
+
+PostgreSQL owns the cursor only for a serialized callback with no other sink or
+factory bookkeeping. Otherwise the dispatcher advances the cursor after the full
+callback succeeds, in dispatch order. An independent sink can fail after the PG
+effect group commits: the cursor stays behind, and replay skips those PG effects
+while retrying the other output. CSV and other independent outputs may receive the
+same events again. Their writes and publications do not become exactly-once or
+atomic with PostgreSQL. Partial ClickHouse table progress cannot advance the PG
+cursor during shutdown.
 
 The supported reorg rollback deletes affected receipts in the same transaction as
 raw deletion, derived reversal and cursor rewind. Canonical events can then be
@@ -46,11 +54,10 @@ metadata manually merely to bypass the guard. If you retain or import existing d
 you must independently reconcile every affected derived result and establish a
 consistent replay boundary; that migration is not automated here.
 
-Once a stream has receipt history, switching it to an untracked PostgreSQL path
-also fails permanently before writing. Keep its supported configuration or perform
-a reviewed migration. This prevents adding another sink or increasing concurrency
-from silently mixing tracked and untracked writes, then making later retries
-ambiguous. Other event streams can continue.
+Enabling callback concurrency or another sink keeps the same PG receipt history;
+it does not switch the contract-event stream back to untracked writes. Direct SQL
+and custom Rust writers must not bypass this managed application path. A failed
+migration affects that stream; other event streams can continue.
 
 Restore raw rows, derived rows, cursor and receipt metadata from the same consistent
 backup point. Manually dropping or editing just one of them is unsupported. Keep
@@ -72,9 +79,12 @@ connection and receipt locks. A preparation failure rolls the transaction back.
 This tradeoff keeps event selection ahead of aggregation without changing
 operation order or public table-operation APIs. It does not make independent
 storage systems or downstream publications atomic.
-On this path, the existing `INDEXED` log counts newly applied events. A replay with
-no new events emits no `INDEXED` line. Input-oriented engine metrics still count
-callback inputs and are not proof of distinct database effects.
+With PG enabled, the existing `INDEXED` log counts newly applied PG events. A replay
+with no new events can log zero while other outputs are delivered again; the
+serialized PG-only fast path omits that line entirely. Input-oriented engine
+metrics still count callback inputs and are not proof of distinct database effects.
+`rindexer_atomic_batches_total` now also counts PG application transactions whose
+cursor is deferred to the dispatcher.
 
 Contributors can run `make tests/postgres-replay/docker`. Its real PostgreSQL wire
 proxy withholds a COMMIT response only after the server commits; the test reads

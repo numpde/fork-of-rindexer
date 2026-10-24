@@ -943,15 +943,12 @@ async fn trigger_event(
     };
 
     if should_update_progress {
-        // Double-index race NOTE: for the no-code POSTGRES-sole-sink path this is
-        // closed — no_code_callback commits [batch + rindexer_internal cursor] in
-        // ONE transaction (insert_bulk_with_cursor), so this async advance is only
-        // the empty-range / tail bump (monotonic guard makes it a no-op otherwise).
-        // The race window still exists for: ClickHouse/CSV(-alongside-PG) and
-        // streams/chat configs (deliberately kept legacy — see atomic_pg_cursor
-        // in no_code.rs), custom Rust handlers, the trace path (its outer
-        // advance ignores the callback result), and factory discovery events
-        // (child-address bookkeeping commits after the callback).
+        // No-code PG event receipts protect database effects on replay. The
+        // serialized sole-sink case may already have committed this cursor;
+        // otherwise the full callback, including other outputs and factory
+        // bookkeeping, must finish before this ordered checkpoint can advance.
+        // Independent outputs and custom Rust handlers retain their own replay
+        // semantics; this checkpoint does not make their effects idempotent.
         let update = update_progress_and_last_synced_task(config.clone(), to_block, || {});
         if checkpoint.commit(update).await.is_err() {
             error!(

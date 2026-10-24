@@ -12,8 +12,8 @@ use crate::database::postgres::client::PostgresClient;
 /// issued as SQL through `batch_execute`; `Transaction::savepoint` (`&mut self`) is not used.
 #[derive(Clone, Copy)]
 pub enum PgWriteMode<'a> {
-    /// Own transaction per statement (legacy arm, cron).
+    /// Own transaction per statement (untracked writes, cron).
     Eager(&'a PostgresClient),
-    /// Execute inside the caller's open transaction (atomic arm).
+    /// Execute inside the caller's open transaction.
     Tx(&'a PgTransaction<'a>),
 }

@@ -44,9 +44,10 @@ use crate::{
     },
     event::{
         callback_registry::{
-            noop_decoder, CallbackError, CallbackResult, EventCallbackRegistry,
-            EventCallbackRegistryInformation, EventCallbackType, TraceCallbackRegistry,
-            TraceCallbackRegistryInformation, TraceCallbackType, TxInformation,
+            noop_decoder, CallbackError, CallbackExecutionResult, CallbackResult,
+            EventCallbackRegistry, EventCallbackRegistryInformation, EventCallbackType,
+            EventResult, TraceCallbackRegistry, TraceCallbackRegistryInformation,
+            TraceCallbackType, TxInformation,
         },
         contract_setup::{ContractInformation, CreateContractInformationError, TraceInformation},
         EventMessage,
@@ -373,7 +374,7 @@ struct NoCodeCallbackParams {
     multicall_addresses: Arc<HashMap<String, Option<String>>>,
     /// Factory discovery event: child-address bookkeeping persists only AFTER
     /// the callback returns (FactoryEventProcessingConfig::trigger_event), so
-    /// these events must stay on the legacy cursor path — an atomically
+    /// these events must keep their cursor outside the PG effect transaction — an atomically
     /// committed cursor + crash before the address persist would permanently
     /// skip re-discovery of child contracts.
     is_factory_event: bool,
@@ -401,6 +402,133 @@ mod permanent_failure_tests;
 #[cfg(test)]
 #[path = "postgres_replay_tests.rs"]
 mod postgres_replay_tests;
+
+// Preserve the existing operator log lines at table-operation failure boundaries.
+fn log_table_failure(params: &NoCodeCallbackParams, error: &str) {
+    if error.contains("Shutdown") {
+        info!(
+            "{}::{} - Graceful shutdown during table processing",
+            params.contract_name, params.event_info.name
+        );
+    } else {
+        error!(
+            "{}::{} - Error processing table operations: {}",
+            params.contract_name, params.event_info.name, error
+        );
+    }
+}
+
+/// Apply only newly claimed PostgreSQL events. Independent sinks borrow the
+/// original batch, and the caller supplies a cursor only when PG can own it.
+async fn apply_postgres_events(
+    postgres: &PostgresClient,
+    params: &NoCodeCallbackParams,
+    events: &[EventResult],
+    raw_rows: &[Vec<EthereumSqlTypeWrapper>],
+    table_events: &[(Vec<LogParam>, String, TxMetadata)],
+    cursor: Option<&BulkCursorUpdate>,
+) -> CallbackExecutionResult<usize> {
+    if !is_running() {
+        return Err("Shutdown requested".into());
+    }
+    let schema = generate_indexer_contract_schema_name(&params.indexer_name, &params.contract_name);
+    let namespace = generate_internal_event_table_name(&schema, &params.event_info.name);
+    let mut connection = postgres.raw_connection().await.map_err(|error| error.to_string())?;
+    let transaction = connection.transaction().await.map_err(|error| pg_error_to_string(&error))?;
+    let new_events = crate::database::postgres::event_applications::claim(
+        &transaction,
+        &namespace,
+        &params.sql_event_table_name,
+        events,
+    )
+    .await?;
+    let rows: Vec<_> = raw_rows
+        .iter()
+        .zip(&new_events)
+        .filter_map(|(row, is_new)| is_new.then_some(row.as_slice()))
+        .collect();
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let table_events: Vec<_> = table_events
+        .iter()
+        .zip(&new_events)
+        .filter_map(|(event, is_new)| is_new.then_some(event.clone()))
+        .collect();
+    let prepared = if params.tables.is_empty() {
+        PreparedTableOps { ops: vec![] }
+    } else {
+        prepare_table_operations(
+            &params.tables,
+            &params.event_info.name,
+            &table_events,
+            params.providers.clone(),
+            &params.constants,
+            &params.multicall_addresses,
+        )
+        .await
+        .inspect_err(|error| log_table_failure(params, error))?
+    };
+    // Preparation can await RPC with these claims held. No effects have been
+    // staged yet; dropping the transaction on error/shutdown releases the claims.
+    if !is_running() {
+        return Err("Shutdown requested".into());
+    }
+    let staged: Result<Option<CursorAdvance>, String> = async {
+        apply_table_operations(&prepared, Some(PgWriteMode::Tx(&transaction)), None, None)
+            .await
+            .inspect_err(|error| log_table_failure(params, error))?;
+        let inserted = match cursor {
+            Some(cursor) => PostgresClient::insert_bulk_with_cursor_in(
+                &transaction,
+                &params.sql_event_table_name,
+                &params.sql_column_names,
+                &rows,
+                cursor,
+            )
+            .await
+            .map(Some),
+            None => PostgresClient::insert_bulk_in(
+                &transaction,
+                &params.sql_event_table_name,
+                &params.sql_column_names,
+                &rows,
+            )
+            .await
+            .map(|()| None),
+        };
+        inserted.inspect_err(|error| {
+            error!(
+                "{}::{} - Error performing postgres bulk insert: {}",
+                params.contract_name, params.event_info.name, error
+            );
+        })
+    }
+    .await;
+    let (committed, advance) = match staged {
+        Ok(advance) => {
+            (transaction.commit().await.map_err(|error| pg_error_to_string(&error)), advance)
+        }
+        Err(error) => {
+            drop(transaction);
+            (Err(error), None)
+        }
+    };
+    db_metrics::record_atomic_batch(&committed);
+    committed?;
+    match (advance, cursor) {
+        (Some(CursorAdvance::Advanced { updated_rows }), Some(cursor)) => debug!(
+            "ATOMIC-CURSOR commit: {} rows={} cursor[{}]={} (updated={})",
+            params.sql_event_table_name, rows.len(), cursor.internal_table_name, cursor.to_block, updated_rows,
+        ),
+        (Some(CursorAdvance::AlreadyAhead { current }), Some(cursor)) => debug!(
+            "ATOMIC-CURSOR commit: {} rows={} cursor[{}] to_block={} not advanced (already at {} — concurrent live/historic loop ahead)",
+            params.sql_event_table_name, rows.len(), cursor.internal_table_name, cursor.to_block, current,
+        ),
+        _ => {}
+    }
+    Ok(rows.len())
+}
 
 fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
     let shared_callback = Arc::new(move |results| {
@@ -697,15 +825,10 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
                 indexed_count += 1;
             }
 
-            // Atomic-cursor eligibility: ONLY when Postgres is the SOLE raw-event
-            // sink. With ClickHouse/CSV alongside, committing the cursor at the PG
-            // write would turn their crash-recovery from at-least-once into silent
-            // at-most-once (a committed cursor skips the range on restart before
-            // the other sinks ever saw it) — those configs keep the legacy path
-            // (plain insert_bulk; the async task advances the cursor only after
-            // the whole callback succeeds). The exactly-once contract additionally
-            // requires a SINGLE writer process and effective callback concurrency 1
-            // (the default; see trigger_event in process.rs).
+            // PG may own the cursor only when its transaction completes every
+            // callback obligation and callbacks commit serially. Other configurations
+            // checkpoint after the whole callback; receipts still protect their PG
+            // effects independently. Cursor ordering assumes one writer process.
             let atomic_pg_cursor = params.store_raw_events
                 && matches!(&results, CallbackResult::Event(_))
                 && params.postgres.is_some()
@@ -724,250 +847,76 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
                 // exactly-once needs serialized batch commits (see field docs).
                 && params.atomic_safe_concurrency;
 
-            // Receipt claims, selected derived effects, raw rows and cursor share
-            // one transaction. Filter before preparing table operations so an
-            // overlapping replay cannot contribute old values to an aggregate.
-            // Preparation may make RPC calls while holding this connection; its
-            // failure drops the transaction and releases the uncommitted claims.
-            // Other sink/configuration paths retain their existing semantics.
-            let run_table_ops = !params.tables.is_empty() && !table_events_data.is_empty();
-
-            if atomic_pg_cursor {
-                if !is_running() {
-                    return Err("Shutdown requested".into());
+            // PostgreSQL application and whole-callback completion are separate
+            // boundaries. Other sinks still receive the original input on replay.
+            let postgres_applied = match (params.postgres.as_ref(), &results) {
+                (Some(postgres), CallbackResult::Event(events)) if params.store_raw_events => {
+                    let cursor = atomic_pg_cursor.then(|| {
+                        let schema = generate_indexer_contract_schema_name(&params.indexer_name, &params.contract_name);
+                        BulkCursorUpdate {
+                            internal_table_name: generate_internal_event_table_name(&schema, &params.event_info.name),
+                            network: network.clone(), to_block: to_block.to(),
+                        }
+                    });
+                    Some(apply_postgres_events(postgres, &params, events, &sql_bulk_data,
+                        &table_events_data, cursor.as_ref()).await?)
                 }
-                let postgres = params.postgres.as_ref().expect("atomic eligibility requires PostgreSQL");
-                let schema = generate_indexer_contract_schema_name(&params.indexer_name, &params.contract_name);
-                let cursor = BulkCursorUpdate {
-                    internal_table_name: generate_internal_event_table_name(&schema, &params.event_info.name),
-                    network: network.clone(), to_block: to_block.to(),
-                };
-                // The transaction drops before its pooled connection on every exit.
-                let mut conn = postgres.raw_connection().await.map_err(|error| error.to_string())?;
-                let tx = conn.transaction().await.map_err(|error| pg_error_to_string(&error))?;
-                let CallbackResult::Event(events) = &results else {
-                    unreachable!("atomic eligibility requires contract events");
-                };
-                let selected = crate::database::postgres::event_applications::claim(
-                    &tx, &cursor.internal_table_name, &params.sql_event_table_name, events,
-                ).await?;
-                if !selected.iter().any(|selected| *selected) {
-                    return Ok(());
-                }
-                sql_bulk_data = sql_bulk_data.into_iter().zip(&selected)
-                    .filter_map(|(row, selected)| selected.then_some(row)).collect();
-                indexed_count = sql_bulk_data.len();
-                table_events_data = table_events_data.into_iter().zip(&selected)
-                    .filter_map(|(event, selected)| selected.then_some(event)).collect();
+                _ => None,
+            };
+            if let Some(applied) = postgres_applied {
+                indexed_count = applied;
+                if applied == 0 && atomic_pg_cursor { return Ok(()); }
+            }
 
-                let prepared = if run_table_ops {
-                    match prepare_table_operations(
-                        &params.tables,
-                        &params.event_info.name,
-                        &table_events_data,
-                        params.providers.clone(),
-                        &params.constants,
-                        &params.multicall_addresses,
-                    )
-                    .await
-                    {
-                        Ok(prepared) => prepared,
-                        Err(e) => {
-                            // Don't log as error if it's a graceful shutdown
-                            if e.contains("Shutdown") {
-                                info!(
-                                    "{}::{} - Graceful shutdown during table processing",
-                                    params.contract_name, params.event_info.name
-                                );
-                            } else {
-                                error!(
-                                    "{}::{} - Error processing table operations: {}",
-                                    params.contract_name, params.event_info.name, e
-                                );
-                            }
-                            return Err(e.into());
-                        }
-                    }
-                } else {
-                    PreparedTableOps { ops: Vec::new() }
-                };
-
-                let write_raw_rows = params.store_raw_events && !sql_bulk_data.is_empty();
-
-                if !prepared.ops.is_empty() || write_raw_rows {
-                    // Claims remain uncommitted: shutdown here drops them before
-                    // any derived or raw writes start.
-                    if !is_running() {
-                        return Err("Shutdown requested".into());
-                    }
-
-                    let staged: Result<Option<CursorAdvance>, String> = async {
-                        if let Err(e) = apply_table_operations(
-                            &prepared,
-                            Some(PgWriteMode::Tx(&tx)),
-                            None,
-                            None,
-                        )
-                        .await
-                        {
-                            error!(
-                                "{}::{} - Error processing table operations: {}",
-                                params.contract_name, params.event_info.name, e
-                            );
-                            return Err(e);
-                        }
-
-                        if !write_raw_rows {
-                            return Ok(None);
-                        }
-
-                        // Raw rows + last-synced cursor in the same transaction
-                        // as the table effects staged above.
-                        PostgresClient::insert_bulk_with_cursor_in(
-                            &tx,
-                            &params.sql_event_table_name,
-                            &params.sql_column_names,
-                            &sql_bulk_data,
-                            &cursor,
-                        )
-                        .await
-                        .map(Some)
-                        .map_err(|e| {
-                            error!(
-                                "{}::{} - Error performing postgres bulk insert: {}",
-                                params.contract_name, params.event_info.name, e
-                            );
-                            e
-                        })
-                    }
-                    .await;
-
-                    let (committed, advance) = match staged {
-                        Ok(advance) => {
-                            (tx.commit().await.map_err(|e| pg_error_to_string(&e)), advance)
-                        }
-                        Err(e) => {
-                            // Dropping an uncommitted transaction enqueues ROLLBACK.
-                            drop(tx);
-                            (Err(e), None)
-                        }
-                    };
-                    db_metrics::record_atomic_batch(&committed);
-                    committed?;
-
-                    match advance {
-                        Some(CursorAdvance::Advanced { updated_rows }) => debug!(
-                            "ATOMIC-CURSOR commit: {} rows={} cursor[{}]={} (updated={})",
-                            params.sql_event_table_name,
-                            sql_bulk_data.len(),
-                            cursor.internal_table_name,
-                            cursor.to_block,
-                            updated_rows
-                        ),
-                        Some(CursorAdvance::AlreadyAhead { current }) => debug!(
-                            "ATOMIC-CURSOR commit: {} rows={} cursor[{}] to_block={} not advanced (already at {} — concurrent live/historic loop ahead)",
-                            params.sql_event_table_name,
-                            sql_bulk_data.len(),
-                            cursor.internal_table_name,
-                            cursor.to_block,
-                            current
-                        ),
-                        None => {}
-                    }
-                }
-            } else {
-                if params.store_raw_events {
+            if params.store_raw_events {
+                // Trace callbacks retain their existing write behavior until
+                // their application identities can distinguish internal calls.
+                if postgres_applied.is_none() {
                     if let Some(postgres) = &params.postgres {
                         let schema = generate_indexer_contract_schema_name(&params.indexer_name, &params.contract_name);
                         let namespace = generate_internal_event_table_name(&schema, &params.event_info.name);
                         crate::database::postgres::event_applications::require_untracked_stream(postgres, &namespace).await?;
-                    }
-                }
-                // LEGACY arm — original ordering + original semantics.
-                if params.store_raw_events {
-                    if let Some(postgres) = &params.postgres {
                         if !sql_bulk_data.is_empty() {
-                            if let Err(e) = postgres
-                                .insert_bulk(
-                                    &params.sql_event_table_name,
-                                    &params.sql_column_names,
-                                    &sql_bulk_data,
-                                )
-                                .await
-                            {
-                                error!(
-                                    "{}::{} - Error performing postgres bulk insert: {}",
-                                    params.contract_name, params.event_info.name, e
-                                );
-                                return Err(e.to_string().into());
-                            }
-                        }
-                    }
-
-                    if let Some(clickhouse) = &params.clickhouse {
-                        if !sql_bulk_data.is_empty() {
-                            if let Err(e) = clickhouse
-                                .insert_bulk(
-                                    &params.sql_event_table_name,
-                                    &params.sql_column_names,
-                                    &sql_bulk_data,
-                                )
-                                .await
-                            {
-                                error!(
-                                    "{}::{} - Error performing clickhouse bulk insert: {}",
-                                    params.contract_name, params.event_info.name, e
-                                );
-                                return Err(e.to_string().into());
-                            };
-                        }
-                    }
-
-                    if let Some(csv) = &params.csv {
-                        if !csv_bulk_data.is_empty() {
-                            if let Err(e) = csv.append_bulk(csv_bulk_data).await {
-                                return Err(e.to_string().into());
-                            }
+                            postgres.insert_bulk(&params.sql_event_table_name,
+                                &params.sql_column_names, &sql_bulk_data).await
+                                .map_err(|error| {
+                                    error!("{}::{} - Error performing postgres bulk insert: {}", params.contract_name, params.event_info.name, error);
+                                    error.to_string()
+                                })?;
                         }
                     }
                 }
-
-                if run_table_ops {
-                    // Create checkpoint config for saving progress on shutdown
-                    let checkpoint_config = ProgressCheckpointConfig::new(
-                        params.indexer_name.clone(),
-                        params.contract_name.clone(),
-                        params.event_info.name.clone(),
-                        params.postgres.clone(),
-                    );
-                    if let Err(e) = process_table_operations(
-                        &params.tables,
-                        &params.event_info.name,
-                        &table_events_data,
-                        params.postgres.clone(),
-                        params.clickhouse.clone(),
-                        params.providers.clone(),
-                        &params.constants,
-                        &params.multicall_addresses,
-                        Some(&checkpoint_config),
-                    )
-                    .await
-                    {
-                        // Don't log as error if it's a graceful shutdown
-                        if e.contains("Shutdown") {
-                            info!(
-                                "{}::{} - Graceful shutdown during table processing",
-                                params.contract_name, params.event_info.name
-                            );
-                        } else {
-                            error!(
-                                "{}::{} - Error processing table operations: {}",
-                                params.contract_name, params.event_info.name, e
-                            );
-                        }
-                        return Err(e.into());
+                if let Some(clickhouse) = &params.clickhouse {
+                    if !sql_bulk_data.is_empty() {
+                        clickhouse.insert_bulk(&params.sql_event_table_name,
+                            &params.sql_column_names, &sql_bulk_data).await
+                            .map_err(|error| {
+                                error!("{}::{} - Error performing clickhouse bulk insert: {}", params.contract_name, params.event_info.name, error);
+                                error.to_string()
+                            })?;
                     }
                 }
+                if let Some(csv) = &params.csv {
+                    if !csv_bulk_data.is_empty() {
+                        csv.append_bulk(csv_bulk_data).await.map_err(|error| error.to_string())?;
+                    }
+                }
+            }
+
+            let remaining_postgres = if postgres_applied.is_some() { None } else { params.postgres.clone() };
+            if !params.tables.is_empty() && !table_events_data.is_empty()
+                && (remaining_postgres.is_some() || params.clickhouse.is_some())
+            {
+                // PG derived effects were committed with their receipts. A later
+                // sink's partial progress must not checkpoint past unfinished output.
+                let checkpoint = postgres_applied.is_none().then(|| ProgressCheckpointConfig::new(
+                    params.indexer_name.clone(), params.contract_name.clone(),
+                    params.event_info.name.clone(), params.postgres.clone(),
+                ));
+                process_table_operations(&params.tables, &params.event_info.name,
+                    &table_events_data, remaining_postgres, params.clickhouse.clone(),
+                    params.providers.clone(), &params.constants, &params.multicall_addresses,
+                    checkpoint.as_ref()).await.inspect_err(|error| log_table_failure(&params, error))?;
             }
             // Build the cross-block chat payload first (one clone per event)
             // so the streams path can consume `event_message_data` into

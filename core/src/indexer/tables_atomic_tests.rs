@@ -3,8 +3,9 @@
 //! [`PgWriteMode::Tx`] (table operations plus their reorg-journal savepoints),
 //! [`PostgresClient::insert_bulk_with_cursor_in`] (raw event rows plus the
 //! `last_synced_block` cursor) and `COMMIT`, all on one pooled connection. That is the
-//! sequence the atomic arm of `no_code_callback` runs; the tests drive it directly because
-//! the callback's `trigger_event` retries on its own schedule.
+//! lower-level effect-staging primitives used by `no_code_callback`. These tests
+//! drive them directly; callback receipts and independent-output behavior are
+//! covered by the real callback tests in `postgres_replay_tests`.
 //!
 //! What is pinned here, in terms of the spec's failure table:
 //!

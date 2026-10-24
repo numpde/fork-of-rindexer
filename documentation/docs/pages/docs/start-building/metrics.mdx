@@ -74,6 +74,10 @@ rindexer_rpc_request_duration_seconds_count{method="eth_getLogs",network="mainne
 
 ### Database Metrics
 
+`rindexer_atomic_batches_total{status,reason}` counts no-code PostgreSQL application
+transactions, including those whose cursor is published later by the dispatcher.
+It does not establish atomic delivery to other storage systems or streams.
+
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `rindexer_db_operations_total` | Counter | `operation`, `status` | Total database operations |

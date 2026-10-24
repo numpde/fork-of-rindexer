@@ -1,6 +1,7 @@
 //! Integration tests for `PostgresClient::insert_bulk_with_cursor` — the
 //! atomic [event batch + `rindexer_internal` last-synced cursor] commit that
-//! closes the double-index race.
+//! keeps those writes atomic. These low-level methods do not deduplicate replay
+//! by themselves; the no-code callback's application receipts own that policy.
 //!
 //! Requires Docker (testcontainers). Mutates process-global state
 //! (`DATABASE_URL`) — safe under `cargo nextest` (process per test), which is

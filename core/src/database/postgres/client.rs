@@ -470,48 +470,14 @@ impl PostgresClient {
     /// guard. Callers pass at least one row; the wrapper returns early on an
     /// empty batch. A missing cursor row is an `Err`: dropping the transaction
     /// then rolls back everything staged in it.
-    pub(crate) async fn insert_bulk_with_cursor_in(
+    pub(crate) async fn insert_bulk_with_cursor_in<Row: AsRef<[EthereumSqlTypeWrapper]> + Sync>(
         transaction: &PgTransaction<'_>,
         table_name: &str,
         columns: &[String],
-        postgres_bulk_data: &[Vec<EthereumSqlTypeWrapper>],
+        postgres_bulk_data: &[Row],
         cursor: &BulkCursorUpdate,
     ) -> Result<CursorAdvance, String> {
-        let total_params = postgres_bulk_data.len() * columns.len();
-
-        if postgres_bulk_data.len() > 100 || total_params > 65535 {
-            let column_types: Vec<PgType> = postgres_bulk_data
-                .first()
-                .map(|row| row.iter().map(|param| param.to_type()).collect())
-                .unwrap_or_default();
-            copy_in_via_transaction(
-                transaction,
-                table_name,
-                columns,
-                &column_types,
-                postgres_bulk_data,
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-        } else {
-            let query = build_multi_row_insert_sql(table_name, columns, postgres_bulk_data.len());
-            let params: Vec<&(dyn ToSql + Sync)> = postgres_bulk_data
-                .iter()
-                .flatten()
-                .map(|param| param as &(dyn ToSql + Sync))
-                .collect();
-            // Metrics parity with the non-atomic path (bulk_insert_via_query goes
-            // through self.execute, which records; the COPY path records nothing
-            // there either, so only this branch records).
-            let start = Instant::now();
-            let result = transaction.execute(&query, &params).await;
-            db_metrics::record_db_operation(
-                ops::QUERY,
-                result.is_ok(),
-                start.elapsed().as_secs_f64(),
-            );
-            result.map_err(|e| pg_error_to_string(&e))?;
-        }
+        Self::insert_bulk_in(transaction, table_name, columns, postgres_bulk_data).await?;
 
         // Same statement + binding shape as update_progress_and_last_synced_task,
         // monotonic guard included, but inside the caller's transaction.
@@ -566,6 +532,56 @@ impl PostgresClient {
                 table_name
             )),
         }
+    }
+
+    /// Stage raw rows without taking ownership of the caller's checkpoint.
+    /// Borrowed selected rows keep large ABI values available to independent sinks.
+    pub(crate) async fn insert_bulk_in<Row: AsRef<[EthereumSqlTypeWrapper]> + Sync>(
+        transaction: &PgTransaction<'_>,
+        table_name: &str,
+        columns: &[String],
+        postgres_bulk_data: &[Row],
+    ) -> Result<(), String> {
+        if postgres_bulk_data.is_empty() {
+            return Ok(());
+        }
+        let total_params = postgres_bulk_data.len() * columns.len();
+
+        if postgres_bulk_data.len() > 100 || total_params > 65535 {
+            let column_types: Vec<PgType> = postgres_bulk_data
+                .first()
+                .map(|row| row.as_ref().iter().map(|param| param.to_type()).collect())
+                .unwrap_or_default();
+            copy_in_via_transaction(
+                transaction,
+                table_name,
+                columns,
+                &column_types,
+                postgres_bulk_data,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        } else {
+            let query = build_multi_row_insert_sql(table_name, columns, postgres_bulk_data.len());
+            let params: Vec<&(dyn ToSql + Sync)> = postgres_bulk_data
+                .iter()
+                .flat_map(|row| row.as_ref().iter())
+                .map(|param| param as &(dyn ToSql + Sync))
+                .collect();
+            // Metrics parity with the non-atomic path (bulk_insert_via_query goes
+            // through self.execute, which records; the COPY path records nothing
+            // there either, so only this branch records).
+            let start = Instant::now();
+            let result = transaction.execute(&query, &params).await;
+            db_metrics::record_db_operation(
+                ops::QUERY,
+                result.is_ok(),
+                start.elapsed().as_secs_f64(),
+            );
+            result.map_err(|e| pg_error_to_string(&e))?;
+        }
+
+        Ok(())
     }
 
     pub async fn raw_connection(
@@ -782,17 +798,17 @@ pub(crate) fn build_multi_row_insert_sql(
 /// `finish()` must run even after a failed write, otherwise the COPY never
 /// completes and leaves a hanging backend process
 /// (https://github.com/sfackler/rust-postgres/issues/1109).
-async fn write_binary_copy_rows(
+async fn write_binary_copy_rows<Row: AsRef<[EthereumSqlTypeWrapper]> + Sync>(
     sink: CopyInSink<bytes::Bytes>,
     column_types: &[PgType],
-    data: &[Vec<EthereumSqlTypeWrapper>],
+    data: &[Row],
 ) -> Result<(), BulkInsertPostgresError> {
     let writer = BinaryCopyInWriter::new(sink, column_types);
     pin_mut!(writer);
 
     for row in data {
         let row_refs: Vec<&(dyn ToSql + Sync)> =
-            row.iter().map(|param| param as &(dyn ToSql + Sync)).collect();
+            row.as_ref().iter().map(|param| param as &(dyn ToSql + Sync)).collect();
         if let Err(e) = writer.as_mut().write(&row_refs).await {
             error!("Error writing binary data, aborting early: {}", e);
             writer.as_mut().finish().await?;
@@ -807,12 +823,12 @@ async fn write_binary_copy_rows(
 
 /// Runs a binary COPY inside an already-open transaction, so the copied rows
 /// commit or roll back with everything else staged in it.
-pub(crate) async fn copy_in_via_transaction(
+pub(crate) async fn copy_in_via_transaction<Row: AsRef<[EthereumSqlTypeWrapper]> + Sync>(
     transaction: &PgTransaction<'_>,
     table_name: &str,
     column_names: &[String],
     column_types: &[PgType],
-    data: &[Vec<EthereumSqlTypeWrapper>],
+    data: &[Row],
 ) -> Result<(), BulkInsertPostgresError> {
     let stmt = build_copy_statement(table_name, column_names);
 
