@@ -277,7 +277,7 @@ pub fn fetch_logs_stream(
         }
 
         while current_filter.from_block() <= snapshot_to_block {
-            if !is_running() || config.cancel_token().is_cancelled() {
+            if !is_running() || config.cancel_token().is_cancelled() || tx.is_closed() {
                 break;
             }
 
@@ -1225,7 +1225,7 @@ async fn live_indexing_stream(
     loop {
         let iteration_start = Instant::now();
 
-        if !is_running() || cancel_token.is_cancelled() {
+        if !is_running() || cancel_token.is_cancelled() || tx.is_closed() {
             break;
         }
 

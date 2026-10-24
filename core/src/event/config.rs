@@ -21,7 +21,8 @@ use crate::types::single_or_array::StringOrArray;
 use crate::{
     event::{
         callback_registry::{
-            EventCallbackRegistry, EventResult, TraceCallbackRegistry, TraceResult,
+            CallbackExecutionResult, EventCallbackRegistry, EventResult, TraceCallbackRegistry,
+            TraceResult,
         },
         contract_setup::NetworkContract,
         BuildRindexerFilterError, RindexerEventFilter,
@@ -117,7 +118,7 @@ impl ContractEventProcessingConfig {
         }
     }
 
-    pub async fn trigger_event(&self, fn_data: Vec<EventResult>) -> Result<(), String> {
+    pub async fn trigger_event(&self, fn_data: Vec<EventResult>) -> CallbackExecutionResult<()> {
         self.registry.trigger_event(&self.id, fn_data).await
     }
 }
@@ -193,10 +194,12 @@ impl FactoryEventProcessingConfig {
         )
     }
 
-    pub async fn trigger_event(&self, events: Vec<EventResult>) -> Result<(), String> {
+    pub async fn trigger_event(&self, events: Vec<EventResult>) -> CallbackExecutionResult<()> {
         self.registry.trigger_event(&self.id, events.clone()).await?;
 
-        update_known_factory_deployed_addresses(self, &events).await.map_err(|e| e.to_string())
+        update_known_factory_deployed_addresses(self, &events)
+            .await
+            .map_err(|e| e.to_string().into())
     }
 
     pub fn info_log_name(&self) -> String {
@@ -438,7 +441,7 @@ impl EventProcessingConfig {
         }
     }
 
-    pub async fn trigger_event(&self, fn_data: Vec<EventResult>) -> Result<(), String> {
+    pub async fn trigger_event(&self, fn_data: Vec<EventResult>) -> CallbackExecutionResult<()> {
         match self {
             Self::ContractEventProcessing(config) => config.trigger_event(fn_data).await,
             Self::FactoryEventProcessing(config) => config.trigger_event(fn_data).await,

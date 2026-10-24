@@ -181,8 +181,31 @@ impl EventResult {
 
 pub type EventCallbackResult<T> = Result<T, String>;
 
+/// Execution failures carry retry policy; user handler String errors remain retryable.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum CallbackError {
+    #[error("{0}")]
+    Retryable(String),
+    #[error("{0}")]
+    Permanent(String),
+}
+
+impl From<String> for CallbackError {
+    fn from(message: String) -> Self {
+        Self::Retryable(message)
+    }
+}
+
+impl From<&str> for CallbackError {
+    fn from(message: &str) -> Self {
+        Self::Retryable(message.to_string())
+    }
+}
+
+pub type CallbackExecutionResult<T> = Result<T, CallbackError>;
+
 pub type EventCallbackType =
-    Arc<dyn Fn(Vec<EventResult>) -> BoxFuture<'static, EventCallbackResult<()>> + Send + Sync>;
+    Arc<dyn Fn(Vec<EventResult>) -> BoxFuture<'static, CallbackExecutionResult<()>> + Send + Sync>;
 pub type TraceCallbackType =
     Arc<dyn Fn(Vec<TraceResult>) -> BoxFuture<'static, EventCallbackResult<()>> + Send + Sync>;
 
@@ -258,6 +281,7 @@ impl Clone for EventCallbackRegistryInformation {
 pub struct EventCallbackRegistry {
     pub events: Vec<EventCallbackRegistryInformation>,
     pub on_reorg: Vec<OnReorgCallback>,
+    failures: Arc<CallbackFailures>,
 }
 
 impl Default for EventCallbackRegistry {
@@ -268,11 +292,15 @@ impl Default for EventCallbackRegistry {
 
 impl EventCallbackRegistry {
     pub(crate) fn failure_state(&self) -> Arc<CallbackFailures> {
-        Arc::new(CallbackFailures::default())
+        self.failures.clone()
     }
 
     pub fn new() -> Self {
-        EventCallbackRegistry { events: Vec::new(), on_reorg: Vec::new() }
+        EventCallbackRegistry {
+            events: Vec::new(),
+            on_reorg: Vec::new(),
+            failures: Arc::new(CallbackFailures::default()),
+        }
     }
 
     pub fn find_event(&self, id: &String) -> Option<&EventCallbackRegistryInformation> {
@@ -291,16 +319,34 @@ impl EventCallbackRegistry {
         fire_on_reorg_isolated(&self.on_reorg, notification, "EventCallbackRegistry").await;
     }
 
-    pub async fn trigger_event(&self, id: &String, data: Vec<EventResult>) -> Result<(), String> {
+    pub async fn trigger_event(
+        &self,
+        id: &String,
+        data: Vec<EventResult>,
+    ) -> CallbackExecutionResult<()> {
         if let Some(event_information) = self.find_event(id) {
-            trigger_event(
+            let stream = data.first().map(|event| FailedStream {
+                id: id.clone(),
+                indexer: event_information.indexer_name.clone(),
+                contract: event_information.contract.name.clone(),
+                event: event_information.event_name.clone(),
+                network: event.tx_information.network.clone(),
+                from_block: event.found_in_request.from_block.to(),
+                to_block: event.found_in_request.to_block.to(),
+            });
+            let result = trigger_event(
                 id,
                 data,
                 |d| (event_information.callback)(d),
                 || event_information.info_log_name(),
                 &event_information.topic_id.to_string(),
+                stream.as_ref().map(|stream| (self.failures.as_ref(), stream.network.as_str())),
             )
-            .await
+            .await;
+            if let (Some(stream), Err(CallbackError::Permanent(reason))) = (stream, &result) {
+                self.failures.record(stream, reason.clone());
+            }
+            result
         } else {
             let message = format!(
                 "EventCallbackRegistry: No event found for id: {}. Data: {:?}",
@@ -308,7 +354,7 @@ impl EventCallbackRegistry {
                 data.first()
             );
             error!(message);
-            Err(message)
+            Err(CallbackError::Permanent(message))
         }
     }
 
@@ -491,10 +537,6 @@ pub struct TraceCallbackRegistry {
 }
 
 impl TraceCallbackRegistry {
-    pub(crate) fn failure_state(&self) -> Arc<CallbackFailures> {
-        Arc::new(CallbackFailures::default())
-    }
-
     pub fn new() -> Self {
         TraceCallbackRegistry { events: Vec::new(), on_reorg: Vec::new() }
     }
@@ -520,11 +562,16 @@ impl TraceCallbackRegistry {
             trigger_event(
                 id,
                 data,
-                |d| (event_information.callback)(d),
+                |d| {
+                    let callback = (event_information.callback)(d);
+                    async move { callback.await.map_err(CallbackError::from) }.boxed()
+                },
                 || event_information.info_log_name(),
                 &event_information.event_name,
+                None,
             )
             .await
+            .map_err(|error| error.to_string())
         } else {
             let message = format!("TraceCallbackRegistry: No event found for id: {id}");
             error!("TraceCallbackRegistry: No event found for id: {}", id);
@@ -561,10 +608,11 @@ async fn fire_on_reorg_isolated(
 async fn trigger_event<T>(
     id: &String,
     data: Vec<T>,
-    callback: impl Fn(Vec<T>) -> BoxFuture<'static, EventCallbackResult<()>>,
+    callback: impl Fn(Vec<T>) -> BoxFuture<'static, CallbackExecutionResult<()>>,
     info_log_name: impl Fn() -> String,
     event_identifier: &str,
-) -> Result<(), String>
+    failure_scope: Option<(&CallbackFailures, &str)>,
+) -> CallbackExecutionResult<()>
 where
     T: Clone,
 {
@@ -577,10 +625,23 @@ where
     loop {
         if !is_running() {
             info!("Detected shutdown, stopping event trigger");
-            return Err("Detected shutdown, stopping event trigger".to_string());
+            return Err("Detected shutdown, stopping event trigger".into());
         }
 
-        match callback(data.clone()).await {
+        if let Some((failures, network)) = failure_scope {
+            if let Some(reason) = failures.reason(id, network) {
+                return Err(CallbackError::Permanent(reason));
+            }
+        }
+        let callback = callback(data.clone());
+        let result = match failure_scope {
+            Some((failures, network)) => tokio::select! {
+                result = callback => result,
+                reason = failures.wait_failed(id, network) => return Err(CallbackError::Permanent(reason)),
+            },
+            None => callback.await,
+        };
+        match result {
             Ok(_) => {
                 debug!(
                     "Event processing succeeded for id: {} - topic_id: {}",
@@ -588,10 +649,20 @@ where
                 );
                 return Ok(());
             }
-            Err(e) => {
+            Err(CallbackError::Permanent(reason)) => {
+                error!(
+                    "{} Event processing permanently failed - id: {} - topic_id: {}. Error: {}",
+                    info_log_name(),
+                    id,
+                    event_identifier,
+                    reason
+                );
+                return Err(CallbackError::Permanent(reason));
+            }
+            Err(CallbackError::Retryable(e)) => {
                 if !is_running() {
                     info!("Detected shutdown, stopping event trigger");
-                    return Err(e);
+                    return Err(CallbackError::Retryable(e));
                 }
                 attempts += 1;
                 error!(

@@ -117,8 +117,9 @@ async fn csv_rejects_batch(mixed: bool, no_topics: bool) {
             .catch_unwind()
             .await
             .expect("malformed ABI input must return an error rather than panic");
-        let error =
-            result.expect_err("a rejected event must not disappear behind a successful callback");
+        let error = result
+            .expect_err("a rejected event must not disappear behind a successful callback")
+            .to_string();
         assert!(
             std::fs::read(file.path()).unwrap().is_empty(),
             "reject the entire batch before writing valid neighbors"

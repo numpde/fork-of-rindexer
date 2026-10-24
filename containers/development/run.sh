@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Generated Rust travels on stdout; compilation and packaging diagnostics use stderr.
+if [[ "${1:?missing command}" == codegen-typings ]]; then
+  exec 3>&1
+  exec 1>&2
+fi
 mkdir -p /work /tmp/home /tmp/cargo
 # One checkout shares a build volume. Never race GraphQL packaging or Cargo.
 exec 9>/build/development.lock
@@ -30,6 +35,8 @@ if ! test -f "$RINDEXER_GRAPHQL_PREBUILT" || ! test -f /build/graphql/input.sha2
   printf '%s\n' "$key" > /build/graphql/input.sha256
 fi
 case "$1" in
+  codegen-typings)
+    exec python3 -B containers/development/typings.py generate --root /work >&3 ;;
   compile) exec cargo nextest run --frozen -p rindexer --test postgres_bytea_array --no-run ;;
   permanent-failures)
     cargo nextest run --frozen -p rindexer --lib --no-run \

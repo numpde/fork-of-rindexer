@@ -142,7 +142,7 @@ fn generate_register_match_arms_code(event_type_name: &str, event_info: &[EventI
                         let event = Arc::new(event);
                         let callback = Arc::new(move |result| {{
                             let event = Arc::clone(&event);
-                            async move {{ event.call(result).await }}.boxed()
+                            async move {{ event.call(result).await.map_err(Into::into) }}.boxed()
                         }});
                         (callback, reorg_sender)
                     }},
@@ -423,7 +423,7 @@ use rindexer::{{
     blockclock::BlockClock,
     event::{{
         callback_registry::{{
-            EventCallbackRegistry, EventCallbackRegistryInformation, EventCallbackResult,
+            CallbackExecutionResult, EventCallbackRegistry, EventCallbackRegistryInformation, EventCallbackResult,
             EventResult, TxInformation, HasTxInformation
         }},
         contract_setup::{{ContractInformation, NetworkContract}},
@@ -563,7 +563,7 @@ impl<TExtensions> {event_type_name}<TExtensions> where TExtensions: 'static + Se
         }};
 
         let (callback, reorg_sender): (
-            Arc<dyn Fn(Vec<EventResult>) -> BoxFuture<'static, EventCallbackResult<()>> + Send + Sync>,
+            Arc<dyn Fn(Vec<EventResult>) -> BoxFuture<'static, CallbackExecutionResult<()>> + Send + Sync>,
             Option<tokio::sync::broadcast::Sender<rindexer::ReorgEvent>>,
         ) = match self {{
             {register_match_arms}

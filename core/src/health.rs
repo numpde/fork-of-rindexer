@@ -7,7 +7,7 @@ use tracing::{error, info};
 
 use crate::{
     database::postgres::client::PostgresClient,
-    event::callback_registry::CallbackFailures,
+    event::callback_registry::{CallbackFailures, FailedStream},
     indexer::task_tracker::active_indexing_count,
     manifest::core::Manifest,
     metrics::metrics_handler,
@@ -33,6 +33,8 @@ pub struct HealthServices {
 pub struct IndexingStatus {
     pub active_tasks: usize,
     pub is_running: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed_streams: Vec<FailedStream>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,15 +110,19 @@ async fn health_handler(
     Extension(failures): Extension<CallbackFailureSources>,
 ) -> Result<(StatusCode, Json<HealthStatus>), StatusCode> {
     let database_health = check_database_health(&state).await;
-    let _failed_streams =
-        failures.0.iter().flat_map(|source| source.snapshot()).collect::<Vec<_>>();
-    let indexing_health = check_indexing_health();
+    let failed_streams = failures.0.iter().flat_map(|source| source.snapshot()).collect::<Vec<_>>();
+    let indexing_health = check_indexing_health(&failed_streams);
     let sync_health = check_sync_health(&state).await;
 
     let overall_status = determine_overall_status(&database_health, &indexing_health, &sync_health);
 
-    let health_status =
-        build_health_status(overall_status, database_health, indexing_health, sync_health);
+    let health_status = build_health_status(
+        overall_status,
+        database_health,
+        indexing_health,
+        sync_health,
+        failed_streams,
+    );
 
     let status_code = if matches!(health_status.status, HealthStatusType::Healthy) {
         StatusCode::OK
@@ -132,6 +138,7 @@ fn build_health_status(
     database_health: HealthStatusType,
     indexing_health: HealthStatusType,
     sync_health: HealthStatusType,
+    failed_streams: Vec<FailedStream>,
 ) -> HealthStatus {
     HealthStatus {
         status: overall_status,
@@ -144,6 +151,7 @@ fn build_health_status(
         indexing: IndexingStatus {
             active_tasks: active_indexing_count(),
             is_running: is_running(),
+            failed_streams,
         },
     }
 }
@@ -165,7 +173,10 @@ async fn check_database_health(state: &HealthServerState) -> HealthStatusType {
     }
 }
 
-fn check_indexing_health() -> HealthStatusType {
+fn check_indexing_health(failed_streams: &[FailedStream]) -> HealthStatusType {
+    if !failed_streams.is_empty() {
+        return HealthStatusType::Unhealthy;
+    }
     if matches!(get_reload_state(), ReloadState::Reloading) {
         return HealthStatusType::Reloading;
     }
@@ -239,7 +250,7 @@ fn determine_overall_status(
     sync: &HealthStatusType,
 ) -> HealthStatusType {
     if matches!(database, HealthStatusType::Unhealthy | HealthStatusType::NotConfigured)
-        || matches!(indexing, HealthStatusType::Stopped)
+        || matches!(indexing, HealthStatusType::Stopped | HealthStatusType::Unhealthy)
         || matches!(sync, HealthStatusType::Unhealthy | HealthStatusType::NotConfigured)
     {
         HealthStatusType::Unhealthy

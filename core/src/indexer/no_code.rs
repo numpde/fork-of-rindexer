@@ -44,9 +44,9 @@ use crate::{
     },
     event::{
         callback_registry::{
-            noop_decoder, CallbackResult, EventCallbackRegistry, EventCallbackRegistryInformation,
-            EventCallbackType, TraceCallbackRegistry, TraceCallbackRegistryInformation,
-            TraceCallbackType, TxInformation,
+            noop_decoder, CallbackError, CallbackResult, EventCallbackRegistry,
+            EventCallbackRegistryInformation, EventCallbackType, TraceCallbackRegistry,
+            TraceCallbackRegistryInformation, TraceCallbackType, TxInformation,
         },
         contract_setup::{ContractInformation, CreateContractInformationError, TraceInformation},
         EventMessage,
@@ -247,7 +247,10 @@ pub async fn setup_no_code(
             )
             .await?;
 
-            let registry = EventCallbackRegistry { events, on_reorg: Vec::new() };
+            let mut registry = EventCallbackRegistry::new();
+            for event in events {
+                registry.register_event(event);
+            }
             info!(
                 "Events registered to index:{}",
                 registry
@@ -470,14 +473,14 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
                     .map(|result| {
                         // Decode the entire batch before any sink or derived-table effects.
                         let log = parse_log(&params.event, &result.log).ok_or_else(|| {
-                            format!(
+                            CallbackError::Permanent(format!(
                                 "Cannot decode {:?}::{:?} on network {:?}: transaction {:#x}, log_index={} does not match the configured event ABI; this callback attempt made no writes",
                                 params.contract_name,
                                 params.event_info.name,
                                 result.tx_information.network,
                                 result.tx_information.transaction_hash,
                                 result.tx_information.log_index,
-                            )
+                            ))
                         })?;
 
                         let address = result.tx_information.address;
@@ -526,7 +529,7 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
                             end_global_parameters,
                         ))
                     })
-                    .collect::<Result<Vec<_>, String>>()?,
+                    .collect::<Result<Vec<_>, CallbackError>>()?,
                 CallbackResult::Trace(events) => events
                     .iter()
                     .filter_map(|result| {
@@ -633,6 +636,15 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
                 let mut all_params: Vec<EthereumSqlTypeWrapper> = vec![contract_address];
                 all_params.extend(event_parameters);
                 all_params.extend(end_global_parameters);
+
+                if params.postgres.is_some() && params.store_raw_events
+                    && all_params.iter().any(EthereumSqlTypeWrapper::postgres_text_contains_nul)
+                {
+                    return Err(CallbackError::Permanent(format!(
+                        "Cannot store {:?}::{:?} on network {:?}: transaction {:#x}, log_index={} contains U+0000 in a PostgreSQL text/JSONB value; this callback attempt made no writes",
+                        params.contract_name, params.event_info.name, network, transaction_hash, log_index,
+                    )));
+                }
 
                 // Set column types dynamically based on first result
                 if sql_bulk_column_types.is_empty() {
@@ -760,7 +772,7 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
                                     params.contract_name, params.event_info.name, e
                                 );
                             }
-                            return Err(e);
+                            return Err(e.into());
                         }
                     }
                 } else {
@@ -772,13 +784,13 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
                 if !prepared.ops.is_empty() || write_raw_rows {
                     // The ONLY shutdown check after prepare; none after BEGIN.
                     if !is_running() {
-                        return Err("Shutdown requested".to_string());
+                        return Err("Shutdown requested".into());
                     }
 
                     // Never expect()/unwrap() here: a panic skips
                     // indexing_event_processed() and hangs shutdown.
                     let Some(postgres) = params.postgres.as_ref() else {
-                        return Err("atomic arm requires a Postgres client".to_string());
+                        return Err("atomic arm requires a Postgres client".into());
                     };
 
                     let schema = generate_indexer_contract_schema_name(
@@ -891,7 +903,7 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
                                     "{}::{} - Error performing postgres bulk insert: {}",
                                     params.contract_name, params.event_info.name, e
                                 );
-                                return Err(e.to_string());
+                                return Err(e.to_string().into());
                             }
                         }
                     }
@@ -910,7 +922,7 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
                                     "{}::{} - Error performing clickhouse bulk insert: {}",
                                     params.contract_name, params.event_info.name, e
                                 );
-                                return Err(e.to_string());
+                                return Err(e.to_string().into());
                             };
                         }
                     }
@@ -918,7 +930,7 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
                     if let Some(csv) = &params.csv {
                         if !csv_bulk_data.is_empty() {
                             if let Err(e) = csv.append_bulk(csv_bulk_data).await {
-                                return Err(e.to_string());
+                                return Err(e.to_string().into());
                             }
                         }
                     }
@@ -957,7 +969,7 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
                                 params.contract_name, params.event_info.name, e
                             );
                         }
-                        return Err(e);
+                        return Err(e.into());
                     }
                 }
             }
@@ -1122,8 +1134,10 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
         Arc::new(move |events| callback(CallbackResult::Event(events)));
 
     let callback = Arc::clone(&shared_callback);
-    let trace_callback: TraceCallbackType =
-        Arc::new(move |traces| callback(CallbackResult::Trace(traces)));
+    let trace_callback: TraceCallbackType = Arc::new(move |traces| {
+        let future = callback(CallbackResult::Trace(traces));
+        async move { future.await.map_err(|error| error.to_string()) }.boxed()
+    });
 
     EventCallbacks { trace_callback, event_callback }
 }

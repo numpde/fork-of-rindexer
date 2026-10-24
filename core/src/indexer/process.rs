@@ -140,6 +140,13 @@ async fn process_event_logs(
             .map_err(|e| Box::new(ProviderError::CustomError(e.to_string())))?;
         if block_until_indexed {
             task.await.map_err(|e| Box::new(ProviderError::BatchRequestFailed(e)))?;
+            if let Some(reason) = config
+                .registry()
+                .failure_state()
+                .reason(config.id(), &config.network_contract().network)
+            {
+                return Err(Box::new(ProviderError::CustomError(reason)));
+            }
         } else {
             in_flight.push(task);
             while let std::task::Poll::Ready(Some(joined)) = poll!(in_flight.next()) {
@@ -149,7 +156,20 @@ async fn process_event_logs(
         Ok(())
     }
 
-    'outer: while let Some(result) = logs_stream.next().await {
+    let failures = config.registry().failure_state();
+    let network = config.network_contract().network.clone();
+    'outer: loop {
+        let result = tokio::select! {
+            result = logs_stream.next() => result,
+            reason = failures.wait_failed(config.id(), &network) => {
+                return Err(Box::new(ProviderError::CustomError(format!(
+                    "{} - Stream permanently blocked: {}", config.info_log_name(), reason
+                ))));
+            }
+        };
+        let Some(result) = result else {
+            break;
+        };
         if let Some(e) = pending_error.take() {
             return Err(Box::new(ProviderError::CustomError(e.to_string())));
         }
@@ -262,6 +282,10 @@ async fn process_event_logs(
 
     while let Some(joined) = in_flight.next().await {
         joined.map_err(|e| Box::new(ProviderError::BatchRequestFailed(e)))?;
+    }
+
+    if let Some(reason) = failures.reason(config.id(), &network) {
+        return Err(Box::new(ProviderError::CustomError(reason)));
     }
 
     Ok(())
@@ -517,6 +541,16 @@ async fn live_indexing_for_contract_event_dependencies(
     loop {
         if !is_running() {
             break;
+        }
+        for (config, _) in &events {
+            if let Some(reason) = config.registry().failure_state().reason(config.id(), &network) {
+                error!(
+                    "{} - Stopping dependent live indexing after a permanent stream failure: {}",
+                    config.info_log_name(),
+                    reason
+                );
+                return;
+            }
         }
         if generation_cancel.as_ref().is_some_and(|t| t.is_cancelled()) {
             info!("Hot-reload: generation cancelled, stopping live indexing for {}", network);
@@ -799,6 +833,12 @@ async fn live_indexing_for_contract_event_dependencies(
                                 );
                                 break;
                             }
+                            if let Some(reason) =
+                                config.registry().failure_state().reason(config.id(), &network)
+                            {
+                                error!("{} - Stopping dependent live indexing after a permanent stream failure: {}", config.info_log_name(), reason);
+                                return;
+                            }
                             ordering_live_indexing_details.last_seen_block_number = to_block;
                             if logs_empty {
                                 ordering_live_indexing_details.filter =
@@ -883,6 +923,14 @@ async fn trigger_event(
     checkpoint: CheckpointTurn,
 ) {
     let _activity = ActiveCallback::start();
+    if config
+        .registry()
+        .failure_state()
+        .reason(config.id(), &config.network_contract().network)
+        .is_some()
+    {
+        return;
+    }
 
     // Record events processed metric
     let event_count = fn_data.len() as u64;
@@ -936,6 +984,13 @@ async fn handle_logs_result(
 ) -> Result<JoinHandle<()>, Box<dyn std::error::Error + Send>> {
     match result {
         Ok(result) => {
+            if let Some(reason) = config
+                .registry()
+                .failure_state()
+                .reason(config.id(), &config.network_contract().network)
+            {
+                return Err(Box::new(ProviderError::CustomError(reason)));
+            }
             // Reorg signal from reth ExEx — the coordinator handles rollback,
             // so we just skip processing these empty results.
             if result.reorg.is_some() {

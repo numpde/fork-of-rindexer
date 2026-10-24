@@ -19,7 +19,7 @@ use crate::{
     blockclock::BlockClock,
     event::{
         callback_registry::{
-            noop_decoder, EventCallbackRegistry, EventCallbackRegistryInformation,
+            noop_decoder, CallbackError, EventCallbackRegistry, EventCallbackRegistryInformation,
             EventCallbackType,
         },
         config::{ContractEventProcessingConfig, EventProcessingConfig},
@@ -44,7 +44,15 @@ struct Fixture {
 impl Fixture {
     async fn new(callback: EventCallbackType) -> Self {
         let directory = tempfile::tempdir().expect("checkpoint directory");
-        let provider = Arc::new(MockChainProvider::new(1).with_block_number(10));
+        let provider =
+            Arc::new(MockChainProvider::new(1).with_block_number(10).with_logs(vec![Log {
+                block_hash: Some(B256::repeat_byte(2)),
+                block_number: Some(2),
+                transaction_hash: Some(B256::repeat_byte(2)),
+                transaction_index: Some(0),
+                log_index: Some(0),
+                ..Default::default()
+            }]));
         let network = NetworkContract {
             id: "checkpoint".to_string(),
             network: "ethereum".to_string(),
@@ -270,5 +278,77 @@ async fn unrelated_stream_can_checkpoint_while_another_stream_is_blocked() {
     release.notify_one();
     first.await.expect("release blocked stream");
     assert_eq!(other_cursor, "3");
+    assert_eq!(active_indexing_count(), 0);
+}
+
+async fn assert_terminal_historical_outcome(block_until_indexed: bool) {
+    let fixture = Fixture::new(Arc::new(|_| {
+        async { Err(CallbackError::Permanent("unrepresentable event".to_string())) }.boxed()
+    }))
+    .await;
+    timeout(
+        Duration::from_secs(5),
+        super::process_event_logs(fixture.config.clone(), true, block_until_indexed, None, None),
+    )
+    .await
+    .expect("terminal historical stream must finish")
+    .expect_err("failed last batch must not authorize dependent streams to start");
+    assert_eq!(fixture.cursor(), "1");
+    assert_eq!(fixture.config.registry().failure_state().snapshot().len(), 1);
+    assert_eq!(active_indexing_count(), 0);
+}
+
+#[tokio::test]
+async fn terminal_last_historical_callback_returns_failure_after_stream_ends() {
+    assert_terminal_historical_outcome(false).await;
+}
+
+#[tokio::test]
+async fn terminal_dependency_callback_returns_failure_instead_of_starting_dependents() {
+    assert_terminal_historical_outcome(true).await;
+}
+
+#[tokio::test]
+async fn terminal_callback_cancels_pending_callbacks_and_blocks_empty_tail() {
+    let first_started = Arc::new(Notify::new());
+    let started = first_started.clone();
+    let mut fixture = Fixture::new(Arc::new(move |events| {
+        let started = started.clone();
+        async move {
+            if events[0].tx_information.block_number == 2 {
+                started.notify_one();
+                futures::future::pending::<()>().await;
+                Ok(())
+            } else {
+                Err(CallbackError::Permanent("unrepresentable event".to_string()))
+            }
+        }
+        .boxed()
+    }))
+    .await;
+    let first = fixture.dispatch(2, false).await;
+    timeout(Duration::from_secs(5), first_started.notified()).await.expect("first callback starts");
+    timeout(Duration::from_secs(5), fixture.dispatch(3, false).await)
+        .await
+        .expect("terminal callback completes")
+        .expect("terminal task joins");
+    timeout(Duration::from_secs(5), first)
+        .await
+        .expect("pending same-stream callback is cancelled")
+        .expect("cancelled work joins");
+    let blocked = handle_logs_result(
+        fixture.config.clone(),
+        fixture.permits.clone(),
+        &mut fixture.checkpoints,
+        Ok(FetchLogsResult {
+            logs: vec![],
+            from_block: U64::from(4),
+            to_block: U64::from(4),
+            reorg: None,
+        }),
+    )
+    .await;
+    assert!(blocked.is_err(), "empty tails must not restart a permanently failed stream");
+    assert_eq!(fixture.cursor(), "1");
     assert_eq!(active_indexing_count(), 0);
 }

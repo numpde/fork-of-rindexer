@@ -1,0 +1,64 @@
+# Terminal event failures
+
+No-code event indexing now stops the affected event stream on its network when a
+log cannot be decoded with the configured ABI, or when a raw PostgreSQL event
+value contains NUL in text, a text array, or JSONB. Retrying those same inputs
+cannot succeed. PostgreSQL binary values can still contain zero bytes.
+
+The callback rejects the batch before making writes or publishing its outputs.
+The failed batch does not advance the durable cursor. Previously committed
+batches remain committed. With concurrent callbacks, another batch may already
+have produced effects before the failure becomes known; stopping it cannot undo
+those effects. This change does not make replayed effects idempotent or make
+independent PostgreSQL, ClickHouse, CSV and stream writes atomic.
+
+Other event streams and networks can continue. A dependency group stops when a
+prerequisite stream fails. Retryable errors, including existing Rust handlers'
+`String` errors and transient storage failures, retain their retry behavior.
+This policy currently applies to event callbacks; native-transfer and block trace
+callbacks retain their previous retry and checkpoint behavior.
+
+## Monitoring and recovery
+
+When the engine's health server is enabled, a retained terminal event failure makes
+`GET /health` return HTTP 503 with `services.indexing` set to `"unhealthy"`.
+`indexing.failed_streams` lists the callback `id`, `indexer`, `contract`, `event`,
+`network`, and requested `from_block` and `to_block`. The range identifies the
+rejected batch, rather than a guarantee that every block in it contained a bad
+event. The field is omitted when there are no recorded failures.
+
+Read the error log for the cause and event identity; the health response does not
+include callback error text or event payloads. The failure stays recorded for the
+registry's lifetime. Restart indexing after correcting the ABI or choosing storage
+that can represent the data. A PostgreSQL schema change cannot make PostgreSQL text
+accept NUL. There is no automatic skip, payload rewriting, quarantine, or historical
+repair. Review previously indexed history before rebuilding affected data. Health
+status does not establish general per-stream freshness or detect every stalled
+RPC request or retryable error.
+
+## Rust projects
+
+Run `rindexer codegen typings` to regenerate event registration adapters before
+building existing generated projects against the new core. Existing user event
+handlers keep returning `EventCallbackResult<T> = Result<T, String>`; these errors
+remain retryable.
+
+Handwritten engine registration code using `EventCallbackType` now returns
+`CallbackExecutionResult<T> = Result<T, CallbackError>`. Convert a retryable
+`String` error with `.map_err(Into::into)`, or deliberately return
+`CallbackError::Permanent(message)` when repeating the callback cannot succeed.
+Only declare an error permanent when stopping the stream is the intended policy;
+this does not roll back effects already performed by a custom callback.
+`EventCallbackRegistry::trigger_event` and event-processing config trigger methods
+return this typed result too.
+
+Construct registries with `EventCallbackRegistry::new()` or `default()` and register
+events with `register_event`. Struct literals are no longer supported because the
+registry now owns shared failure state. Clones and `complete()` share that state.
+Code constructing `health::IndexingStatus` directly must also initialize its new
+`failed_streams` field, usually with an empty vector.
+
+For contributors, `make codegen/typings/check` generates the workspace examples in
+an offline container and reports drift. `make codegen/typings/update` applies that
+output to their existing generated typings directories. Prepare the toolchain and
+locked dependencies first using `make dev/image/build` and `make deps/install`.

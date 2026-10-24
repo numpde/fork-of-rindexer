@@ -134,7 +134,7 @@ if ! docker image inspect "$$RINDEXER_RUNNER_IMAGE" >/dev/null; then
 fi
 git ls-files -z --deduplicate --cached --others --exclude-standard -- \
   Cargo.toml Cargo.lock rust-toolchain.toml rustfmt.toml .cargo core cli xtask \
-  e2e-tests examples graphql tests/development > "$$scratch_dir/source-candidates"
+  e2e-tests examples graphql tests/development containers/development/typings.py > "$$scratch_dir/source-candidates"
 : > "$$scratch_dir/source-files"
 while IFS= read -r -d '' file; do
   if ! test -e "$$file" && ! test -L "$$file"; then
@@ -154,6 +154,70 @@ compose_cleanup_required=1
 endef
 
 # The ## annotations are the help source, kept beside the recipes they describe.
+define refresh_typings
+# Source generation and host writes use separate offline containers. The writer
+# sees only Cargo metadata, the archive, and the existing generated directories.
+selected_context=$$(docker context show)
+if [[ "$$(docker context inspect "$$selected_context" --format '{{.Endpoints.docker.Host}}')" != unix:///* ]]; then
+  echo 'Typing refresh requires a local Unix-socket Docker context for output binds.' >&2; exit 2
+fi
+unset DOCKER_HOST DOCKER_TLS_VERIFY DOCKER_CERT_PATH DOCKER_API_VERSION
+export DOCKER_CONTEXT="$$selected_context"
+if (( $$(id -u) == 0 )); then
+  echo 'Run typing refresh as the non-root checkout owner.' >&2; exit 2
+fi
+$(call offline_runner,$$dependency_image)
+case "$$checkout_root" in *','*|*$$'\n'*) echo 'Checkout path cannot be encoded as a Docker bind mount.' >&2; exit 2;; esac
+$(compose) run --rm --no-deps -T offline codegen-typings > "$$scratch_dir/typings.tar"
+chmod 0444 "$$scratch_dir/typings.tar"
+typing_inputs=(--mount "type=bind,src=$$checkout_root/Cargo.toml,dst=/repo/Cargo.toml,readonly" \
+  --mount "type=bind,src=$$checkout_root/containers/development/typings.py,dst=/tools/typings.py,readonly")
+typing_runtime=(--rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
+  --pids-limit 64 --memory 256m --cpus 1 --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m)
+# Rootless container uid 0 maps to the non-root daemon owner on the host.
+# A rootful daemon instead needs the caller's explicit uid and gid.
+typing_user="$$(id -u):$$(id -g)"
+docker_security=$$(docker info --format '{{range .SecurityOptions}}{{println .}}{{end}}')
+while IFS= read -r option; do
+  if [[ "$$option" == name=rootless ]]; then typing_user=0:0; fi
+done <<< "$$docker_security"
+docker run "$${typing_runtime[@]}" --user 65532:65532 "$${typing_inputs[@]}" \
+  --entrypoint python3 "$$toolchain_image" -B /tools/typings.py roots --root /repo > "$$scratch_dir/typing-roots"
+readonly_output=
+if [[ '$(1)' == check ]]; then readonly_output=,readonly; fi
+while IFS= read -r output; do
+  if ! test -d "$$output" || test -L "$$output"; then
+    echo "Typing output directory must already exist without symlinks: $$output" >&2; exit 2
+  fi
+  parent="$$output"
+  while [[ "$$parent" != . ]]; do
+    if test -L "$$parent"; then echo "Symlink output parent: $$parent" >&2; exit 2; fi
+    parent=$$(dirname "$$parent")
+  done
+  typing_inputs+=(--mount "type=bind,src=$$checkout_root/$$output,dst=/repo/$$output$$readonly_output")
+done < "$$scratch_dir/typing-roots"
+docker run "$${typing_runtime[@]}" --user "$$typing_user" "$${typing_inputs[@]}" \
+  --mount "type=bind,src=$$scratch_dir/typings.tar,dst=/input/typings.tar,readonly" \
+  --entrypoint python3 "$$toolchain_image" -B /tools/typings.py '$(1)' --root /repo --archive /input/typings.tar
+if [[ '$(1)' == update ]]; then
+  while IFS= read -r output; do
+    while IFS= read -r -d '' file; do
+      if ! test -e "$$file" && ! test -L "$$file"; then continue; fi
+      if [[ "$$(stat -c '%u' "$$file")" != "$$(id -u)" ]]; then
+        echo "Generated file is not owned by the checkout user: $$file" >&2; exit 2
+      fi
+    done < <(git ls-files -z --cached --others --exclude-standard --deduplicate -- "$$output")
+  done < "$$scratch_dir/typing-roots"
+fi
+endef
+
+.PHONY: codegen/typings/check codegen/typings/update
+codegen/typings/check: tests/posture ## Generate workspace example typings offline and report drift without changing source
+	@$(call refresh_typings,check)
+
+codegen/typings/update: tests/posture ## Regenerate only workspace example typings (writes generated Rust source)
+	@$(call refresh_typings,update)
+
 help: ## Show supported container-development commands
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z0-9_\/.-]+:.*## / {printf "%-24s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
@@ -176,7 +240,7 @@ deps/install: ## Acquire locked dependencies from manifests only (network)
 	  --build-arg TOOLCHAIN_IMAGE="$$toolchain_image" --build-arg UPDATE_LOCKS=0 \
 	  -t "$$dependency_image" "$$scratch_dir"
 
-# This is the only target that overwrites checkout files. Export and check both
+# Lock refresh overwrites the two dependency locks. Export and check both
 # locks offline before copying either one. The two final copies are not atomic:
 # interruption can leave only one updated. Review the diff before deps/install.
 deps/locks/update: ## Explicitly resolve and apply lock updates (network, scoped writes)
@@ -205,7 +269,7 @@ deps/check: tests/posture ## Verify prepared inputs and package the real GraphQL
 	@$(call offline_runner,$$dependency_image)
 	$(compose) run --rm --no-deps -T offline verify
 
-tests/checks: tests/posture ## Test the prepared GraphQL build boundary in the pinned toolchain
+tests/checks: tests/posture ## Test prepared GraphQL inputs and generated typing archive admission
 	@$(call offline_runner,$$toolchain_image)
 	$(compose) run --rm --no-deps -T offline policy
 

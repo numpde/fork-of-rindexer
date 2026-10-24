@@ -236,6 +236,10 @@ export default defineConfig({
           text: "PostgreSQL Unsigned Integer Migration",
           link: "/docs/migrations/unsigned-integer-storage",
         },
+        {
+          text: "Terminal Event Failures",
+          link: "/docs/migrations/terminal-event-failures",
+        },
       ],
     },
     {

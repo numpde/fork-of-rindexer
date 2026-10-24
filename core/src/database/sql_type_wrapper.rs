@@ -251,6 +251,33 @@ impl EthereumSqlTypeWrapper {
         }
     }
 
+    /// PostgreSQL text and JSONB reject U+0000; binary byte values remain representable.
+    pub(crate) fn postgres_text_contains_nul(&self) -> bool {
+        fn json_contains_nul(value: &Value) -> bool {
+            match value {
+                Value::String(value) => value.contains('\0'),
+                Value::Array(values) => values.iter().any(json_contains_nul),
+                Value::Object(values) => {
+                    values.iter().any(|(key, value)| key.contains('\0') || json_contains_nul(value))
+                }
+                _ => false,
+            }
+        }
+        match self {
+            Self::String(value)
+            | Self::StringNullable(value)
+            | Self::StringVarchar(value)
+            | Self::StringVarcharNullable(value)
+            | Self::StringChar(value)
+            | Self::StringCharNullable(value) => value.contains('\0'),
+            Self::VecString(values)
+            | Self::VecStringVarchar(values)
+            | Self::VecStringChar(values) => values.iter().any(|value| value.contains('\0')),
+            Self::JSONB(value) => json_contains_nul(value),
+            _ => false,
+        }
+    }
+
     pub fn to_type(&self) -> PgType {
         match self {
             // Boolean

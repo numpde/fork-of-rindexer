@@ -30,7 +30,7 @@ use rindexer::{
     blockclock::BlockClock,
     event::{
         callback_registry::{
-            EventCallbackRegistry, EventCallbackRegistryInformation, EventCallbackResult,
+            CallbackExecutionResult, EventCallbackRegistry, EventCallbackRegistryInformation, EventCallbackResult,
             EventResult, TxInformation, HasTxInformation
         },
         contract_setup::{ContractInformation, NetworkContract},
@@ -361,7 +361,7 @@ where
 
         let (callback, reorg_sender): (
             Arc<
-                dyn Fn(Vec<EventResult>) -> BoxFuture<'static, EventCallbackResult<()>>
+                dyn Fn(Vec<EventResult>) -> BoxFuture<'static, CallbackExecutionResult<()>>
                     + Send
                     + Sync,
             >,
@@ -372,7 +372,7 @@ where
                 let event = Arc::new(event);
                 let callback = Arc::new(move |result| {
                     let event = Arc::clone(&event);
-                    async move { event.call(result).await }.boxed()
+                    async move { event.call(result).await.map_err(Into::into) }.boxed()
                 });
                 (callback, reorg_sender)
             }
