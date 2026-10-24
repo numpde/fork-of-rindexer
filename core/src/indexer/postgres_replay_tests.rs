@@ -31,6 +31,9 @@ use crate::{
     PostgresClient,
 };
 
+#[path = "factory_replay_tests.rs"]
+mod factory_replay_tests;
+
 struct Fixture {
     admin: Arc<PostgresClient>,
     client: Arc<PostgresClient>,
