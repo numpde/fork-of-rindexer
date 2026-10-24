@@ -13,8 +13,8 @@ use rust_decimal::Decimal;
 use tokio::{task, time::timeout};
 pub use tokio_postgres::types::{ToSql, Type as PgType};
 use tokio_postgres::{
-    binary_copy::BinaryCopyInWriter, config::SslMode, Config, CopyInSink, Error as PgError, Row,
-    Statement, ToStatement, Transaction as PgTransaction,
+    binary_copy::BinaryCopyInWriter, Config, CopyInSink, Error as PgError, Row, Statement,
+    ToStatement, Transaction as PgTransaction,
 };
 use tokio_postgres_rustls::MakeRustlsConnect;
 use tracing::error;
@@ -132,83 +132,68 @@ pub struct PostgresClient {
 
 impl PostgresClient {
     pub async fn new() -> Result<Self, PostgresConnectionError> {
-        async fn _new(disable_ssl: bool) -> Result<PostgresClient, PostgresConnectionError> {
-            let connection_str = connection_string()?;
-            let mut config: Config = connection_str
-                .parse()
-                .map_err(|_| PostgresConnectionError::CouldNotParseConnectionString)?;
+        let connection_str = connection_string()?;
+        let config: Config = connection_str
+            .parse()
+            .map_err(|_| PostgresConnectionError::CouldNotParseConnectionString)?;
 
-            if disable_ssl {
-                config.ssl_mode(SslMode::Disable);
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let native = rustls_native_certs::load_native_certs();
+        for e in &native.errors {
+            tracing::debug!("Native cert load error (skipped): {}", e);
+        }
+        for cert in native.certs {
+            if let Err(e) = root_store.add(cert) {
+                tracing::debug!("Skipped malformed native cert: {}", e);
             }
+        }
+        let tls_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        let tls_connector = MakeRustlsConnect::new(tls_config);
 
-            let mut root_store = rustls::RootCertStore::empty();
-            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            let native = rustls_native_certs::load_native_certs();
-            for e in &native.errors {
-                tracing::debug!("Native cert load error (skipped): {}", e);
-            }
-            for cert in native.certs {
-                if let Err(e) = root_store.add(cert) {
-                    tracing::debug!("Skipped malformed native cert: {}", e);
+        // The driver owns SSL negotiation. Preserve the parsed policy for both
+        // the startup probe and the pool; connection errors must not weaken it.
+        let (client, connection) =
+            match timeout(Duration::from_millis(5000), config.connect(tls_connector.clone())).await
+            {
+                Ok(Ok((client, connection))) => (client, connection),
+                Ok(Err(e)) => {
+                    error!("Error connecting to database: {}", e);
+                    return Err(PostgresConnectionError::CanNotConnectToDatabase);
                 }
-            }
-            let tls_config = rustls::ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth();
-            let tls_connector = MakeRustlsConnect::new(tls_config);
-
-            // Perform a direct connection test
-            let (client, connection) =
-                match timeout(Duration::from_millis(5000), config.connect(tls_connector.clone()))
-                    .await
-                {
-                    Ok(Ok((client, connection))) => (client, connection),
-                    Ok(Err(e)) => {
-                        // retry without ssl if ssl has been attempted and failed
-                        if !disable_ssl
-                            && config.get_ssl_mode() != SslMode::Disable
-                            && !connection_str.contains("sslmode=require")
-                        {
-                            return Box::pin(_new(true)).await;
-                        }
-                        error!("Error connecting to database: {}", e);
-                        return Err(PostgresConnectionError::CanNotConnectToDatabase);
-                    }
-                    Err(e) => {
-                        error!("Timeout connecting to database: {}", e);
-                        return Err(PostgresConnectionError::CanNotConnectToDatabase);
-                    }
-                };
-
-            // Spawn the connection future to ensure the connection is established
-            let connection_handle = task::spawn(connection);
-
-            // Perform a simple query to check the connection
-            match client.query_one("SELECT 1", &[]).await {
-                Ok(_) => {}
-                Err(_) => return Err(PostgresConnectionError::CanNotConnectToDatabase),
+                Err(e) => {
+                    error!("Timeout connecting to database: {}", e);
+                    return Err(PostgresConnectionError::CanNotConnectToDatabase);
+                }
             };
 
-            // Drop the client and ensure the connection handle completes
-            drop(client);
-            match connection_handle.await {
-                Ok(Ok(())) => (),
-                Ok(Err(_)) => return Err(PostgresConnectionError::CanNotConnectToDatabase),
-                Err(_) => return Err(PostgresConnectionError::CanNotConnectToDatabase),
-            }
+        // Spawn the connection future to ensure the connection is established
+        let connection_handle = task::spawn(connection);
 
-            let manager = PostgresConnectionManager::new(config, tls_connector);
+        // Perform a simple query to check the connection
+        match client.query_one("SELECT 1", &[]).await {
+            Ok(_) => {}
+            Err(_) => return Err(PostgresConnectionError::CanNotConnectToDatabase),
+        };
 
-            // Pool size: configurable via DATABASE_POOL_SIZE env var, defaults to 10.
-            let pool_size: u32 =
-                env::var("DATABASE_POOL_SIZE").ok().and_then(|s| s.parse().ok()).unwrap_or(10);
-            let pool = Pool::builder().max_size(pool_size).build(manager).await?;
-
-            Ok(PostgresClient { pool })
+        // Drop the client and ensure the connection handle completes
+        drop(client);
+        match connection_handle.await {
+            Ok(Ok(())) => (),
+            Ok(Err(_)) => return Err(PostgresConnectionError::CanNotConnectToDatabase),
+            Err(_) => return Err(PostgresConnectionError::CanNotConnectToDatabase),
         }
 
-        _new(false).await
+        let manager = PostgresConnectionManager::new(config, tls_connector);
+
+        // Pool size: configurable via DATABASE_POOL_SIZE env var, defaults to 10.
+        let pool_size: u32 =
+            env::var("DATABASE_POOL_SIZE").ok().and_then(|s| s.parse().ok()).unwrap_or(10);
+        let pool = Pool::builder().max_size(pool_size).build(manager).await?;
+
+        Ok(PostgresClient { pool })
     }
 
     pub async fn from_connection(
