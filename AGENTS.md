@@ -23,8 +23,13 @@ Cloudflare Queues), chat alerts, and a GraphQL API out of the box. Docs: https:/
 | `xtask/` | Dev tooling (`cargo xtask …`) for maintaining `.blockclock` timestamp files — not part of releases |
 | `helm/` | Kubernetes chart (`helm/rindexer/`). Not versioned/published by CI |
 | `providers/` | Deployment templates (Railway; `providers/aws/` is an empty placeholder) |
+| `Makefile` | Root entrypoints for container preparation, offline checks, focused regressions, and generated typings |
+| `containers/development/` | Pinned development images, dependency preparation, and the in-container command runner |
+| `compose/development.yml` | Development runner and isolated PostgreSQL fixture services |
 
-There is no root Makefile. Makefiles exist only at `cli/Makefile` and `e2e-tests/Makefile`.
+Run `make help` from the repo root to list container-development commands.
+`cli/Makefile` and `e2e-tests/Makefile` provide the native CLI and standalone E2E
+commands described below.
 
 ## ⚠️ The changelog rule — always update it
 
@@ -154,6 +159,22 @@ cd cli && make prod_build                      # production build: RUSTFLAGS='-C
 
 Release profiles in `core/Cargo.toml` and `cli/Cargo.toml` use `lto = "fat"` +
 `codegen-units = 1` — release builds are very slow by design.
+
+For containerized development, run these from the repo root with Docker and
+Docker Compose available:
+
+```bash
+make dev/image/build    # acquire and build the pinned development images
+make deps/install       # prepare locked dependencies explicitly (network)
+make ci                 # run the currently migrated container checks offline
+```
+
+Checks require the prepared images; they do not install dependencies implicitly.
+`make ci` includes workspace formatting and Clippy, container workflow checks, and
+PostgreSQL round-trip tests. It does not include every focused regression target,
+the full workspace test suites, all-features tests, or the standalone E2E harness.
+Use `make help` to select the focused regressions relevant to a change. The native
+CI commands below remain the reference for full upstream validation.
 
 ### Feature flags
 
