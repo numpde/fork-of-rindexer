@@ -34,6 +34,55 @@ use crate::{
 #[path = "factory_replay_tests.rs"]
 mod factory_replay_tests;
 
+#[tokio::test]
+async fn postgres_reorg_never_advances_a_lagging_stream_checkpoint() {
+    let fixture = Fixture::new().await;
+    let mut lagging = fixture.indexer.clone();
+    lagging.contracts[0].name = "Lagging".to_string();
+    fixture
+        .client
+        .batch_execute(
+            generate_tables_for_indexer_sql(fixture._directory.path(), &lagging, false)
+                .unwrap()
+                .as_str(),
+        )
+        .await
+        .unwrap();
+    let checkpoints: Vec<_> = ["Contract", "Lagging"]
+        .iter()
+        .map(|contract| {
+            let schema =
+                generate_indexer_contract_schema_name(&fixture.params.indexer_name, contract);
+            generate_internal_event_table_name(&schema, &fixture.params.event_info.name)
+        })
+        .collect();
+    for (table, position) in checkpoints.iter().zip([100, 80]) {
+        fixture.client.batch_execute(&format!("UPDATE rindexer_internal.{table} SET last_synced_block = {position} WHERE network = 'ethereum'")).await.unwrap();
+    }
+    fixture
+        .client
+        .reorg_rollback_transaction(
+            &[],
+            "ethereum",
+            98,
+            100,
+            &[],
+            &checkpoints.iter().map(String::as_str).collect::<Vec<_>>(),
+        )
+        .await
+        .unwrap();
+    let mut actual = Vec::new();
+    for table in &checkpoints {
+        actual.push(fixture.client.query_one(&format!("SELECT last_synced_block::text FROM rindexer_internal.{table} WHERE network = 'ethereum'"), &[]).await.unwrap().get::<_, String>(0));
+    }
+    fixture.finish().await;
+    assert_eq!(
+        actual,
+        ["97", "80"],
+        "network rollback must never mark unprocessed blocks as complete"
+    );
+}
+
 struct Fixture {
     admin: Arc<PostgresClient>,
     client: Arc<PostgresClient>,
