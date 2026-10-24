@@ -418,7 +418,7 @@ async fn fetch_historic_logs_stream<P: ChainProvider>(
         );
     }
 
-    match cached_provider.get_logs(&current_filter).await {
+    match cached_provider.get_logs(&current_filter).await.and_then(require_log_block_numbers) {
         Ok(logs) => {
             debug!(
                 "{} - {} - topic_id {}, Logs: {} from {} to {}",
@@ -880,6 +880,20 @@ async fn parallel_worker(
 #[path = "fetch_log_input_tests.rs"]
 mod input_validation_tests;
 
+/// Fetch-range advancement and timestamp lookup require mined block numbers.
+/// Route malformed RPC responses through the existing fetch-error retry path.
+fn require_log_block_numbers(logs: Vec<Log>) -> Result<Vec<Log>, ProviderError> {
+    for log in &logs {
+        if log.block_number.is_none() {
+            return Err(ProviderError::CustomError(format!(
+                "Cannot process fetched log from address {}, transaction {:?}: RPC response is missing block_number",
+                log.inner.address, log.transaction_hash,
+            )));
+        }
+    }
+    Ok(logs)
+}
+
 /// Classification of a recoverable fetch error. Rate-limit errors warrant
 /// the aggressive -50% scale-down + backoff in `record_rate_limit`; other
 /// errors only warrant the gentler -10% in `record_error`. Raw HTTP 429s are
@@ -951,7 +965,7 @@ async fn fetch_logs_once<P: ChainProvider + ?Sized>(
         );
     }
 
-    match cached_provider.get_logs(&current_filter).await {
+    match cached_provider.get_logs(&current_filter).await.and_then(require_log_block_numbers) {
         Ok(logs) => {
             let logs_empty = logs.is_empty();
             let last_log = logs.last().cloned();

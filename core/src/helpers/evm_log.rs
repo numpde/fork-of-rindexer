@@ -14,7 +14,7 @@ use crate::types::core::{LogParam, ParsedLog};
 
 pub fn parse_log(event: &Event, log: &Log) -> Option<ParsedLog> {
     // as topic[0] is the event signature
-    let topics_length = log.topics().len() - 1;
+    let topics_length = log.topics().len().checked_sub(1)?;
     let indexed_inputs_abi_length = event.inputs.iter().filter(|param| param.indexed).count();
 
     // check if topics and data match the event

@@ -267,7 +267,7 @@ ci: rust/checks tests ## Validate the first container-development slice (not all
 
 .PHONY: tests/event-inputs/docker tests/event-inputs/postgres
 
-tests/event-inputs/docker: tests/posture ## Check decode and RPC metadata failures before event effects
+tests/event-inputs/docker: tests/posture ## Check event inputs and nearby fetch/callback regressions offline
 	@$(call offline_runner,$$dependency_image)
 	$(compose) run --rm --no-deps -T offline event-inputs
 

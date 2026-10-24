@@ -2,11 +2,13 @@
 
 ### Breaking changes
 -------------------------------------------------
+- breaking: no-code event batches now reject every event in the batch if any log fails to decode with the configured ABI. Correct the ABI or RPC response and restart indexing; existing callback retries remain in effect. Previously skipped history is not repaired automatically and needs a reviewed rebuild. With `callback_concurrency` above one, other batches can still advance the shared cursor; cross-batch cursor ordering is unchanged.
 - breaking: PostgreSQL connections no longer retry with TLS disabled after a TLS, authentication, or connection error. Deployments that relied on this retry must fix the certificate, server, or connection configuration before upgrading; use `DATABASE_URL` with `sslmode=disable` only when plaintext is intentional. The default remains `sslmode=prefer`, which still permits plaintext when the server declines TLS negotiation.
 - breaking: PostgreSQL `uint16` event and custom-table columns now use `INTEGER`, and `uint24`/`uint32` use `BIGINT`, with matching array types, to preserve their full unsigned ranges. Before upgrading an existing database, stop writers and widen affected scalar and array columns, including custom-table keys and values; widening alone does not repair previously negative values. Rebuild affected history and derived results from trusted logs. See the [migration guide](/docs/migrations/unsigned-integer-storage).
 
 ### Bug fixes
 -------------------------------------------------
+- fix: reject no-code ABI decode failures before storage or derived-table writes instead of silently filtering them out; errors identify the contract, event, network, transaction and log index. Missing log topics return a decode error, and missing required RPC log metadata returns an engine error or fetch retry rather than panicking. Empty batches and optional block timestamps retain their existing behavior.
 - fix: enforce PostgreSQL `DATABASE_URL` SSL policy for URI and keyword configurations, including percent-encoded and quoted `sslmode=require` values; a connection error can no longer trigger an application-level plaintext fallback.
 - fix: preserve `uint16` and `uint32` values above the signed integer boundary in PostgreSQL event INSERT and binary COPY, including arrays, and custom-table writes and reorg rollback; signed integer and ClickHouse encodings are unchanged.
 - fix: preserve every dynamic `bytes[]` element, including empty elements, when converting decoded events for storage; existing empty-array handling is unchanged. Reindex affected historical ranges to recover previously discarded values.

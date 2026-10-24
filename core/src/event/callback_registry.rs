@@ -130,36 +130,47 @@ impl EventResult {
         start_block: U64,
         end_block: U64,
     ) -> Result<Self, String> {
-        Ok(Self::new(network_contract, log, start_block, end_block))
+        let missing = |field| {
+            format!(
+                "Cannot construct callback input for network {:?}, address {}, transaction {:?}, requested blocks {}..{}: RPC log is missing {}",
+                network_contract.network,
+                log.inner.address,
+                log.transaction_hash,
+                start_block,
+                end_block,
+                field,
+            )
+        };
+        // Validate mined-log metadata before calling even a user-supplied decoder.
+        let tx_information = TxInformation {
+            chain_id: network_contract.cached_provider.chain().id(),
+            network: network_contract.network.to_string(),
+            address: log.inner.address,
+            block_hash: log.block_hash.ok_or_else(|| missing("block_hash"))?,
+            block_number: log.block_number.ok_or_else(|| missing("block_number"))?,
+            block_timestamp: log.block_timestamp.map(U256::from),
+            transaction_hash: log.transaction_hash.ok_or_else(|| missing("transaction_hash"))?,
+            transaction_index: log.transaction_index.ok_or_else(|| missing("transaction_index"))?,
+            log_index: U256::from(log.log_index.ok_or_else(|| missing("log_index"))?),
+        };
+        Ok(Self {
+            log: log.clone(),
+            decoded_data: network_contract.decode_log(log.inner),
+            tx_information,
+            found_in_request: LogFoundInRequest { from_block: start_block, to_block: end_block },
+        })
     }
 
+    /// Construct callback input from a complete mined log.
+    /// Panics on missing required metadata; engine callers use the checked entry point.
     pub fn new(
         network_contract: Arc<NetworkContract>,
         log: Log,
         start_block: U64,
         end_block: U64,
     ) -> Self {
-        let log_address = log.inner.address;
-        Self {
-            log: log.clone(),
-            decoded_data: network_contract.decode_log(log.inner),
-            tx_information: TxInformation {
-                chain_id: network_contract.cached_provider.chain().id(),
-                network: network_contract.network.to_string(),
-                address: log_address,
-                block_hash: log.block_hash.expect("log should contain block_hash"),
-                block_number: log.block_number.expect("log should contain block_number"),
-                block_timestamp: log.block_timestamp.map(U256::from),
-                transaction_hash: log
-                    .transaction_hash
-                    .expect("log should contain transaction_hash"),
-                transaction_index: log
-                    .transaction_index
-                    .expect("log should contain transaction_index"),
-                log_index: U256::from(log.log_index.expect("log should contain log_index")),
-            },
-            found_in_request: LogFoundInRequest { from_block: start_block, to_block: end_block },
-        }
+        Self::try_new(network_contract, log, start_block, end_block)
+            .expect("EventResult::new requires complete mined-log metadata")
     }
 }
 

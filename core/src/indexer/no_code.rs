@@ -463,8 +463,18 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
             let owned_results = match &results {
                 CallbackResult::Event(events) => events
                     .iter()
-                    .filter_map(|result| {
-                        let log = parse_log(&params.event, &result.log)?;
+                    .map(|result| {
+                        // Decode the entire batch before any sink or derived-table effects.
+                        let log = parse_log(&params.event, &result.log).ok_or_else(|| {
+                            format!(
+                                "Cannot decode {:?}::{:?} on network {:?}: transaction {:#x}, log_index={} does not match the configured event ABI; this callback attempt made no writes",
+                                params.contract_name,
+                                params.event_info.name,
+                                result.tx_information.network,
+                                result.tx_information.transaction_hash,
+                                result.tx_information.log_index,
+                            )
+                        })?;
 
                         let address = result.tx_information.address;
                         let transaction_hash = result.tx_information.transaction_hash;
@@ -496,7 +506,7 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
                             EthereumSqlTypeWrapper::U256(log_index),
                         ];
 
-                        Some((
+                        Ok((
                             log.params,
                             address,
                             transaction_hash,
@@ -512,7 +522,7 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
                             end_global_parameters,
                         ))
                     })
-                    .collect::<Vec<_>>(),
+                    .collect::<Result<Vec<_>, String>>()?,
                 CallbackResult::Trace(events) => events
                     .iter()
                     .filter_map(|result| {
