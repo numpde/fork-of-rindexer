@@ -724,11 +724,12 @@ impl PostgresClient {
                 .await?;
         }
 
-        // 4. Rewind last_synced_block checkpoints to fork_point - 1
+        // A network rollback can cover streams that have not reached the fork.
+        // Their unprocessed pre-fork history must remain behind the checkpoint.
         let rewind_block = Decimal::from(fork_point.saturating_sub(1));
         for table in checkpoint_tables {
             let query = format!(
-                "UPDATE rindexer_internal.{} SET last_synced_block = $1 WHERE network = $2",
+                "UPDATE rindexer_internal.{} SET last_synced_block = LEAST(last_synced_block, $1) WHERE network = $2",
                 table
             );
             transaction.execute(&query, &[&rewind_block, &network]).await?;
