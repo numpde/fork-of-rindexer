@@ -1207,3 +1207,111 @@ async fn postgres_reorg_refetches_discarded_unprocessed_history_before_the_fork(
     drop(callbacks);
     fixture.finish().await;
 }
+
+#[tokio::test]
+async fn postgres_same_height_recovery_preserves_the_original_header_until_commit() {
+    use crate::indexer::reorg::{
+        subscribe_reorgs, BlockChainWindow, EventTableInfo, ReorgBlockHashPersistence,
+        ReorgContext, ReorgCoordinator,
+    };
+    use crate::provider::mock::MockChainProvider;
+    use alloy::{
+        network::{AnyHeader, AnyRpcBlock, AnyRpcHeader},
+        rpc::types::{Block, BlockTransactions},
+    };
+    let fixture = Fixture::new().await;
+    let parent = B256::repeat_byte(99);
+    let original = B256::repeat_byte(100);
+    let replacement = B256::repeat_byte(200);
+    let header = |number, hash, parent_hash| {
+        AnyRpcBlock::new(
+            Block::new(
+                AnyRpcHeader::from_sealed(
+                    AnyHeader { number, parent_hash, ..Default::default() }.seal(hash),
+                ),
+                BlockTransactions::Full(vec![]),
+            )
+            .into(),
+        )
+    };
+    let provider = Arc::new(MockChainProvider::new(1).with_blocks(vec![
+        header(99, parent, B256::repeat_byte(98)),
+        header(100, replacement, parent),
+    ]));
+    let mut window = BlockChainWindow::try_new(20).unwrap();
+    window.insert(99, parent, B256::repeat_byte(98));
+    window.insert(100, original, parent);
+    let schema = generate_indexer_contract_schema_name(&fixture.params.indexer_name, "Contract");
+    let checkpoint = generate_internal_event_table_name(&schema, "Value");
+    let mut coordinator = ReorgCoordinator::new(
+        "ethereum".to_string(),
+        window,
+        Arc::new(ReorgBlockHashPersistence::new(Some(fixture.client.clone()), None)),
+        provider,
+        vec![EventTableInfo::try_new(
+            schema.clone(),
+            "value".to_string(),
+            checkpoint,
+            fixture.params.indexer_name.clone(),
+            "Contract".to_string(),
+            "Value".to_string(),
+        )
+        .unwrap()],
+        vec![],
+        vec![],
+    )
+    .unwrap();
+    let notification = subscribe_reorgs("ethereum");
+    // An identical observation is accepted and persists A as the original header.
+    assert!(coordinator.on_new_block(100, original, parent).await.unwrap().is_none());
+    let original_text = format!("{original:#x}");
+    let query = "SELECT block_hash FROM rindexer_internal.reorg_block_hashes WHERE network = 'ethereum' AND block_number = 100";
+    let task = coordinator
+        .on_new_block(100, replacement, parent)
+        .await
+        .unwrap()
+        .expect("replacement must trigger recovery");
+    assert_eq!(task.fork_point, 100);
+    assert_eq!(
+        fixture.client.query_one(query, &[]).await.unwrap().get::<_, String>(0),
+        original_text
+    );
+    assert_eq!(notification.take_rewind(), None, "detection alone cannot authorize recovery");
+    // Make the actual rollback DELETE fail, without altering its prepared headers.
+    fixture
+        .client
+        .batch_execute(&format!("ALTER TABLE {schema}.value RENAME TO value_saved"))
+        .await
+        .unwrap();
+    let ctx = ReorgContext {
+        postgres: Some(&fixture.client),
+        clickhouse: None,
+        registry: None,
+        trace_registry: None,
+    };
+    assert!(coordinator.handle_reorg(task, &ctx).await.is_err());
+    assert_eq!(
+        fixture.client.query_one(query, &[]).await.unwrap().get::<_, String>(0),
+        original_text
+    );
+    assert_eq!(notification.take_rewind(), None);
+    // A second observation must still find A in RAM and produce a retry task.
+    let retry = coordinator
+        .on_new_block(100, replacement, parent)
+        .await
+        .unwrap()
+        .expect("failed recovery must retain the old in-memory header");
+    fixture
+        .client
+        .batch_execute(&format!("ALTER TABLE {schema}.value_saved RENAME TO value"))
+        .await
+        .unwrap();
+    coordinator.handle_reorg(retry, &ctx).await.unwrap();
+    assert_eq!(
+        fixture.client.query_one(query, &[]).await.unwrap().get::<_, String>(0),
+        format!("{replacement:#x}")
+    );
+    assert_eq!(notification.take_rewind(), Some(100));
+    drop(coordinator);
+    fixture.finish().await;
+}
