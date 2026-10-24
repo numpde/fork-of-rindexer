@@ -22,7 +22,7 @@ use crate::{
         setup::{setup_postgres, SetupPostgresError},
     },
     event::callback_registry::{EventCallbackRegistry, TraceCallbackRegistry},
-    health::start_health_server,
+    health::HealthServer,
     indexer::{
         no_code::{setup_no_code, SetupNoCodeError},
         start::StartIndexingError,
@@ -207,8 +207,12 @@ pub async fn start_rindexer(details: StartDetails<'_>) -> Result<(), StartRindex
             }
 
             // Health server follows the indexer lifecycle - only runs when indexer is running
-            let health_server_handle = if details.indexing_details.is_some() {
+            let health_server_handle = if let Some(indexing) = details.indexing_details.as_ref() {
                 let manifest_clone = Arc::clone(&manifest);
+                let callback_failures = vec![
+                    indexing.registry.failure_state(),
+                    indexing.trace_registry.failure_state(),
+                ];
 
                 Some(tokio::spawn(async move {
                     info!("🩺 Starting health server on port {}", health_port);
@@ -228,8 +232,10 @@ pub async fn start_rindexer(details: StartDetails<'_>) -> Result<(), StartRindex
                         None
                     };
 
-                    if let Err(e) =
-                        start_health_server(health_port, manifest_clone, postgres_client).await
+                    if let Err(e) = HealthServer::new(health_port, manifest_clone, postgres_client)
+                        .with_callback_failures(callback_failures)
+                        .start()
+                        .await
                     {
                         error!("Failed to start health server: {:?}", e);
                     }

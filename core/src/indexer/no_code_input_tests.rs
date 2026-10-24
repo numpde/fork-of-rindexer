@@ -28,7 +28,7 @@ use crate::{
     AsyncCsvAppender,
 };
 
-fn params() -> NoCodeCallbackParams {
+pub(super) fn params() -> NoCodeCallbackParams {
     let definition = json!({"name": "Value", "type": "event", "anonymous": false, "inputs": [{"name": "value", "type": "uint256", "indexed": false}]});
     let event_info =
         EventInfo::new(serde_json::from_value::<ABIItem>(definition.clone()).unwrap()).unwrap();
@@ -56,7 +56,7 @@ fn params() -> NoCodeCallbackParams {
     }
 }
 
-fn event(params: &NoCodeCallbackParams, index: u64) -> EventResult {
+pub(super) fn event(params: &NoCodeCallbackParams, index: u64) -> EventResult {
     let hash = B256::repeat_byte(index as u8);
     let log = Log {
         inner: PrimitiveLog {
@@ -187,10 +187,11 @@ async fn postgres_batch_checks(
     Ok(())
 }
 
-#[tokio::test]
-async fn postgres_decode_failure_keeps_rows_and_cursor_unchanged_until_corrected() {
+/// Keep the returned native container alive until the pooled client is dropped.
+pub(super) async fn postgres_client(
+) -> (Arc<PostgresClient>, Option<testcontainers::ContainerAsync<Postgres>>) {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let (url, _container) = match std::env::var_os("RINDEXER_TEST_POSTGRES_URL") {
+    let (url, container) = match std::env::var_os("RINDEXER_TEST_POSTGRES_URL") {
         Some(url) => {
             let url = url.into_string().expect("Unicode fixture URL");
             let config: tokio_postgres::Config = url.parse().expect("valid fixture URL");
@@ -222,6 +223,12 @@ async fn postgres_decode_failure_keeps_rows_and_cursor_unchanged_until_corrected
         }
         Arc::new(result.expect("fixture client"))
     };
+    (postgres, container)
+}
+
+#[tokio::test]
+async fn postgres_decode_failure_keeps_rows_and_cursor_unchanged_until_corrected() {
+    let (postgres, _container) = postgres_client().await;
     let mut params = params();
     params.indexer_name = format!("input_{:032x}", rand::random::<u128>());
     let schema = generate_indexer_contract_schema_name(&params.indexer_name, &params.contract_name);
@@ -241,5 +248,7 @@ async fn postgres_decode_failure_keeps_rows_and_cursor_unchanged_until_corrected
         ))
         .await
         .expect("remove owned fixture tables");
+    drop(postgres);
+    drop(_container);
     result.expect("decode rejection and corrected replay preserve rows and cursor");
 }

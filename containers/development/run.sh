@@ -31,6 +31,23 @@ if ! test -f "$RINDEXER_GRAPHQL_PREBUILT" || ! test -f /build/graphql/input.sha2
 fi
 case "$1" in
   compile) exec cargo nextest run --frozen -p rindexer --test postgres_bytea_array --no-run ;;
+  permanent-failures)
+    cargo nextest run --frozen -p rindexer --lib --no-run \
+      -E 'test(/permanent_failure_tests/) & not test(/::postgres_/)'
+    exec timeout --signal=TERM --kill-after=20s 900s cargo nextest run --frozen \
+      -p rindexer --lib --no-fail-fast --no-capture \
+      -E 'test(/permanent_failure_tests/) & not test(/::postgres_/)'
+    ;;
+  permanent-failures-compile)
+    exec cargo nextest run --frozen -p rindexer --lib --no-run \
+      -E 'test(/permanent_failure_tests::postgres_/)'
+    ;;
+  permanent-failures-postgres)
+    : "${RINDEXER_TEST_POSTGRES_URL:?missing explicit PostgreSQL fixture}"
+    exec timeout --signal=TERM --kill-after=20s 900s cargo nextest run --frozen \
+      -p rindexer --lib --no-fail-fast --no-capture \
+      -E 'test(/permanent_failure_tests::postgres_/)'
+    ;;
   checkpoint-order)
     cargo nextest run --frozen -p rindexer --lib --no-run \
       -E 'test(/^indexer::process::checkpoint_order_tests::/)'

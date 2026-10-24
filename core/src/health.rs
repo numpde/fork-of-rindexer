@@ -1,12 +1,13 @@
 use std::{net::SocketAddr, sync::Arc};
 
-use axum::{extract::State, http::StatusCode, response::Json, routing::get, Router};
+use axum::{extract::State, http::StatusCode, response::Json, routing::get, Extension, Router};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
 use crate::{
     database::postgres::client::PostgresClient,
+    event::callback_registry::CallbackFailures,
     indexer::task_tracker::active_indexing_count,
     manifest::core::Manifest,
     metrics::metrics_handler,
@@ -56,7 +57,11 @@ pub struct HealthServerState {
 pub struct HealthServer {
     port: u16,
     state: HealthServerState,
+    callback_failures: Vec<Arc<CallbackFailures>>,
 }
+
+#[derive(Clone)]
+struct CallbackFailureSources(Vec<Arc<CallbackFailures>>);
 
 impl HealthServer {
     pub fn new(
@@ -64,20 +69,34 @@ impl HealthServer {
         manifest: Arc<Manifest>,
         postgres_client: Option<Arc<PostgresClient>>,
     ) -> Self {
-        Self { port, state: HealthServerState { manifest, postgres_client } }
+        Self {
+            port,
+            state: HealthServerState { manifest, postgres_client },
+            callback_failures: vec![],
+        }
+    }
+
+    pub(crate) fn with_callback_failures(mut self, failures: Vec<Arc<CallbackFailures>>) -> Self {
+        self.callback_failures = failures;
+        self
+    }
+
+    pub(crate) fn router(self) -> Router {
+        Router::new()
+            .route("/health", get(health_handler))
+            .route("/metrics", get(metrics_handler))
+            .layer(Extension(CallbackFailureSources(self.callback_failures)))
+            .with_state(self.state)
     }
 
     pub async fn start(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let app = Router::new()
-            .route("/health", get(health_handler))
-            .route("/metrics", get(metrics_handler))
-            .with_state(self.state);
-
         let addr = SocketAddr::from(([0, 0, 0, 0], self.port));
+        let port = self.port;
+        let app = self.router();
         let listener = TcpListener::bind(addr).await?;
 
-        info!("🩺 Health server started on http://0.0.0.0:{}/health", self.port);
-        info!("📊 Metrics available at http://0.0.0.0:{}/metrics", self.port);
+        info!("🩺 Health server started on http://0.0.0.0:{}/health", port);
+        info!("📊 Metrics available at http://0.0.0.0:{}/metrics", port);
 
         axum::serve(listener, app).await?;
         Ok(())
@@ -86,8 +105,11 @@ impl HealthServer {
 
 async fn health_handler(
     State(state): State<HealthServerState>,
+    Extension(failures): Extension<CallbackFailureSources>,
 ) -> Result<(StatusCode, Json<HealthStatus>), StatusCode> {
     let database_health = check_database_health(&state).await;
+    let _failed_streams =
+        failures.0.iter().flat_map(|source| source.snapshot()).collect::<Vec<_>>();
     let indexing_health = check_indexing_health();
     let sync_health = check_sync_health(&state).await;
 

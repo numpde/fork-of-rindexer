@@ -388,6 +388,10 @@ struct EventCallbacks {
 #[path = "no_code_input_tests.rs"]
 mod input_validation_tests;
 
+#[cfg(test)]
+#[path = "permanent_failure_tests.rs"]
+mod permanent_failure_tests;
+
 fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
     let shared_callback = Arc::new(move |results| {
         let params = Arc::clone(&params);

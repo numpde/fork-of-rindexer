@@ -269,6 +269,18 @@ ci: rust/checks tests ## Validate the first container-development slice (not all
 
 .PHONY: tests/checkpoint-order/docker
 
+.PHONY: tests/permanent-failures/docker tests/permanent-failures/postgres
+
+tests/permanent-failures/docker: tests/posture ## Check terminal callback handling, transient retries and stream health offline
+	@$(call offline_runner,$$dependency_image)
+	$(compose) run --rm --no-deps -T offline permanent-failures
+
+tests/permanent-failures/postgres: tests/posture ## Check PostgreSQL text NUL rejection without rejecting binary values
+	@$(call offline_runner,$$dependency_image)
+	$(compose) run --rm --no-deps -T offline permanent-failures-compile
+	$(compose) up -d --no-build --pull never --wait --wait-timeout 90 postgres
+	$(compose) run --rm --no-deps -T postgres-tests permanent-failures-postgres
+
 tests/checkpoint-order/docker: tests/posture ## Check concurrent callbacks and durable checkpoint ordering offline
 	@$(call offline_runner,$$dependency_image)
 	$(compose) run --rm --no-deps -T offline checkpoint-order

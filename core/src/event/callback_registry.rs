@@ -29,6 +29,11 @@ use crate::{
 
 pub type Decoder = Arc<dyn Fn(Vec<TxHash>, Bytes) -> Arc<dyn Any + Send + Sync> + Send + Sync>;
 
+#[path = "callback_failures.rs"]
+mod callback_failures;
+pub(crate) use callback_failures::CallbackFailures;
+pub use callback_failures::FailedStream;
+
 pub fn noop_decoder() -> Decoder {
     Arc::new(move |_topics: Vec<TxHash>, _data: Bytes| {
         Arc::new(String::new()) as Arc<dyn Any + Send + Sync>
@@ -262,6 +267,10 @@ impl Default for EventCallbackRegistry {
 }
 
 impl EventCallbackRegistry {
+    pub(crate) fn failure_state(&self) -> Arc<CallbackFailures> {
+        Arc::new(CallbackFailures::default())
+    }
+
     pub fn new() -> Self {
         EventCallbackRegistry { events: Vec::new(), on_reorg: Vec::new() }
     }
@@ -482,6 +491,10 @@ pub struct TraceCallbackRegistry {
 }
 
 impl TraceCallbackRegistry {
+    pub(crate) fn failure_state(&self) -> Arc<CallbackFailures> {
+        Arc::new(CallbackFailures::default())
+    }
+
     pub fn new() -> Self {
         TraceCallbackRegistry { events: Vec::new(), on_reorg: Vec::new() }
     }
