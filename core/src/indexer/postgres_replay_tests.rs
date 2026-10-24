@@ -1174,3 +1174,36 @@ async fn postgres_startup_stops_after_canonical_validation_rpc_error() {
     assert!(rejected, "startup must not launch indexing after canonical validation failed");
     fixture.finish().await;
 }
+
+#[tokio::test]
+async fn postgres_reorg_refetches_discarded_unprocessed_history_before_the_fork() {
+    let fixture = Fixture::new().await;
+    let mut params = fixture.params.clone();
+    params.atomic_safe_concurrency = false;
+    let callbacks = no_code_callback(Arc::new(params));
+    let schema = generate_indexer_contract_schema_name(&fixture.params.indexer_name, "Contract");
+    let checkpoint = generate_internal_event_table_name(&schema, "Value");
+    fixture.client.batch_execute(&format!("UPDATE rindexer_internal.{checkpoint} SET last_synced_block = 80 WHERE network = 'ethereum'")).await.unwrap();
+    let mut events = fixture.events(&(81..=100).collect::<Vec<_>>());
+    for (number, event) in (81..=100).zip(&mut events) {
+        event.log.block_number = Some(number);
+        event.log.block_hash = Some(B256::repeat_byte(number as u8));
+    }
+    crate::indexer::process::checkpoint_order_tests::replay_lagging_buffer_after_rollback(
+        callbacks.event_callback.clone(),
+        events.into_iter().map(|event| event.log).collect(),
+        fixture.client.clone(),
+        &fixture.params.indexer_name,
+    )
+    .await;
+    assert_eq!(fixture.position().await, (20, "1810".to_string(), "100".to_string()));
+    let receipts: i64 = fixture
+        .client
+        .query_one("SELECT count(*) FROM rindexer_internal.event_applications", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(receipts, 20);
+    drop(callbacks);
+    fixture.finish().await;
+}

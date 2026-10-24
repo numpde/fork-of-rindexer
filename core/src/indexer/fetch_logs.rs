@@ -2743,6 +2743,15 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn all_live_streams_refetch_after_shared_rollback() {
+        assert_shared_recovery([101, 101]).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lagging_live_stream_refetches_unprocessed_pre_fork_history() {
+        assert_shared_recovery([101, 81]).await;
+    }
+
+    async fn assert_shared_recovery(starts: [u64; 2]) {
         use crate::indexer::reorg::{BlockChainWindow, ReorgBlockHashPersistence};
         use futures::poll;
 
@@ -2769,7 +2778,7 @@ mod tests {
         ));
         let mut streams = Vec::new();
         let mut receivers = Vec::new();
-        for _ in 0..2 {
+        for first_required in starts {
             let (tx, rx) = mpsc::channel(4);
             receivers.push(rx);
             let provider = provider.clone();
@@ -2781,12 +2790,12 @@ mod tests {
                     BlockClock::new(None, None, provider.clone()),
                     provider,
                     &tx,
-                    U64::from(100),
+                    U64::from(first_required - 1),
                     &B256::ZERO,
                     &U64::ZERO,
                     RindexerEventFilter::empty_for_test()
-                        .set_from_block(U64::from(101))
-                        .set_to_block(U64::from(101)),
+                        .set_from_block(U64::from(first_required))
+                        .set_to_block(U64::from(first_required)),
                     "test",
                     network,
                     true,
@@ -2805,6 +2814,7 @@ mod tests {
         for stream in &mut streams {
             assert!(poll!(stream.as_mut()).is_pending());
         }
+        let old_generation = crate::indexer::reorg::reorg_generation(network);
         let mut guard = coordinator.lock().await;
         let task = guard.try_create_reorg_task_for_block_range(98, 100).unwrap();
         guard
@@ -2821,16 +2831,26 @@ mod tests {
             .unwrap();
         drop(guard);
 
-        for (stream, receiver) in streams.iter_mut().zip(&mut receivers) {
+        for ((stream, receiver), first_required) in
+            streams.iter_mut().zip(&mut receivers).zip(starts)
+        {
             let batch = tokio::time::timeout(Duration::from_secs(1), async {
-                tokio::select! {
-                    _ = stream => panic!("live stream ended"),
-                    batch = receiver.recv() => batch.unwrap().unwrap(),
+                loop {
+                    let batch = tokio::select! {
+                        _ = stream.as_mut() => panic!("live stream ended"),
+                        batch = receiver.recv() => batch.unwrap().unwrap(),
+                    };
+                    if batch.reorg_generation != old_generation {
+                        break batch;
+                    }
                 }
             })
             .await
             .expect("every stream must refetch the rolled-back range");
-            assert_eq!((batch.from_block, batch.to_block), (U64::from(98), U64::from(100)));
+            assert_eq!(
+                (batch.from_block, batch.to_block),
+                (U64::from(first_required.min(98)), U64::from(100))
+            );
         }
     }
 

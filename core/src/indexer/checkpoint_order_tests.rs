@@ -270,6 +270,147 @@ async fn dispatch_buffered_after_rollback(fixture: &mut Fixture, empty: bool) {
     assert_eq!(fixture.cursor(), "1", "orphaned work cannot checkpoint");
 }
 
+pub(crate) async fn replay_lagging_buffer_after_rollback(
+    callback: EventCallbackType,
+    logs: Vec<Log>,
+    postgres: Arc<crate::PostgresClient>,
+    indexer_name: &str,
+) {
+    use crate::database::{
+        generate::generate_indexer_contract_schema_name,
+        postgres::generate::generate_internal_event_table_name,
+    };
+    use crate::indexer::reorg::{
+        BlockChainWindow, EventTableInfo, ReorgBlockHashPersistence, ReorgContext, ReorgCoordinator,
+    };
+    use alloy::{
+        network::{AnyHeader, AnyRpcBlock, AnyRpcHeader},
+        rpc::types::{Block, BlockTransactions},
+    };
+    use futures::StreamExt;
+
+    let mut fixture = Fixture::with_logs(callback, logs.clone()).await;
+    let provider = Arc::new(
+        MockChainProvider::new(1)
+            .with_block_number(100)
+            .with_max_block_range(9)
+            .with_logs(logs)
+            .with_blocks(
+                (98..=100)
+                    .map(|number| {
+                        AnyRpcBlock::new(
+                            Block::new(
+                                AnyRpcHeader::from_sealed(
+                                    AnyHeader {
+                                        number,
+                                        parent_hash: B256::repeat_byte((number - 1) as u8),
+                                        ..Default::default()
+                                    }
+                                    .seal(B256::repeat_byte(number as u8)),
+                                ),
+                                BlockTransactions::Full(vec![]),
+                            )
+                            .into(),
+                        )
+                    })
+                    .collect(),
+            ),
+    );
+    let EventProcessingConfig::ContractEventProcessing(config) =
+        Arc::get_mut(&mut fixture.config).unwrap()
+    else {
+        panic!("contract fixture")
+    };
+    config.start_block = U64::from(81);
+    config.end_block = U64::from(100);
+    config.live_indexing = true;
+    config.config.buffer = Some(1);
+    config.postgres = Some(postgres.clone());
+    config.indexer_name = indexer_name.to_string();
+    let network = Arc::make_mut(&mut config.network_contract);
+    network.cached_provider = provider.clone();
+    network.block_clock = BlockClock::new(None, None, provider.clone());
+    network.start_block = Some(U64::from(81));
+    network.end_block = Some(U64::from(100));
+    let mut fetched =
+        crate::indexer::fetch_logs::fetch_logs_stream(fixture.config.clone(), false, None, None);
+    let buffered = timeout(Duration::from_secs(5), fetched.next()).await.unwrap().unwrap().unwrap();
+    assert_eq!((buffered.from_block, buffered.to_block), (U64::from(81), U64::from(90)));
+    let old_generation = buffered.reorg_generation;
+    let schema = generate_indexer_contract_schema_name(indexer_name, "Contract");
+    let checkpoint = generate_internal_event_table_name(&schema, "Value");
+    let mut coordinator = ReorgCoordinator::new(
+        "ethereum".to_string(),
+        BlockChainWindow::try_new(20).unwrap(),
+        Arc::new(ReorgBlockHashPersistence::new(Some(postgres.clone()), None)),
+        provider,
+        vec![EventTableInfo::try_new(
+            schema,
+            "value".to_string(),
+            checkpoint.clone(),
+            indexer_name.to_string(),
+            "Contract".to_string(),
+            "Value".to_string(),
+        )
+        .unwrap()],
+        vec![],
+        vec![],
+    )
+    .unwrap();
+    let task = coordinator.try_create_reorg_task_for_block_range(98, 100).unwrap();
+    coordinator
+        .handle_reorg(
+            task,
+            &ReorgContext {
+                postgres: Some(&postgres),
+                clickhouse: None,
+                registry: None,
+                trace_registry: None,
+            },
+        )
+        .await
+        .unwrap();
+    handle_logs_result(
+        fixture.config.clone(),
+        fixture.permits.clone(),
+        &mut fixture.checkpoints,
+        Ok(buffered),
+    )
+    .await
+    .unwrap()
+    .await
+    .unwrap();
+    let mut next_required = 81;
+    while next_required <= 100 {
+        let batch =
+            timeout(Duration::from_secs(5), fetched.next()).await.unwrap().unwrap().unwrap();
+        if batch.reorg_generation != old_generation {
+            assert_eq!(
+                batch.from_block.to::<u64>(),
+                next_required,
+                "discarded pre-fork work must be refetched before later progress"
+            );
+            next_required = batch.to_block.to::<u64>() + 1;
+        }
+        let stale = batch.reorg_generation == old_generation;
+        handle_logs_result(
+            fixture.config.clone(),
+            fixture.permits.clone(),
+            &mut fixture.checkpoints,
+            Ok(batch),
+        )
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+        if stale {
+            let cursor: String = postgres.query_one(&format!("SELECT last_synced_block::text FROM rindexer_internal.{checkpoint} WHERE network = 'ethereum'"), &[]).await.unwrap().get(0);
+            assert_eq!(cursor, "80", "discarded work cannot advance durable progress");
+        }
+    }
+    fixture.config.cancel_token().cancel();
+}
+
 fn delayed_callback(
     first_started: Arc<Notify>,
     release_first: Arc<Notify>,
