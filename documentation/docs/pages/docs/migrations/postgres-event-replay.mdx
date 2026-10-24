@@ -36,6 +36,12 @@ same events again. Their writes and publications do not become exactly-once or
 atomic with PostgreSQL. Partial ClickHouse table progress cannot advance the PG
 cursor during shutdown.
 
+PostgreSQL factory child-address bookkeeping runs after the raw callback and
+accepts addresses already stored under its existing factory/address/network
+primary key. Repeating discovery can therefore finish its bookkeeping after a
+retry. This does not add an atomic transaction across the callback and independent
+outputs, or change ClickHouse and CSV bookkeeping.
+
 The supported reorg rollback deletes affected receipts in the same transaction as
 raw deletion, derived reversal and cursor rewind. Canonical events can then be
 applied again. The existing explicit `drop_each_run` reset removes receipt history

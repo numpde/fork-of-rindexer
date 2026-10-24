@@ -151,29 +151,30 @@ pub async fn update_known_factory_deployed_addresses(
             input_names: config.input_names().clone(),
         };
         let table_name = generate_internal_factory_event_table_name(&params);
-
+        crate::indexer::reorg::validate_sql_identifier(&table_name, "factory address table")
+            .map_err(|error| {
+                UpdateKnownFactoryDeployedAddressesError::PostgresWrite(error.to_string())
+            })?;
+        let mut ordered_addresses: Vec<_> = addresses.iter().collect();
+        ordered_addresses.sort_unstable();
+        let factories: Vec<_> =
+            ordered_addresses.iter().map(|item| format!("{:?}", item.factory_address)).collect();
+        let deployed: Vec<_> =
+            ordered_addresses.iter().map(|item| format!("{:?}", item.address)).collect();
+        // Discovery persists after the raw callback commits. Its natural primary
+        // key makes replay a no-op; sorted input also orders overlapping locks.
         postgres
-            .insert_bulk(
-                &format!("rindexer_internal.{table_name}"),
-                &[
-                    "factory_address".to_string(),
-                    "factory_deployed_address".to_string(),
-                    "network".to_string(),
-                ],
-                &addresses
-                    .clone()
-                    .into_iter()
-                    .map(|item| {
-                        vec![
-                            EthereumSqlTypeWrapper::Address(item.factory_address),
-                            EthereumSqlTypeWrapper::Address(item.address),
-                            EthereumSqlTypeWrapper::String(config.network_contract.network.clone()),
-                        ]
-                    })
-                    .collect::<Vec<_>>(),
+            .execute(
+                &format!("INSERT INTO rindexer_internal.{table_name}
+                    (factory_address, factory_deployed_address, network)
+                    SELECT factory_address, factory_deployed_address, $3::text
+                    FROM unnest($1::text[], $2::text[]) AS input(factory_address, factory_deployed_address)
+                    ORDER BY factory_address, factory_deployed_address
+                    ON CONFLICT (factory_address, factory_deployed_address, network) DO NOTHING"),
+                &[&factories, &deployed, &config.network_contract.network],
             )
             .await
-            .map_err(UpdateKnownFactoryDeployedAddressesError::PostgresWrite)?;
+            .map_err(|error| UpdateKnownFactoryDeployedAddressesError::PostgresWrite(error.to_string()))?;
 
         return Ok(());
     }

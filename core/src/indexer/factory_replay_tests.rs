@@ -134,8 +134,8 @@ async fn assert_factory_replay(size: u16) {
     let repeated = config.trigger_event(events(1..=size)).await;
     let overlap = config.trigger_event(events(size..=size * 2)).await;
     let (first, second) = tokio::join!(
-        config.trigger_event(events(1..=size)),
-        config.trigger_event(events(size..=size * 2))
+        config.trigger_event(events(size * 2..=size * 3)),
+        config.trigger_event(events(size * 2..=size * 3))
     );
     let count: i64 = fixture
         .client
@@ -155,10 +155,10 @@ async fn assert_factory_replay(size: u16) {
     overlap.expect("overlap must retain old addresses and admit new ones");
     first.unwrap();
     second.unwrap();
-    assert_eq!(count, i64::from(size * 2));
+    assert_eq!(count, i64::from(size * 3));
     assert_eq!(
         position,
-        (i64::from(size * 2), "0".to_string(), "0".to_string()),
+        (i64::from(size * 3), "0".to_string(), "0".to_string()),
         "raw PG receipts protect events while factory completion keeps the cursor deferred"
     );
 }
