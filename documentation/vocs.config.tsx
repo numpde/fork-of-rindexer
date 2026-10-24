@@ -237,7 +237,7 @@ export default defineConfig({
           link: "/docs/migrations/unsigned-integer-storage",
         },
         {
-          text: "Terminal Event Failures",
+          text: "Terminal Indexing Failures",
           link: "/docs/migrations/terminal-event-failures",
         },
       ],

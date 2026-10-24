@@ -1,4 +1,4 @@
-# Terminal event failures
+# Terminal indexing failures
 
 No-code event indexing now stops the affected event stream on its network when a
 log cannot be decoded with the configured ABI, or when a raw PostgreSQL event
@@ -15,12 +15,16 @@ independent PostgreSQL, ClickHouse, CSV and stream writes atomic.
 Other event streams and networks can continue. A dependency group stops when a
 prerequisite stream fails. Retryable errors, including existing Rust handlers'
 `String` errors and transient storage failures, retain their retry behavior.
-This policy currently applies to event callbacks; native-transfer and block trace
-callbacks retain their previous retry and checkpoint behavior.
+Native-transfer and block trace callbacks use the same permanent-error policy.
+Because trace handlers on one network share a cursor, a permanent failure stops
+that network's trace pipeline before its checkpoint, including empty trailing
+ranges. Other trace networks and contract-event streams can continue. Earlier
+trace handlers may already have produced effects before a later handler fails;
+stopping the pipeline does not undo those effects.
 
 ## Monitoring and recovery
 
-When the engine's health server is enabled, a retained terminal event failure makes
+When the engine's health server is enabled, a retained terminal callback failure makes
 `GET /health` return HTTP 503 with `services.indexing` set to `"unhealthy"`.
 `indexing.failed_streams` lists the callback `id`, `indexer`, `contract`, `event`,
 `network`, and requested `from_block` and `to_block`. The range identifies the
@@ -38,23 +42,33 @@ RPC request or retryable error.
 
 ## Rust projects
 
-Run `rindexer codegen typings` to regenerate event registration adapters before
-building existing generated projects against the new core. Existing user event
-handlers keep returning `EventCallbackResult<T> = Result<T, String>`; these errors
-remain retryable.
+Run `rindexer codegen typings` to regenerate event and trace registration adapters
+before building existing generated projects against the new core. Existing user
+handlers keep returning `EventCallbackResult<T>` or `TraceCallbackResult<T>`, both
+`Result<T, String>`; these errors remain retryable.
 
-Handwritten engine registration code using `EventCallbackType` now returns
+Handwritten engine registration code using `EventCallbackType` or `TraceCallbackType` now returns
 `CallbackExecutionResult<T> = Result<T, CallbackError>`. Convert a retryable
 `String` error with `.map_err(Into::into)`, or deliberately return
 `CallbackError::Permanent(message)` when repeating the callback cannot succeed.
 Only declare an error permanent when stopping the stream is the intended policy;
 this does not roll back effects already performed by a custom callback.
-`EventCallbackRegistry::trigger_event` and event-processing config trigger methods
-return this typed result too.
+Both registries' `trigger_event` methods and event/trace-processing config trigger
+methods return this typed result too. Propagate or handle it before checkpointing.
+`TraceProcessingConfig::trigger_event` no longer invokes callbacks for an empty
+input batch; the consumer can still checkpoint a successful empty range. Custom
+engine callbacks that relied on receiving empty batches must move that work to
+their caller.
 
-Construct registries with `EventCallbackRegistry::new()` or `default()` and register
-events with `register_event`. Struct literals are no longer supported because the
-registry now owns shared failure state. Clones and `complete()` share that state.
+Construct event and trace registries with their `new()` or `default()` constructors
+and register events with `register_event`. Struct literals are no longer supported
+because each registry now owns shared failure state. Clones and `complete()` share
+that state. In existing generated `main.rs`, replace an empty
+`TraceCallbackRegistry { events: vec![], on_reorg: vec![] }` with
+`TraceCallbackRegistry::new()`.
+Generated block handlers now also initialize the native-transfer CSV writer in
+their shared `TraceContext` when CSV is enabled. This fixes generated-code
+compilation; it does not automatically export block rows or add a block CSV format.
 Code constructing `health::IndexingStatus` directly must also initialize its new
 `failed_streams` field, usually with an empty vector.
 
@@ -62,3 +76,6 @@ For contributors, `make codegen/typings/check` generates the workspace examples 
 an offline container and reports drift. `make codegen/typings/update` applies that
 output to their existing generated typings directories. Prepare the toolchain and
 locked dependencies first using `make dev/image/build` and `make deps/install`.
+`make tests/trace-bindings/docker` enables native transfers only in a disposable
+copy of the playground, generates its bindings, and compiles that example with
+Clippy. It does not change the example's checked-in manifest or generated files.

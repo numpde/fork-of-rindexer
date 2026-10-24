@@ -270,10 +270,9 @@ async fn start_indexing_traces(
         .await?;
 
         // Create a shared registry for this network's events
-        let network_registry = Arc::new(TraceCallbackRegistry {
-            events: events.iter().map(|e| (*e).clone()).collect(),
-            on_reorg: trace_registry.on_reorg.clone(),
-        });
+        let mut network_registry = trace_registry.as_ref().clone();
+        network_registry.events = events.iter().map(|e| (*e).clone()).collect();
+        let network_registry = Arc::new(network_registry);
 
         let config = Arc::new(TraceProcessingConfig {
             id: first_event.id.clone(), // Use the first event's ID for progress tracking
@@ -2050,24 +2049,18 @@ contracts:
 
     use crate::event::callback_registry::{
         EventCallbackRegistry, TraceCallbackRegistry, TraceCallbackRegistryInformation,
+        TraceCallbackType,
     };
     use crate::event::contract_setup::{NetworkTrace, TraceInformation};
     use crate::manifest::native_transfer::TraceProcessingMethod;
     use crate::provider::ChainProvider;
-    use futures::future::{BoxFuture, FutureExt};
+    use futures::future::FutureExt;
 
     fn trace_registry_with_network(
         network: &str,
         provider: Arc<dyn ChainProvider>,
     ) -> TraceCallbackRegistry {
-        let noop_callback: Arc<
-            dyn Fn(
-                    Vec<crate::event::callback_registry::TraceResult>,
-                )
-                    -> BoxFuture<'static, crate::event::callback_registry::EventCallbackResult<()>>
-                + Send
-                + Sync,
-        > = Arc::new(|_| async { Ok(()) }.boxed());
+        let noop_callback: TraceCallbackType = Arc::new(|_| async { Ok(()) }.boxed());
 
         let trace_info = TraceInformation {
             name: "NativeTransfer".to_string(),
@@ -2093,7 +2086,9 @@ contracts:
             streams_clients: Arc::new(None),
         };
 
-        TraceCallbackRegistry { events: vec![info], on_reorg: vec![] }
+        let mut registry = TraceCallbackRegistry::new();
+        registry.register_event(info);
+        registry
     }
 
     #[test]

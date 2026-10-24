@@ -141,7 +141,7 @@ fn generate_register_match_arms_code(event_type_name: &str, event_info: &[EventI
                     let event = Arc::new(event);
                     Arc::new(move |result| {{
                         let event = Arc::clone(&event);
-                        async move {{ event.call(result).await }}.boxed()
+                        async move {{ event.call(result).await.map_err(Into::into) }}.boxed()
                     }})
                 }},
             "#,
@@ -157,7 +157,7 @@ fn generate_register_match_arms_code(event_type_name: &str, event_info: &[EventI
             let event = Arc::new(event);
             Arc::new(move |result| {{
                 let event = Arc::clone(&event);
-                async move {{ event.call(result).await }}.boxed()
+                async move {{ event.call(result).await.map_err(Into::into) }}.boxed()
             }})
         }},
     "#,
@@ -400,7 +400,16 @@ fn generate_trace_callback_structs_code(
         parts.push(part);
     }
 
-    // Add Block event callback struct
+    // Block handlers expose the same TraceContext as native-transfer handlers,
+    // including that context's native-transfer CSV writer. This creates no
+    // automatic block-row export or separate block CSV format.
+    let block_csv_generator = if csv_enabled {
+        let native_transfer =
+            event_info.first().expect("the built-in native-transfer ABI has one event");
+        generate_csv_instance(project_path, contract, native_transfer, &storage.csv)?
+    } else {
+        Code::blank()
+    };
     let block_part = format!(
         r#"
         pub fn block_handler<TExtensions, F, Fut>(
@@ -446,10 +455,12 @@ fn generate_trace_callback_structs_code(
                     + Clone,
                 Fut: Future<Output = TraceCallbackResult<()>> + Send + 'static,
             {{
+                {csv_generator}
                 Self {{
                     callback: block_handler(closure),
                     context: Arc::new(TraceContext {{
                         {database}
+                        {csv}
                         extensions: Arc::new(extensions),
                     }}),
                 }}
@@ -482,6 +493,8 @@ fn generate_trace_callback_structs_code(
         "#,
         database =
             if databases_enabled { "database: get_or_init_postgres_client().await," } else { "" },
+        csv_generator = block_csv_generator,
+        csv = if csv_enabled { "csv: Arc::new(csv)," } else { "" },
     );
 
     parts.push(block_part);
@@ -536,7 +549,7 @@ use rindexer::{{
     FutureExt,
     event::{{
         callback_registry::{{
-            TraceCallbackRegistry, TraceCallbackRegistryInformation, TraceCallbackResult,
+            CallbackExecutionResult, TraceCallbackRegistry, TraceCallbackRegistryInformation, TraceCallbackResult,
             TraceResult, TxInformation, HasTxInformation
         }},
         contract_setup::{{TraceInformation, NetworkTrace}},
@@ -636,7 +649,7 @@ impl<TExtensions> {event_type_name}<TExtensions> where TExtensions: 'static + Se
                 .native_transfers.reorg_safe_distance,
         }};
 
-        let callback: Arc<dyn Fn(Vec<TraceResult>) -> BoxFuture<'static, TraceCallbackResult<()>> + Send + Sync> = match self {{
+        let callback: Arc<dyn Fn(Vec<TraceResult>) -> BoxFuture<'static, CallbackExecutionResult<()>> + Send + Sync> = match self {{
             {register_match_arms}
         }};
 

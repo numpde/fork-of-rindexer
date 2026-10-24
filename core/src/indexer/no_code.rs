@@ -269,7 +269,10 @@ pub async fn setup_no_code(
                 &network_providers,
             )
             .await?;
-            let trace_registry = TraceCallbackRegistry { events: trace_events, on_reorg: vec![] };
+            let mut trace_registry = TraceCallbackRegistry::new();
+            for event in trace_events {
+                trace_registry.register_event(event);
+            }
 
             if manifest.has_enabled_native_transfers() {
                 info!(
@@ -1134,10 +1137,8 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
         Arc::new(move |events| callback(CallbackResult::Event(events)));
 
     let callback = Arc::clone(&shared_callback);
-    let trace_callback: TraceCallbackType = Arc::new(move |traces| {
-        let future = callback(CallbackResult::Trace(traces));
-        async move { future.await.map_err(|error| error.to_string()) }.boxed()
-    });
+    let trace_callback: TraceCallbackType =
+        Arc::new(move |traces| callback(CallbackResult::Trace(traces)));
 
     EventCallbacks { trace_callback, event_callback }
 }

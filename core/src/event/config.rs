@@ -21,8 +21,8 @@ use crate::types::single_or_array::StringOrArray;
 use crate::{
     event::{
         callback_registry::{
-            CallbackExecutionResult, EventCallbackRegistry, EventResult, TraceCallbackRegistry,
-            TraceResult,
+            CallbackError, CallbackExecutionResult, EventCallbackRegistry, EventResult,
+            TraceCallbackRegistry, TraceResult,
         },
         contract_setup::NetworkContract,
         BuildRindexerFilterError, RindexerEventFilter,
@@ -471,10 +471,26 @@ pub struct TraceProcessingConfig {
 }
 
 impl TraceProcessingConfig {
-    pub async fn trigger_event(&self, fn_data: Vec<TraceResult>) {
+    pub(crate) fn terminal_failure(&self) -> Option<CallbackError> {
+        let failures = self.registry.failure_state();
+        self.registry.events.iter().find_map(|event| {
+            failures.reason(&event.id, &self.network).map(CallbackError::Permanent)
+        })
+    }
+
+    pub async fn trigger_event(&self, fn_data: Vec<TraceResult>) -> CallbackExecutionResult<()> {
+        if let Some(failure) = self.terminal_failure() {
+            return Err(failure);
+        }
+        // Empty ranges checkpoint in the consumer; callbacks need actual inputs
+        // to identify their network and rejected range if they fail permanently.
+        if fn_data.is_empty() {
+            return Ok(());
+        }
         // Trigger events for all registered events in this network's registry
         for event in &self.registry.events {
-            let _ = self.registry.trigger_event(&event.id, fn_data.clone()).await;
+            self.registry.trigger_event(&event.id, fn_data.clone()).await?;
         }
+        Ok(())
     }
 }

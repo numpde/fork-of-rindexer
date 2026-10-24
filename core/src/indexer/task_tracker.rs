@@ -7,6 +7,23 @@ use crate::metrics::indexing as metrics;
 
 static INDEXING_TASKS: Lazy<AtomicUsize> = Lazy::new(|| AtomicUsize::new(0));
 
+/// Own active-task accounting until callback execution and checkpointing finish,
+/// including error returns, cancellation and panic.
+pub(super) struct ActiveCallback;
+
+impl ActiveCallback {
+    pub(super) fn start() -> Self {
+        indexing_event_processing();
+        Self
+    }
+}
+
+impl Drop for ActiveCallback {
+    fn drop(&mut self) {
+        indexing_event_processed();
+    }
+}
+
 pub fn indexing_event_processing() {
     INDEXING_TASKS.fetch_add(1, Ordering::SeqCst);
     metrics::inc_active_tasks();

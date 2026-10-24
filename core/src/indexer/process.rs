@@ -39,7 +39,7 @@ use crate::{
         fetch_logs::{fetch_logs_stream, FetchLogsResult},
         last_synced::update_progress_and_last_synced_task,
         progress::IndexingEventProgressStatus,
-        task_tracker::{indexing_event_processed, indexing_event_processing},
+        task_tracker::{indexing_event_processed, indexing_event_processing, ActiveCallback},
     },
     is_running,
     provider::ProviderError,
@@ -55,6 +55,9 @@ pub enum ProcessEventError {
 
     #[error("Could not get block number from provider: {0}")]
     ProviderCallError(#[from] ProviderError),
+
+    #[error("Could not process callback: {0}")]
+    Callback(#[from] crate::event::callback_registry::CallbackError),
 }
 
 /// Processes an event that doesn't have dependencies.
@@ -896,23 +899,6 @@ async fn live_indexing_for_contract_event_dependencies(
         if elapsed < target_iteration_duration {
             tokio::time::sleep(target_iteration_duration - elapsed).await;
         }
-    }
-}
-
-/// Count the whole callback lifecycle, including its checkpoint wait. Task
-/// cancellation or panic must release shutdown accounting as well as permits.
-struct ActiveCallback;
-
-impl ActiveCallback {
-    fn start() -> Self {
-        indexing_event_processing();
-        Self
-    }
-}
-
-impl Drop for ActiveCallback {
-    fn drop(&mut self) {
-        indexing_event_processed();
     }
 }
 

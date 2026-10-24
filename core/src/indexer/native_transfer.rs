@@ -23,13 +23,12 @@ use crate::provider::RECOMMENDED_RPC_CHUNK_SIZE;
 use crate::PostgresClient;
 use crate::{
     event::{
-        callback_registry::{TraceCallbackRegistry, TraceResult, TxInformation},
+        callback_registry::{CallbackError, TraceCallbackRegistry, TraceResult, TxInformation},
         config::TraceProcessingConfig,
     },
     indexer::{
-        last_synced::evm_trace_update_progress_and_last_synced_task,
-        process::ProcessEventError,
-        task_tracker::{indexing_event_processed, indexing_event_processing},
+        last_synced::evm_trace_update_progress_and_last_synced_task, process::ProcessEventError,
+        task_tracker::ActiveCallback,
     },
     manifest::native_transfer::TraceProcessingMethod,
     provider::{ChainProvider, ProviderError},
@@ -244,7 +243,7 @@ pub async fn native_transfer_block_fetch(
     let mut last_seen_block = start_block;
 
     loop {
-        if !is_running() || cancel_token.is_cancelled() {
+        if !is_running() || cancel_token.is_cancelled() || block_tx.is_closed() {
             info!("Exiting native transfer indexing block processor!");
             break Ok(());
         }
@@ -388,6 +387,9 @@ pub async fn native_transfer_block_processor(
     let mut buffer: Vec<U64> = Vec::with_capacity(limit_concurrent_requests);
 
     loop {
+        if let Some(failure) = config.terminal_failure() {
+            return Err(failure.into());
+        }
         if !is_running() || config.cancel_token.is_cancelled() {
             info!("Exiting native transfer indexing block processor!");
             break Ok(());
@@ -401,8 +403,7 @@ pub async fn native_transfer_block_processor(
         };
 
         if recv == 0 {
-            sleep(Duration::from_secs(1)).await;
-            continue;
+            break Ok(());
         }
 
         let processed_block = native_transfer_block_consumer(
@@ -413,10 +414,12 @@ pub async fn native_transfer_block_processor(
         )
         .await;
 
-        // If this has an error, we need to not and reconsume the blocks. We don't have
-        // to worry about double-publish because the failure point is on the provider
-        // call itself, which is before publish.
+        // Provider failures can retry the buffered range. A permanent callback
+        // failure has already blocked this trace stream and must stop processing.
         if let Err(e) = processed_block {
+            if matches!(e, ProcessEventError::Callback(CallbackError::Permanent(_))) {
+                return Err(e);
+            }
             // On error, drop the block query range. We want a slow increase in concurrency and a
             // relatively aggressive backoff.
             concurrent_requests = cmp::max(1, (concurrent_requests as f64 * 0.8) as usize);
@@ -486,6 +489,9 @@ pub async fn native_transfer_block_consumer(
     network_name: &str,
     config: &Arc<TraceProcessingConfig>,
 ) -> Result<(), ProcessEventError> {
+    if let Some(failure) = config.terminal_failure() {
+        return Err(failure.into());
+    }
     let blocks = provider.get_block_by_number_batch(block_numbers, true).await?;
     let (from_block, to_block) = block_numbers
         .iter()
@@ -522,9 +528,8 @@ pub async fn native_transfer_block_consumer(
     let writer_barrier = event_writer_barrier(network_name);
     let _writer_guard = writer_barrier.read().await;
 
-    // Important that we call this for every event even if there are no logs.
-    // This is because we need to sync the last seen block number still.
-    indexing_event_processing();
+    // Empty transfer ranges still checkpoint after any block callbacks succeed.
+    let _activity = ActiveCallback::start();
 
     let blocks = blocks
         .into_iter()
@@ -532,18 +537,13 @@ pub async fn native_transfer_block_consumer(
             TraceResult::new_block(b, network_name, provider.chain().id(), from_block, to_block)
         })
         .collect::<Vec<_>>();
-    config.trigger_event(blocks).await;
+    config.trigger_event(blocks).await?;
 
     if !native_transfers.is_empty() {
-        config.trigger_event(native_transfers).await;
+        config.trigger_event(native_transfers).await?;
     }
 
-    evm_trace_update_progress_and_last_synced_task(
-        config.clone(),
-        to_block,
-        indexing_event_processed,
-    )
-    .await;
+    evm_trace_update_progress_and_last_synced_task(config.clone(), to_block, || {}).await;
 
     Ok(())
 }
@@ -560,6 +560,9 @@ pub async fn native_transfer_block_consumer_debug(
     network_name: &str,
     config: Arc<TraceProcessingConfig>,
 ) -> Result<(), ProcessEventError> {
+    if let Some(failure) = config.terminal_failure() {
+        return Err(failure.into());
+    }
     let trace_futures: Vec<_> =
         block_numbers.iter().map(|n| provider_trace_call(provider.clone(), &config, *n)).collect();
     let trace_calls = try_join_all(trace_futures).await?;
@@ -631,12 +634,11 @@ pub async fn native_transfer_block_consumer_debug(
     let writer_barrier = event_writer_barrier(network_name);
     let _writer_guard = writer_barrier.read().await;
 
-    indexing_event_processing();
+    let _activity = ActiveCallback::start();
     if !native_transfers.is_empty() {
-        config.trigger_event(native_transfers).await;
+        config.trigger_event(native_transfers).await?;
     }
-    evm_trace_update_progress_and_last_synced_task(config, to_block, indexing_event_processed)
-        .await;
+    evm_trace_update_progress_and_last_synced_task(config, to_block, || {}).await;
 
     Ok(())
 }
@@ -885,6 +887,135 @@ mod tests {
             )
             .into(),
         )
+    }
+
+    async fn callback_case(
+        callback: crate::event::callback_registry::TraceCallbackType,
+    ) -> (tempfile::TempDir, Arc<TraceProcessingConfig>, Arc<MockChainProvider>, std::path::PathBuf)
+    {
+        use crate::event::{
+            callback_registry::TraceCallbackRegistryInformation, contract_setup::TraceInformation,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = make_trace_config_async().await.as_ref().clone();
+        let mut registry = TraceCallbackRegistry::new();
+        registry.register_event(TraceCallbackRegistryInformation {
+            id: config.id.clone(),
+            indexer_name: config.indexer_name.clone(),
+            contract_name: config.contract_name.clone(),
+            event_name: EVENT_NAME.to_string(),
+            trace_information: TraceInformation {
+                name: EVENT_NAME.to_string(),
+                details: vec![],
+                reorg_safe_distance: None,
+            },
+            callback,
+            tables: Arc::new(vec![]),
+            streams_clients: Arc::new(None),
+        });
+        config.registry = registry.complete();
+        config.project_path = directory.path().to_path_buf();
+        config.stream_last_synced_block_file_path = Some("cursor".to_string());
+        let path = directory
+            .path()
+            .join("cursor/EvmTraces/last-synced-blocks/evmtraces-ethereum-nativetransfer.txt");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "1").unwrap();
+        let block =
+            make_block_with_native_transfer(42, Address::ZERO, Address::repeat_byte(1), U256::ONE);
+        let provider = Arc::new(MockChainProvider::new(1).with_blocks(vec![block]));
+        (directory, Arc::new(config), provider, path)
+    }
+
+    #[tokio::test]
+    async fn terminal_transfer_callback_rejects_checkpoint_and_releases_activity() {
+        use futures::FutureExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = attempts.clone();
+        let (_directory, config, provider, path) = callback_case(Arc::new(move |traces| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if traces.iter().any(|trace| matches!(trace, TraceResult::NativeTransfer { .. })) {
+                    Err(CallbackError::Permanent("unrepresentable trace effect".to_string()))
+                } else {
+                    Ok(())
+                }
+            }
+            .boxed()
+        }))
+        .await;
+        let result =
+            native_transfer_block_consumer(provider, &[U64::from(42)], "ethereum", &config).await;
+        assert!(matches!(result, Err(ProcessEventError::Callback(CallbackError::Permanent(_)))));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2, "block then transfer callback");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "1");
+        assert_eq!(config.registry.failure_state().snapshot().len(), 1);
+        assert_eq!(crate::indexer::task_tracker::active_indexing_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn terminal_trace_processor_returns_without_retrying_callback_or_checkpointing() {
+        use futures::FutureExt;
+        let (_directory, config, provider, path) = callback_case(Arc::new(|_| {
+            async { Err(CallbackError::Permanent("terminal trace effect".to_string())) }.boxed()
+        }))
+        .await;
+        let (sender, receiver) = mpsc::channel(1);
+        sender.send(U64::from(42)).await.unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            native_transfer_block_processor("ethereum".to_string(), provider, config, receiver),
+        )
+        .await
+        .expect("terminal processor stops instead of retrying its range");
+        assert!(matches!(result, Err(ProcessEventError::Callback(CallbackError::Permanent(_)))));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "1");
+        assert_eq!(crate::indexer::task_tracker::active_indexing_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_trace_callback_releases_activity_without_checkpointing() {
+        use futures::FutureExt;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let callback_started = started.clone();
+        let (_directory, config, provider, path) = callback_case(Arc::new(move |_| {
+            let started = callback_started.clone();
+            async move {
+                started.notify_one();
+                futures::future::pending::<()>().await;
+                Ok(())
+            }
+            .boxed()
+        }))
+        .await;
+        let task = tokio::spawn(async move {
+            native_transfer_block_consumer(provider, &[U64::from(42)], "ethereum", &config).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), started.notified()).await.unwrap();
+        assert_eq!(crate::indexer::task_tracker::active_indexing_count(), 1);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "1");
+        assert_eq!(crate::indexer::task_tracker::active_indexing_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn closed_trace_block_queue_finishes_without_waiting_for_more_input() {
+        let (sender, receiver) = mpsc::channel(1);
+        drop(sender);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            native_transfer_block_processor(
+                "ethereum".to_string(),
+                Arc::new(MockChainProvider::new(1)),
+                make_trace_config_async().await,
+                receiver,
+            ),
+        )
+        .await
+        .expect("closed block source finishes")
+        .expect("normal historical completion");
     }
 
     #[tokio::test]

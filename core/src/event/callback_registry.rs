@@ -64,14 +64,7 @@ impl CallbackResult {
                 )
             }),
             Self::Trace(traces) => traces.first().map(|t| {
-                let (fir, tx) = match t {
-                    TraceResult::NativeTransfer { found_in_request, tx_information, .. } => {
-                        (found_in_request, tx_information)
-                    }
-                    TraceResult::Block { found_in_request, tx_information, .. } => {
-                        (found_in_request, tx_information)
-                    }
-                };
+                let (fir, tx) = t.metadata();
                 (fir.from_block, fir.to_block, tx.network.clone())
             }),
         }
@@ -207,7 +200,7 @@ pub type CallbackExecutionResult<T> = Result<T, CallbackError>;
 pub type EventCallbackType =
     Arc<dyn Fn(Vec<EventResult>) -> BoxFuture<'static, CallbackExecutionResult<()>> + Send + Sync>;
 pub type TraceCallbackType =
-    Arc<dyn Fn(Vec<TraceResult>) -> BoxFuture<'static, EventCallbackResult<()>> + Send + Sync>;
+    Arc<dyn Fn(Vec<TraceResult>) -> BoxFuture<'static, CallbackExecutionResult<()>> + Send + Sync>;
 
 #[derive(Clone)]
 pub struct ReorgNotification {
@@ -411,6 +404,15 @@ pub enum TraceResult {
 }
 
 impl TraceResult {
+    fn metadata(&self) -> (&LogFoundInRequest, &TxInformation) {
+        match self {
+            Self::NativeTransfer { found_in_request, tx_information, .. }
+            | Self::Block { found_in_request, tx_information, .. } => {
+                (found_in_request, tx_information)
+            }
+        }
+    }
+
     /// Create a "NativeTransfer" TraceResult for sinking and streaming.
     pub fn new_debug_native_transfer(
         action: &CallAction,
@@ -534,16 +536,16 @@ impl TraceCallbackRegistryInformation {
 pub struct TraceCallbackRegistry {
     pub events: Vec<TraceCallbackRegistryInformation>,
     pub on_reorg: Vec<OnReorgCallback>,
+    failures: Arc<CallbackFailures>,
 }
 
 impl TraceCallbackRegistry {
-    #[cfg(test)]
     pub(crate) fn failure_state(&self) -> Arc<CallbackFailures> {
-        Arc::new(CallbackFailures::default())
+        self.failures.clone()
     }
 
     pub fn new() -> Self {
-        TraceCallbackRegistry { events: Vec::new(), on_reorg: Vec::new() }
+        Self::default()
     }
 
     pub fn find_event(&self, id: &String) -> Option<&TraceCallbackRegistryInformation> {
@@ -562,25 +564,41 @@ impl TraceCallbackRegistry {
         fire_on_reorg_isolated(&self.on_reorg, notification, "TraceCallbackRegistry").await;
     }
 
-    pub async fn trigger_event(&self, id: &String, data: Vec<TraceResult>) -> Result<(), String> {
+    pub async fn trigger_event(
+        &self,
+        id: &String,
+        data: Vec<TraceResult>,
+    ) -> CallbackExecutionResult<()> {
         if let Some(event_information) = self.find_event(id) {
-            trigger_event(
+            let stream = data.first().map(|trace| {
+                let (range, tx) = trace.metadata();
+                FailedStream {
+                    id: id.clone(),
+                    indexer: event_information.indexer_name.clone(),
+                    contract: event_information.contract_name.clone(),
+                    event: event_information.event_name.clone(),
+                    network: tx.network.clone(),
+                    from_block: range.from_block.to(),
+                    to_block: range.to_block.to(),
+                }
+            });
+            let result = trigger_event(
                 id,
                 data,
-                |d| {
-                    let callback = (event_information.callback)(d);
-                    async move { callback.await.map_err(CallbackError::from) }.boxed()
-                },
+                |d| (event_information.callback)(d),
                 || event_information.info_log_name(),
                 &event_information.event_name,
-                None,
+                stream.as_ref().map(|stream| (self.failures.as_ref(), stream.network.as_str())),
             )
-            .await
-            .map_err(|error| error.to_string())
+            .await;
+            if let (Some(stream), Err(CallbackError::Permanent(reason))) = (stream, &result) {
+                self.failures.record(stream, reason.clone());
+            }
+            result
         } else {
             let message = format!("TraceCallbackRegistry: No event found for id: {id}");
             error!("TraceCallbackRegistry: No event found for id: {}", id);
-            Err(message)
+            Err(CallbackError::Permanent(message))
         }
     }
 

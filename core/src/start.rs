@@ -209,7 +209,10 @@ pub async fn start_rindexer(details: StartDetails<'_>) -> Result<(), StartRindex
             // Health server follows the indexer lifecycle - only runs when indexer is running
             let health_server_handle = if let Some(indexing) = details.indexing_details.as_ref() {
                 let manifest_clone = Arc::clone(&manifest);
-                let callback_failures = vec![indexing.registry.failure_state()];
+                let callback_failures = vec![
+                    indexing.registry.failure_state(),
+                    indexing.trace_registry.failure_state(),
+                ];
 
                 Some(tokio::spawn(async move {
                     info!("🩺 Starting health server on port {}", health_port);
