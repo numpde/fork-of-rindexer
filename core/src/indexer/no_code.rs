@@ -384,6 +384,10 @@ struct EventCallbacks {
     trace_callback: TraceCallbackType,
 }
 
+#[cfg(test)]
+#[path = "no_code_input_tests.rs"]
+mod input_validation_tests;
+
 fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
     let shared_callback = Arc::new(move |results| {
         let params = Arc::clone(&params);

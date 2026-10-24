@@ -118,7 +118,21 @@ pub struct EventResult {
     pub found_in_request: LogFoundInRequest,
 }
 
+#[cfg(test)]
+#[path = "log_metadata_tests.rs"]
+mod input_validation_tests;
+
 impl EventResult {
+    /// Fallible entry point for constructing engine callback inputs.
+    pub(crate) fn try_new(
+        network_contract: Arc<NetworkContract>,
+        log: Log,
+        start_block: U64,
+        end_block: U64,
+    ) -> Result<Self, String> {
+        Ok(Self::new(network_contract, log, start_block, end_block))
+    }
+
     pub fn new(
         network_contract: Arc<NetworkContract>,
         log: Log,

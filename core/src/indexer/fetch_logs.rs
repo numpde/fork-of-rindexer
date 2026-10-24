@@ -876,6 +876,10 @@ async fn parallel_worker(
     // goes out of scope here, keeping the cleanup path single-sourced.
 }
 
+#[cfg(test)]
+#[path = "fetch_log_input_tests.rs"]
+mod input_validation_tests;
+
 /// Classification of a recoverable fetch error. Rate-limit errors warrant
 /// the aggressive -50% scale-down + backoff in `record_rate_limit`; other
 /// errors only warrant the gentler -10% in `record_error`. Raw HTTP 429s are

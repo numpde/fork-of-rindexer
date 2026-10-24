@@ -913,14 +913,18 @@ async fn handle_logs_result(
                 .logs
                 .into_iter()
                 .map(|log| {
-                    EventResult::new(
+                    EventResult::try_new(
                         Arc::clone(&config.network_contract()),
                         log,
                         result.from_block,
                         result.to_block,
                     )
                 })
-                .collect::<Vec<_>>();
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|message| {
+                    Box::new(ProviderError::CustomError(message))
+                        as Box<dyn std::error::Error + Send>
+                })?;
 
             if let Ok(permit) = callback_permits.clone().acquire_owned().await {
                 let task = tokio::spawn(async move {

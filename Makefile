@@ -265,6 +265,18 @@ ci: rust/checks tests ## Validate the first container-development slice (not all
 
 .PHONY: tests/postgres-tls/docker
 
+.PHONY: tests/event-inputs/docker tests/event-inputs/postgres
+
+tests/event-inputs/docker: tests/posture ## Check decode and RPC metadata failures before event effects
+	@$(call offline_runner,$$dependency_image)
+	$(compose) run --rm --no-deps -T offline event-inputs
+
+tests/event-inputs/postgres: tests/posture ## Check decode rejection, unchanged PostgreSQL rows/cursor and corrected replay
+	@$(call offline_runner,$$dependency_image)
+	$(compose) run --rm --no-deps -T offline event-inputs-compile
+	$(compose) up -d --no-build --pull never --wait --wait-timeout 90 postgres
+	$(compose) run --rm --no-deps -T postgres-tests event-inputs-postgres
+
 # Inject TLS negotiation failures in a loopback proxy to the disposable fixture.
 tests/postgres-tls/docker: tests/posture ## Check PostgreSQL TLS policy and reconnect behavior
 	@$(call offline_runner,$$dependency_image)
