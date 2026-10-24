@@ -391,6 +391,92 @@ async fn postgres_regrouped_replay_applies_only_new_events() {
 }
 
 #[tokio::test]
+async fn postgres_derived_constant_nul_stops_once_without_effects_and_allows_corrected_replay() {
+    use super::permanent_failure_tests::{health, registry, ID};
+    use crate::manifest::core::ConstantValue;
+    use std::sync::atomic::AtomicUsize;
+
+    let fixture = Fixture::new().await;
+    let mut params = fixture.params.clone();
+    let mut tables = params.tables.as_ref().clone();
+    tables[0].table.columns.push(
+        serde_json::from_value(json!({
+            "name": "note", "type": "string", "nullable": true
+        }))
+        .unwrap(),
+    );
+    tables[0].table.events[0].operations[0].set.push(
+        serde_json::from_value(json!({
+            "column": "note", "action": "set", "value": "$constant(private_note)"
+        }))
+        .unwrap(),
+    );
+    fixture
+        .client
+        .batch_execute(&format!("ALTER TABLE {} ADD COLUMN note TEXT", tables[0].full_table_name))
+        .await
+        .unwrap();
+    params.tables = Arc::new(tables);
+    params.constants = Arc::new(
+        [("private_note".to_string(), ConstantValue::Simple("private\0payload".to_string()))]
+            .into(),
+    );
+    let callback = no_code_callback(Arc::new(params.clone())).event_callback;
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let observed = attempts.clone();
+    let registry = registry(
+        &params,
+        Arc::new(move |events| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            callback(events)
+        }),
+    );
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(3),
+        registry.trigger_event(&ID.to_string(), fixture.events(&[1, 2])),
+    )
+    .await;
+    let rejected_position = fixture.position().await;
+    let receipts: i64 = fixture
+        .client
+        .query_one("SELECT count(*) FROM rindexer_internal.event_applications", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let failures = registry.failure_state().snapshot();
+    let (status, body) = health(vec![registry.failure_state()]).await;
+    drop(registry);
+
+    // A fresh callback models restarting after correcting the configured constant.
+    params.constants = Arc::new(
+        [("private_note".to_string(), ConstantValue::Simple("corrected".to_string()))].into(),
+    );
+    let corrected = no_code_callback(Arc::new(params)).event_callback;
+    let replay = corrected(fixture.events(&[1, 2])).await;
+    let corrected_position = fixture.position().await;
+    drop(corrected);
+    fixture.finish().await;
+
+    assert!(outcome.is_ok(), "a derived text NUL must stop instead of retrying forever");
+    let error = outcome.unwrap().expect_err("reject the unrepresentable custom-table value");
+    assert!(matches!(error, crate::event::callback_registry::CallbackError::Permanent(_)));
+    let error = error.to_string();
+    assert!(
+        error.contains("note") && error.contains("U+0000"),
+        "identify the blocked column and reason: {error}"
+    );
+    assert!(!error.contains("private\0payload"));
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(rejected_position, (0, "0".to_string(), "0".to_string()));
+    assert_eq!(receipts, 0, "rejected preparation must not leave application claims");
+    assert_eq!(failures.len(), 1);
+    assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!body.to_string().contains("private"));
+    replay.unwrap();
+    assert_eq!(corrected_position, (2, "3".to_string(), "2".to_string()));
+}
+
+#[tokio::test]
 async fn postgres_concurrent_replays_apply_effects_once() {
     let fixture = Fixture::new().await;
     let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;

@@ -221,7 +221,7 @@ async fn postgres_binary_nul_remains_storable() {
     assert_eq!(position, (1, "2".to_string()));
 }
 
-const ID: &str = "permanent-failure";
+pub(super) const ID: &str = "permanent-failure";
 
 fn trace_registry(callback: TraceCallbackType) -> TraceCallbackRegistry {
     let mut registry = TraceCallbackRegistry::new();
@@ -410,7 +410,10 @@ async fn postgres_trace_parameter_nul_remains_terminal_through_the_trace_adapter
     assert_eq!(failures.len(), 1);
 }
 
-fn registry(params: &NoCodeCallbackParams, callback: EventCallbackType) -> EventCallbackRegistry {
+pub(super) fn registry(
+    params: &NoCodeCallbackParams,
+    callback: EventCallbackType,
+) -> EventCallbackRegistry {
     let mut registry = EventCallbackRegistry::new();
     registry.register_event(EventCallbackRegistryInformation {
         id: ID.to_string(),
@@ -447,7 +450,7 @@ fn failure() -> FailedStream {
     }
 }
 
-async fn health(sources: Vec<Arc<CallbackFailures>>) -> (StatusCode, Value) {
+pub(super) async fn health(sources: Vec<Arc<CallbackFailures>>) -> (StatusCode, Value) {
     let manifest = serde_json::from_value(
         json!({"name": "health-test", "project_type": "no-code", "networks": [], "contracts": []}),
     )
