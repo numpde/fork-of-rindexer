@@ -3219,7 +3219,7 @@ fn literal_to_wrapper(value: &str, column_type: &ColumnType) -> EthereumSqlTypeW
                 EthereumSqlTypeWrapper::String(value.to_string())
             }
         }
-        // 16-bit integers -> U16/I16 (serialized as INT2/SMALLINT)
+        // Unsigned values use the next signed PostgreSQL width.
         ColumnType::Uint16 => {
             if let Ok(num) = value.parse::<u16>() {
                 EthereumSqlTypeWrapper::U16(num)
@@ -3227,7 +3227,6 @@ fn literal_to_wrapper(value: &str, column_type: &ColumnType) -> EthereumSqlTypeW
                 EthereumSqlTypeWrapper::String(value.to_string())
             }
         }
-        // 32-bit integers -> U32/I32 (serialized as INT4/INTEGER)
         ColumnType::Uint32 => {
             if let Ok(num) = value.parse::<u32>() {
                 EthereumSqlTypeWrapper::U32(num)
@@ -3997,12 +3996,17 @@ pub async fn process_table_operations(
     .await
 }
 
-/// PostgreSQL batch parameters are mapped separately from ClickHouse.
+/// PostgreSQL batch parameters must match the shared unsigned binary encoder.
+/// Keep these overrides local: ClickHouse also consumes the common batch mapping.
 fn column_type_to_postgres_batch_sql_type(column_type: &ColumnType) -> BatchOperationSqlType {
-    column_type_to_batch_sql_type(column_type)
+    match column_type {
+        ColumnType::Uint16 => BatchOperationSqlType::Integer,
+        ColumnType::Uint32 => BatchOperationSqlType::Bigint,
+        _ => column_type_to_batch_sql_type(column_type),
+    }
 }
 
-/// Maps ColumnType to BatchOperationSqlType.
+/// Maps column types to the common batch representation.
 fn column_type_to_batch_sql_type(column_type: &ColumnType) -> BatchOperationSqlType {
     match column_type {
         ColumnType::Address => BatchOperationSqlType::Address,

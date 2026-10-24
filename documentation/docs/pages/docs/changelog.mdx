@@ -2,9 +2,11 @@
 
 ### Breaking changes
 -------------------------------------------------
+- breaking: PostgreSQL `uint16` event and custom-table columns now use `INTEGER`, and `uint24`/`uint32` use `BIGINT`, with matching array types, to preserve their full unsigned ranges. Before upgrading an existing database, stop writers and widen affected scalar and array columns, including custom-table keys and values; widening alone does not repair previously negative values. Rebuild affected history and derived results from trusted logs. See the [migration guide](/docs/migrations/unsigned-integer-storage).
 
 ### Bug fixes
 -------------------------------------------------
+- fix: preserve `uint16` and `uint32` values above the signed integer boundary in PostgreSQL event INSERT and binary COPY, including arrays, and custom-table writes and reorg rollback; signed integer and ClickHouse encodings are unchanged.
 - fix: preserve every dynamic `bytes[]` element, including empty elements, when converting decoded events for storage; existing empty-array handling is unchanged. Reindex affected historical ranges to recover previously discarded values.
 ### Features
 -------------------------------------------------

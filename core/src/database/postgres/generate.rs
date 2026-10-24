@@ -124,6 +124,10 @@ pub fn solidity_type_to_db_type(abi_type: &str) -> String {
             let (prefix, size) = parse_solidity_integer_type(t);
 
             match size {
+                // Unsigned wrappers need the next signed PostgreSQL width. uint24
+                // shares U32 with uint32, including their binary COPY bind types.
+                16 if prefix == "uint" => "INTEGER",
+                24 | 32 if prefix == "uint" => "BIGINT",
                 8 | 16 => "SMALLINT",
                 24 | 32 => "INTEGER",
                 40 | 48 | 56 | 64 | 72 | 80 | 88 | 96 | 104 | 112 | 120 | 128 => "NUMERIC",

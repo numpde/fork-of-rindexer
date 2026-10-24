@@ -264,15 +264,15 @@ impl EthereumSqlTypeWrapper {
             EthereumSqlTypeWrapper::VecI8(_) => PgType::INT2_ARRAY,
 
             // 16-bit integers
-            EthereumSqlTypeWrapper::U16(_) => PgType::INT2,
+            EthereumSqlTypeWrapper::U16(_) => PgType::INT4,
             EthereumSqlTypeWrapper::I16(_) => PgType::INT2,
-            EthereumSqlTypeWrapper::VecU16(_) => PgType::INT2_ARRAY,
+            EthereumSqlTypeWrapper::VecU16(_) => PgType::INT4_ARRAY,
             EthereumSqlTypeWrapper::VecI16(_) => PgType::INT2_ARRAY,
 
             // 32-bit integers
-            EthereumSqlTypeWrapper::U32(_) => PgType::INT4,
+            EthereumSqlTypeWrapper::U32(_) => PgType::INT8,
             EthereumSqlTypeWrapper::I32(_) => PgType::INT4,
-            EthereumSqlTypeWrapper::VecU32(_) => PgType::INT4_ARRAY,
+            EthereumSqlTypeWrapper::VecU32(_) => PgType::INT8_ARRAY,
             EthereumSqlTypeWrapper::VecI32(_) => PgType::INT4_ARRAY,
 
             // 64-bit integers
@@ -1103,12 +1103,12 @@ impl ToSql for EthereumSqlTypeWrapper {
                 serialize_bytea_array(values.iter().map(|value| value.as_ref()), ty, out)
             }
             EthereumSqlTypeWrapper::U32(value) => {
-                let int_value: i32 = *value as i32;
+                let int_value = i64::from(*value);
                 int_value.to_sql(ty, out)
             }
             EthereumSqlTypeWrapper::I32(value) => value.to_sql(ty, out),
             EthereumSqlTypeWrapper::VecU32(values) => {
-                let int_values: Vec<i32> = values.iter().map(|&s| s as i32).collect();
+                let int_values: Vec<i64> = values.iter().copied().map(i64::from).collect();
                 if int_values.is_empty() {
                     Ok(IsNull::Yes)
                 } else {
@@ -1123,12 +1123,12 @@ impl ToSql for EthereumSqlTypeWrapper {
                 }
             }
             EthereumSqlTypeWrapper::U16(value) => {
-                let int_value: i16 = *value as i16;
+                let int_value = i32::from(*value);
                 int_value.to_sql(ty, out)
             }
             EthereumSqlTypeWrapper::I16(value) => value.to_sql(ty, out),
             EthereumSqlTypeWrapper::VecU16(values) => {
-                let int_values: Vec<i16> = values.iter().map(|&s| s as i16).collect();
+                let int_values: Vec<i32> = values.iter().copied().map(i32::from).collect();
                 if int_values.is_empty() {
                     Ok(IsNull::Yes)
                 } else {

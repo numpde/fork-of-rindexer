@@ -1,0 +1,96 @@
+# PostgreSQL unsigned integer storage
+
+`uint16` and `uint32` values above the signed integer maximum were previously
+encoded as negative PostgreSQL values, including array elements. The corrected
+encoder and generated event and custom-table schemas use a wider signed PostgreSQL
+representation. Custom-table batch parameters and reorg casts use those same wider
+types. Custom-table `uint32` columns also cover values inferred from `uint24` events.
+
+| ABI type | Previous PostgreSQL type | Required PostgreSQL type |
+| --- | --- | --- |
+| `uint16` | `SMALLINT` | `INTEGER` |
+| `uint16[]` | `SMALLINT[]` | `INTEGER[]` |
+| `uint24`, `uint32` | `INTEGER` | `BIGINT` |
+| `uint24[]`, `uint32[]` | `INTEGER[]` | `BIGINT[]` |
+
+`uint24` itself did not overflow, but shares the `U32`/`VecU32` wrapper and
+binary COPY bind types with `uint32`. Its columns must therefore widen too.
+`uint8`, signed integers, larger integer mappings and ClickHouse are unchanged.
+Rust wrapper variants and the convention storing an empty integer array as SQL
+`NULL` are unchanged.
+
+## Existing databases
+
+Newly generated tables use the corrected types. This change does not automatically
+migrate existing event or custom tables or repair historical data. Do not run the
+new encoder against old column types. Stop normal indexing before changing schemas
+and keep it stopped through any required history and derived-data repair. Use only
+upgraded encoders for a controlled rebuild into the widened schema; do not mix old
+and new encoders.
+
+Use the original contract ABI to identify affected event columns, including
+flattened tuple fields and corresponding custom-table or foreign-key columns.
+Audit Rust-mode schemas using `U16`, `VecU16`, `U32`, or `VecU32` as well. Review
+views, constraints, SQL clients and GraphQL consumers for the column-type change.
+Back up the database and plan the required table locks before applying DDL.
+
+For custom tables, widen affected primary-key columns and value columns together
+with their source event columns. Schema checks warn about type changes for resolved
+scalar columns, but do not widen them or prevent startup. They do not verify array
+element widths. Inspect the actual column types, including arrays, in PostgreSQL
+(for example, with `\d schema.table` in psql); startup warnings do not confirm that
+migration is complete.
+
+The following is a template, not an automatically executed migration. Replace
+all identifiers with the affected schema, table and column names:
+
+```sql
+BEGIN;
+ALTER TABLE example_schema.example_event
+    ALTER COLUMN value16 TYPE INTEGER USING value16::INTEGER,
+    ALTER COLUMN values16 TYPE INTEGER[] USING values16::INTEGER[],
+    ALTER COLUMN value24 TYPE BIGINT USING value24::BIGINT,
+    ALTER COLUMN values24 TYPE BIGINT[] USING values24::BIGINT[],
+    ALTER COLUMN value32 TYPE BIGINT USING value32::BIGINT,
+    ALTER COLUMN values32 TYPE BIGINT[] USING values32::BIGINT[];
+COMMIT;
+```
+
+Widening preserves existing contents; it does not turn previously negative values
+back into their original unsigned values. Restore affected raw events and derived
+results from trusted logs. Rebuilding into a fresh database, from a consistent
+start block and cursor state, avoids mixing corrected and corrupted history.
+Simply rewinding a cursor into populated tables can duplicate events or reapply
+derived effects; use the deployment's reviewed rebuild/reconciliation procedure.
+Correcting a raw column alone does not repair aggregates computed from bad values.
+No historical-value rewrite is attempted by this fix.
+
+After migration, use disposable tables with the migrated column types to verify
+INSERT and binary COPY at the signed boundary and unsigned maximum: `32767`,
+`32768`, `65535` for `uint16`, and `2147483647`, `2147483648`, `4294967295` for
+`uint32`, including arrays. Verify `uint24` and `uint24[]` with `16777215` as well.
+Resume normal indexing with upgraded encoders only after you have verified all
+affected column types and any required repairs to historical events and derived
+results. Downgrading to the old encoder requires a separate compatibility plan;
+do not narrow columns containing values that cannot fit the old types.
+
+## Regression checks
+
+From the repository root, prepare the development image and locked dependencies,
+then run the focused tests:
+
+```bash
+make dev/image/build
+make deps/install
+make tests/unsigned-integers/docker
+make tests/unsigned-integers/postgres
+```
+
+`make tests/unsigned-integers/docker` checks ABI conversion, event and custom-table
+types, binary encoding, signed controls, unchanged ClickHouse serialization and
+empty arrays. `make tests/unsigned-integers/postgres` checks event INSERT and binary
+COPY, custom-table COPY and batched upserts, scalar schema-change detection, and
+reversal of custom-table updates after a blockchain reorganization, using large
+unsigned keys and amounts.
+Custom-table tests use a fresh disposable database per test on the internal fixture
+network. Neither test container has Docker access.

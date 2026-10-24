@@ -232,6 +232,10 @@ export default defineConfig({
           text: "RPC Node Providers ",
           link: "/docs/references/rpc-node-providers",
         },
+        {
+          text: "PostgreSQL Unsigned Integer Migration",
+          link: "/docs/migrations/unsigned-integer-storage",
+        },
       ],
     },
     {

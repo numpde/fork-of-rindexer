@@ -782,12 +782,15 @@ impl serde::Serialize for ColumnType {
 }
 
 impl ColumnType {
-    /// Convert to PostgreSQL type
+    /// PostgreSQL storage type for custom-table columns and rollback casts.
+    /// Unsigned 16- and 32-bit values use the next signed width to match parameter encoding.
     pub fn to_postgres_type(&self) -> String {
         match self {
             ColumnType::Uint8 | ColumnType::Int8 => "SMALLINT".to_string(),
-            ColumnType::Uint16 | ColumnType::Int16 => "SMALLINT".to_string(),
-            ColumnType::Uint32 | ColumnType::Int32 => "INTEGER".to_string(),
+            ColumnType::Uint16 => "INTEGER".to_string(),
+            ColumnType::Uint32 => "BIGINT".to_string(),
+            ColumnType::Int16 => "SMALLINT".to_string(),
+            ColumnType::Int32 => "INTEGER".to_string(),
             ColumnType::Uint64 | ColumnType::Int64 => "BIGINT".to_string(),
             ColumnType::Uint128 | ColumnType::Int128 | ColumnType::Uint256 | ColumnType::Int256 => {
                 "NUMERIC".to_string()
@@ -1948,8 +1951,8 @@ mod tests {
     }
 
     #[test]
-    fn test_pg_type_uint32_is_integer() {
-        assert_eq!(ColumnType::Uint32.to_postgres_type(), "INTEGER");
+    fn test_pg_type_uint32_is_bigint() {
+        assert_eq!(ColumnType::Uint32.to_postgres_type(), "BIGINT");
     }
 
     #[test]
