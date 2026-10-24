@@ -393,6 +393,9 @@ pub enum TraceResult {
         from: Address,
         to: Address,
         value: U256,
+        /// Internal-call position from the trace source; None denotes a
+        /// transaction-root transfer from full block transactions.
+        trace_address: Option<Vec<usize>>,
         tx_information: TxInformation,
         found_in_request: LogFoundInRequest,
     },
@@ -433,6 +436,7 @@ impl TraceResult {
             from: action.from,
             to: action.to,
             value: action.value,
+            trace_address: Some(trace.trace.trace_address.clone()),
             tx_information: TxInformation {
                 chain_id,
                 network: network.to_string(),
@@ -459,25 +463,46 @@ impl TraceResult {
         start_block: U64,
         end_block: U64,
     ) -> Self {
-        Self::NativeTransfer {
+        Self::try_new_native_transfer(tx, ts, to, network, chain_id, start_block, end_block)
+            .expect("TraceResult::new_native_transfer requires complete mined transaction metadata")
+    }
+
+    /// Engine input must fail before callbacks, rather than panic on an incomplete RPC transaction.
+    pub(crate) fn try_new_native_transfer(
+        tx: AnyRpcTransaction,
+        ts: u64,
+        to: Address,
+        network: &str,
+        chain_id: u64,
+        start_block: U64,
+        end_block: U64,
+    ) -> Result<Self, String> {
+        let missing = |field| {
+            format!(
+            "Cannot construct native-transfer callback input on network {network:?}, transaction {:#x}, requested blocks {start_block}..{end_block}: RPC transaction is missing {field}", tx.tx_hash(),
+        )
+        };
+        let block_number = tx.block_number.ok_or_else(|| missing("block_number"))?;
+        let block_hash = tx.block_hash.ok_or_else(|| missing("block_hash"))?;
+        let transaction_index = tx.transaction_index.ok_or_else(|| missing("transaction_index"))?;
+        Ok(Self::NativeTransfer {
             to,
             from: tx.from(),
             value: tx.value(),
+            trace_address: None,
             tx_information: TxInformation {
                 chain_id,
                 network: network.to_string(),
                 address: Address::ZERO,
-                block_number: tx.block_number.expect("block_number should be present"),
+                block_number,
                 block_timestamp: Some(U256::from(ts)),
                 transaction_hash: tx.tx_hash(),
-                block_hash: tx.block_hash.expect("block_hash should be present"),
-                transaction_index: tx
-                    .transaction_index
-                    .expect("transaction_index should be present"),
+                block_hash,
+                transaction_index,
                 log_index: U256::from(0),
             },
             found_in_request: LogFoundInRequest { from_block: start_block, to_block: end_block },
-        }
+        })
     }
 
     /// Create a "Block" TraceResult for block events.
@@ -1066,6 +1091,7 @@ mod tests {
             from: Address::ZERO,
             to: Address::ZERO,
             value: U256::ZERO,
+            trace_address: None,
             tx_information: test_tx_information("anvil"),
             found_in_request: test_found_in_request(5, 15),
         };

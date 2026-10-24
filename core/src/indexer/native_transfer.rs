@@ -510,7 +510,7 @@ pub async fn native_transfer_block_consumer(
 
             if has_to_address && is_empty_input && !is_value_zero {
                 let to = tx.to().unwrap();
-                Some(TraceResult::new_native_transfer(
+                Some(TraceResult::try_new_native_transfer(
                     tx,
                     ts,
                     to,
@@ -523,7 +523,8 @@ pub async fn native_transfer_block_consumer(
                 None
             }
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(ProviderError::CustomError)?;
 
     let writer_barrier = event_writer_barrier(network_name);
     let _writer_guard = writer_barrier.read().await;

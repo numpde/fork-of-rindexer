@@ -9,14 +9,13 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use tokio_postgres::types::Type as PgType;
 use tracing::{debug, error, info, warn};
 
 use super::cron_scheduler::{manifest_has_cron_tables, CronScheduler};
 use super::native_transfer::{NATIVE_TRANSFER_ABI, NATIVE_TRANSFER_CONTRACT_NAME};
 use super::tables::{
     apply_table_operations, prepare_table_operations, process_table_operations, PreparedTableOps,
-    ProgressCheckpointConfig, TableRuntime, TxMetadata,
+    TableRuntime, TxMetadata,
 };
 use crate::database::clickhouse::client::ClickhouseClient;
 use crate::database::clickhouse::setup::{setup_clickhouse, SetupClickhouseError};
@@ -24,6 +23,7 @@ use crate::database::generate::{
     generate_event_table_full_name, generate_indexer_contract_schema_name,
 };
 use crate::database::postgres::client::{pg_error_to_string, BulkCursorUpdate, CursorAdvance};
+use crate::database::postgres::event_applications::EventApplication;
 use crate::database::postgres::generate::generate_internal_event_table_name;
 use crate::database::postgres::write_mode::PgWriteMode;
 use crate::database::sql_type_wrapper::{
@@ -46,8 +46,7 @@ use crate::{
         callback_registry::{
             noop_decoder, CallbackError, CallbackExecutionResult, CallbackResult,
             EventCallbackRegistry, EventCallbackRegistryInformation, EventCallbackType,
-            EventResult, TraceCallbackRegistry, TraceCallbackRegistryInformation,
-            TraceCallbackType, TxInformation,
+            TraceCallbackRegistry, TraceCallbackRegistryInformation, TraceCallbackType,
         },
         contract_setup::{ContractInformation, CreateContractInformationError, TraceInformation},
         EventMessage,
@@ -418,12 +417,17 @@ fn log_table_failure(params: &NoCodeCallbackParams, error: &str) {
     }
 }
 
+struct DecodedCallbackEvent {
+    parameters: Vec<LogParam>,
+    application: EventApplication,
+}
+
 /// Apply only newly claimed PostgreSQL events. Independent sinks borrow the
 /// original batch, and the caller supplies a cursor only when PG can own it.
 async fn apply_postgres_events(
     postgres: &PostgresClient,
     params: &NoCodeCallbackParams,
-    events: &[EventResult],
+    applications: &[EventApplication],
     raw_rows: &[Vec<EthereumSqlTypeWrapper>],
     table_events: &[(Vec<LogParam>, String, TxMetadata)],
     cursor: Option<&BulkCursorUpdate>,
@@ -439,7 +443,7 @@ async fn apply_postgres_events(
         &transaction,
         &namespace,
         &params.sql_event_table_name,
-        events,
+        applications,
     )
     .await?;
     let rows: Vec<_> = raw_rows
@@ -595,7 +599,7 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
 
             let mut indexed_count = 0;
             let mut sql_bulk_data: Vec<Vec<EthereumSqlTypeWrapper>> = Vec::new();
-            let mut sql_bulk_column_types: Vec<PgType> = Vec::new();
+            let mut applications = Vec::new();
             let mut csv_bulk_data: Vec<Vec<String>> = Vec::new();
 
             // stream and chat info, paired with source block_number so the
@@ -605,167 +609,82 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
             // table operations data: (log_params, network, tx_metadata)
             let mut table_events_data: Vec<(Vec<LogParam>, String, TxMetadata)> = Vec::new();
 
+            // Decode once into rows that retain their exact source identity.
+            // Receipt input, raw parameters and derived inputs share this order.
             let owned_results = match &results {
-                CallbackResult::Event(events) => events
-                    .iter()
-                    .map(|result| {
-                        // Decode the entire batch before any sink or derived-table effects.
-                        let log = parse_log(&params.event, &result.log).ok_or_else(|| {
-                            CallbackError::Permanent(format!(
-                                "Cannot decode {:?}::{:?} on network {:?}: transaction {:#x}, log_index={} does not match the configured event ABI; this callback attempt made no writes",
-                                params.contract_name,
-                                params.event_info.name,
-                                result.tx_information.network,
-                                result.tx_information.transaction_hash,
-                                result.tx_information.log_index,
-                            ))
-                        })?;
-
-                        let address = result.tx_information.address;
-                        let transaction_hash = result.tx_information.transaction_hash;
-                        let block_number = result.tx_information.block_number;
-                        let block_timestamp = result
-                            .tx_information
-                            .block_timestamp
-                            .and_then(|ts| chrono::DateTime::from_timestamp(ts.to(), 0));
-                        let block_hash = result.tx_information.block_hash;
-                        let network = result.tx_information.network.to_string();
-                        let chain_id = result.tx_information.chain_id;
-                        let transaction_index = result.tx_information.transaction_index;
-                        let log_index = result.tx_information.log_index;
-
-                        let event_parameters: Vec<EthereumSqlTypeWrapper> =
-                            map_log_params_to_ethereum_wrapper(
-                                &params.event_info.inputs,
-                                &log.params,
-                            );
-
-                        let contract_address = EthereumSqlTypeWrapper::Address(address);
-                        let end_global_parameters = vec![
-                            EthereumSqlTypeWrapper::B256(transaction_hash),
-                            EthereumSqlTypeWrapper::U64(block_number),
-                            EthereumSqlTypeWrapper::DateTimeNullable(block_timestamp),
-                            EthereumSqlTypeWrapper::B256(block_hash),
-                            EthereumSqlTypeWrapper::String(network.to_string()),
-                            EthereumSqlTypeWrapper::U64(transaction_index),
-                            EthereumSqlTypeWrapper::U256(log_index),
-                        ];
-
-                        Ok((
-                            log.params,
-                            address,
-                            transaction_hash,
-                            log_index,
-                            transaction_index,
-                            block_number,
-                            result.tx_information.block_timestamp,
-                            block_hash,
-                            network,
-                            chain_id,
-                            contract_address,
-                            event_parameters,
-                            end_global_parameters,
+                CallbackResult::Event(events) => events.iter().map(|result| {
+                    let log = parse_log(&params.event, &result.log).ok_or_else(|| {
+                        CallbackError::Permanent(format!(
+                            "Cannot decode {:?}::{:?} on network {:?}: transaction {:#x}, log_index={} does not match the configured event ABI; this callback attempt made no writes",
+                            params.contract_name, params.event_info.name, result.tx_information.network,
+                            result.tx_information.transaction_hash, result.tx_information.log_index,
                         ))
+                    })?;
+                    Ok(DecodedCallbackEvent {
+                        parameters: log.params,
+                        application: EventApplication {
+                            tx_information: result.tx_information.clone(),
+                            position: result.tx_information.log_index.to_string(),
+                        },
                     })
-                    .collect::<Result<Vec<_>, CallbackError>>()?,
-                CallbackResult::Trace(events) => events
-                    .iter()
-                    .filter_map(|result| {
-                        match result {
-                            TraceResult::NativeTransfer {
-                                from, to, value, tx_information, ..
-                            } => {
-                                let log_params = vec![
-                                    LogParam::new("from".to_string(), DynSolValue::Address(*from)),
-                                    LogParam::new("to".to_string(), DynSolValue::Address(*to)),
-                                    LogParam::new(
-                                        "value".to_string(),
-                                        DynSolValue::Uint(*value, 256),
-                                    ),
-                                ];
-
-                                let address = tx_information.address;
-                                let transaction_hash = tx_information.transaction_hash;
-                                let block_number = tx_information.block_number;
-                                let block_timestamp = tx_information
-                                    .block_timestamp
-                                    .and_then(|ts| chrono::DateTime::from_timestamp(ts.to(), 0));
-                                let block_hash = tx_information.block_hash;
-                                let network = tx_information.network.to_string();
-                                let chain_id = tx_information.chain_id;
-                                let transaction_index = tx_information.transaction_index;
-                                let log_index = tx_information.log_index;
-
-                                let event_parameters: Vec<EthereumSqlTypeWrapper> =
-                                    map_log_params_to_ethereum_wrapper(
-                                        &params.event_info.inputs,
-                                        &log_params,
-                                    );
-
-                                let contract_address = EthereumSqlTypeWrapper::Address(address);
-                                let end_global_parameters = vec![
-                                    EthereumSqlTypeWrapper::B256(transaction_hash),
-                                    EthereumSqlTypeWrapper::U64(block_number),
-                                    EthereumSqlTypeWrapper::DateTimeNullable(block_timestamp),
-                                    EthereumSqlTypeWrapper::B256(block_hash),
-                                    EthereumSqlTypeWrapper::String(network.to_string()),
-                                    EthereumSqlTypeWrapper::U64(transaction_index),
-                                    EthereumSqlTypeWrapper::U256(log_index),
-                                ];
-
-                                Some((
-                                    log_params,
-                                    address,
-                                    transaction_hash,
-                                    log_index,
-                                    transaction_index,
-                                    block_number,
-                                    tx_information.block_timestamp,
-                                    block_hash,
-                                    network,
-                                    chain_id,
-                                    contract_address,
-                                    event_parameters,
-                                    end_global_parameters,
-                                ))
-                            }
-                            TraceResult::Block { .. } => None, // Skip block events in no-code mode
+                }).collect::<Result<Vec<_>, CallbackError>>()?,
+                CallbackResult::Trace(traces) => traces.iter().filter_map(|trace| match trace {
+                    TraceResult::NativeTransfer { from, to, value, tx_information, trace_address, .. } => {
+                        if params.postgres.is_some() && (tx_information.block_hash.is_zero() || tx_information.transaction_hash.is_zero()) {
+                            let field = if tx_information.block_hash.is_zero() { "block_hash" } else { "transaction_hash" };
+                            return Some(Err(CallbackError::Permanent(format!(
+                                "Cannot apply PostgreSQL native transfers on network {:?}, block {}, transaction {:#x}: {field} is zero, so a stable mined-trace identity is unavailable; this callback attempt made no raw or derived writes",
+                                tx_information.network, tx_information.block_number, tx_information.transaction_hash,
+                            ))));
                         }
-                    })
-                    .collect::<Vec<_>>(),
+                        let path = trace_address.as_deref().unwrap_or_default();
+                        let position = if path.is_empty() { "root".to_string() } else {
+                            // A full path remains on TraceResult. Its stable digest
+                            // bounds the receipt's B-tree key even at EVM call-depth limits.
+                            let encoded = serde_json::to_vec(path).expect("integer trace paths serialize");
+                            format!("trace:{:#x}", alloy::primitives::keccak256(encoded))
+                        };
+                        Some(Ok(DecodedCallbackEvent {
+                            parameters: vec![
+                                LogParam::new("from".to_string(), DynSolValue::Address(*from)),
+                                LogParam::new("to".to_string(), DynSolValue::Address(*to)),
+                                LogParam::new("value".to_string(), DynSolValue::Uint(*value, 256)),
+                            ],
+                            application: EventApplication { tx_information: tx_information.clone(), position },
+                        }))
+                    }
+                    TraceResult::Block { .. } => None,
+                }).collect::<Result<Vec<_>, CallbackError>>()?,
             };
 
-            for (
-                log_params,
-                address,
-                transaction_hash,
-                log_index,
-                transaction_index,
-                block_number,
-                block_timestamp,
-                block_hash,
-                network,
-                chain_id,
-                contract_address,
-                event_parameters,
-                end_global_parameters,
-            ) in owned_results
-            {
+            for decoded in owned_results {
+                let tx = &decoded.application.tx_information;
+                let address = tx.address;
+                let transaction_hash = tx.transaction_hash;
+                let log_index = tx.log_index;
+                let transaction_index = tx.transaction_index;
+                let block_number = tx.block_number;
+                let block_timestamp = tx.block_timestamp;
+                let block_hash = tx.block_hash;
+                let network = tx.network.clone();
+                let log_params = decoded.parameters;
+                let event_parameters = map_log_params_to_ethereum_wrapper(&params.event_info.inputs, &log_params);
+                let contract_address = EthereumSqlTypeWrapper::Address(address);
+                let end_global_parameters = vec![
+                    EthereumSqlTypeWrapper::B256(transaction_hash),
+                    EthereumSqlTypeWrapper::U64(block_number),
+                    EthereumSqlTypeWrapper::DateTimeNullable(tx.block_timestamp.and_then(|timestamp| chrono::DateTime::from_timestamp(timestamp.to(), 0))),
+                    EthereumSqlTypeWrapper::B256(block_hash),
+                    EthereumSqlTypeWrapper::String(network.clone()),
+                    EthereumSqlTypeWrapper::U64(transaction_index),
+                    EthereumSqlTypeWrapper::U256(log_index),
+                ];
+
                 if params.streams_clients.is_some() || params.chat_clients.is_some() {
                     let event_result = map_ethereum_wrapper_to_json(
                         &params.event_info.inputs,
                         &event_parameters,
-                        &TxInformation {
-                            network: network.clone(),
-                            chain_id,
-                            address,
-                            block_hash,
-                            block_number,
-                            transaction_hash,
-                            block_timestamp,
-                            log_index,
-                            transaction_index,
-                        },
+                        tx,
                         false,
                     );
                     event_message_data.push((block_number, event_result));
@@ -782,12 +701,6 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
                         "Cannot store {:?}::{:?} on network {:?}: transaction {:#x}, log_index={} contains U+0000 in a PostgreSQL text/JSONB value; this callback attempt made no writes",
                         params.contract_name, params.event_info.name, network, transaction_hash, log_index,
                     )));
-                }
-
-                // Set column types dynamically based on first result
-                if sql_bulk_column_types.is_empty() {
-                    sql_bulk_column_types =
-                        all_params.iter().map(|param| param.to_type()).collect();
                 }
 
                 if params.postgres.is_some() || params.clickhouse.is_some() {
@@ -825,6 +738,7 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
                     table_events_data.push((log_params, network, tx_metadata));
                 }
 
+                applications.push(decoded.application);
                 indexed_count += 1;
             }
 
@@ -852,8 +766,8 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
 
             // PostgreSQL application and whole-callback completion are separate
             // boundaries. Other sinks still receive the original input on replay.
-            let postgres_applied = match (params.postgres.as_ref(), &results) {
-                (Some(postgres), CallbackResult::Event(events)) if params.store_raw_events => {
+            let postgres_applied = match params.postgres.as_ref() {
+                Some(postgres) if params.store_raw_events => {
                     let cursor = atomic_pg_cursor.then(|| {
                         let schema = generate_indexer_contract_schema_name(&params.indexer_name, &params.contract_name);
                         BulkCursorUpdate {
@@ -861,7 +775,7 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
                             network: network.clone(), to_block: to_block.to(),
                         }
                     });
-                    Some(apply_postgres_events(postgres, &params, events, &sql_bulk_data,
+                    Some(apply_postgres_events(postgres, &params, &applications, &sql_bulk_data,
                         &table_events_data, cursor.as_ref()).await?)
                 }
                 _ => None,
@@ -872,23 +786,6 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
             }
 
             if params.store_raw_events {
-                // Trace callbacks retain their existing write behavior until
-                // their application identities can distinguish internal calls.
-                if postgres_applied.is_none() {
-                    if let Some(postgres) = &params.postgres {
-                        let schema = generate_indexer_contract_schema_name(&params.indexer_name, &params.contract_name);
-                        let namespace = generate_internal_event_table_name(&schema, &params.event_info.name);
-                        crate::database::postgres::event_applications::require_untracked_stream(postgres, &namespace).await?;
-                        if !sql_bulk_data.is_empty() {
-                            postgres.insert_bulk(&params.sql_event_table_name,
-                                &params.sql_column_names, &sql_bulk_data).await
-                                .map_err(|error| {
-                                    error!("{}::{} - Error performing postgres bulk insert: {}", params.contract_name, params.event_info.name, error);
-                                    error.to_string()
-                                })?;
-                        }
-                    }
-                }
                 if let Some(clickhouse) = &params.clickhouse {
                     if !sql_bulk_data.is_empty() {
                         clickhouse.insert_bulk(&params.sql_event_table_name,
@@ -906,20 +803,13 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
                 }
             }
 
-            let remaining_postgres = if postgres_applied.is_some() { None } else { params.postgres.clone() };
-            if !params.tables.is_empty() && !table_events_data.is_empty()
-                && (remaining_postgres.is_some() || params.clickhouse.is_some())
-            {
-                // PG derived effects were committed with their receipts. A later
-                // sink's partial progress must not checkpoint past unfinished output.
-                let checkpoint = postgres_applied.is_none().then(|| ProgressCheckpointConfig::new(
-                    params.indexer_name.clone(), params.contract_name.clone(),
-                    params.event_info.name.clone(), params.postgres.clone(),
-                ));
+            if !params.tables.is_empty() && !table_events_data.is_empty() && params.clickhouse.is_some() {
+                // PG derived effects already committed with their receipts.
+                // Partial work in another sink cannot publish the shared cursor.
                 process_table_operations(&params.tables, &params.event_info.name,
-                    &table_events_data, remaining_postgres, params.clickhouse.clone(),
+                    &table_events_data, None, params.clickhouse.clone(),
                     params.providers.clone(), &params.constants, &params.multicall_addresses,
-                    checkpoint.as_ref()).await.inspect_err(|error| log_table_failure(&params, error))?;
+                    None).await.inspect_err(|error| log_table_failure(&params, error))?;
             }
             // Build the cross-block chat payload first (one clone per event)
             // so the streams path can consume `event_message_data` into
@@ -1445,10 +1335,9 @@ pub async fn process_trace_events(
             constants: Arc::new(manifest.constants.clone()),
             multicall_addresses,
             is_factory_event: false,
-            // Trace/native-transfer streams keep legacy cursor semantics: their
-            // OUTER cursor advance is unconditional (evm_trace_update_progress…
-            // ignores the callback result), so the atomic path buys nothing and
-            // must not engage.
+            // Native callbacks share a trace cursor with other trace callbacks.
+            // The dispatcher advances it after every callback succeeds; the
+            // per-callback receipt transaction must not publish that cursor.
             atomic_safe_concurrency: false,
         });
 

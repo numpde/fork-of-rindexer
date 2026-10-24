@@ -306,35 +306,53 @@ async fn relay(
 
 #[tokio::test]
 async fn postgres_lost_commit_response_replay_preserves_rows_and_additive_effects() {
-    assert_lost_commit_replay(false).await;
+    assert_lost_commit_replay(ReplayKind::AtomicEvent).await;
 }
 
 #[tokio::test]
 async fn postgres_lost_commit_response_with_deferred_cursor_preserves_effects() {
-    assert_lost_commit_replay(true).await;
+    assert_lost_commit_replay(ReplayKind::DeferredEvent).await;
 }
 
-async fn assert_lost_commit_replay(deferred_cursor: bool) {
-    let fixture = Fixture::new().await;
+#[tokio::test]
+async fn postgres_native_transfer_lost_commit_response_preserves_effects() {
+    assert_lost_commit_replay(ReplayKind::NativeTransfer).await;
+}
+
+enum ReplayKind {
+    AtomicEvent,
+    DeferredEvent,
+    NativeTransfer,
+}
+
+async fn assert_lost_commit_replay(kind: ReplayKind) {
+    let fixture = match kind {
+        ReplayKind::NativeTransfer => Fixture::new_trace().await,
+        _ => Fixture::new().await,
+    };
     let proxy = LostCommitResponse::start(&fixture.url).await;
     let mut params = fixture.params.clone();
-    params.atomic_safe_concurrency = !deferred_cursor;
+    params.atomic_safe_concurrency = matches!(kind, ReplayKind::AtomicEvent);
     params.postgres = Some(client(&proxy.url).await);
-    let callback = no_code_callback(Arc::new(params)).event_callback;
+    let callbacks = no_code_callback(Arc::new(params));
+    let apply = || match kind {
+        ReplayKind::NativeTransfer => {
+            (callbacks.trace_callback)(vec![native_trace(1, 1, &[]), native_trace(2, 2, &[])])
+        }
+        _ => (callbacks.event_callback)(fixture.events(&[1, 2])),
+    };
     let commit_errors = crate::metrics::definitions::ATOMIC_BATCHES_TOTAL
         .with_label_values(&["commit_error", "error"]);
     let rollbacks = crate::metrics::definitions::ATOMIC_BATCHES_TOTAL
         .with_label_values(&["rolled_back", "error"]);
     let before = (commit_errors.get(), rollbacks.get());
-    let first = tokio::time::timeout(Duration::from_secs(20), callback(fixture.events(&[1, 2])))
-        .await
-        .unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(20), apply()).await.unwrap();
     let after_server_commit = fixture.position().await;
     let after_failure = (commit_errors.get(), rollbacks.get());
     let dropped = proxy.dropped.load(Ordering::SeqCst);
-    let replay = callback(fixture.events(&[1, 2])).await;
+    let replay = apply().await;
     let after_replay = fixture.position().await;
-    drop(callback);
+    drop(callbacks);
     proxy.stop().await;
     fixture.finish().await;
     assert!(dropped, "drop the real PostgreSQL COMMIT response");
@@ -346,7 +364,11 @@ async fn assert_lost_commit_replay(deferred_cursor: bool) {
     );
     assert_eq!(
         after_server_commit,
-        (2, "3".to_string(), if deferred_cursor { "0" } else { "2" }.to_string()),
+        (
+            2,
+            "3".to_string(),
+            if matches!(kind, ReplayKind::AtomicEvent) { "2" } else { "0" }.to_string()
+        ),
         "server committed every effect before disconnecting"
     );
     replay.expect("retry the uncertain outcome");
@@ -586,7 +608,7 @@ fn native_trace(
             error: None,
         },
         transaction_hash: Some(B256::repeat_byte(transaction)),
-        transaction_position: Some(0),
+        transaction_position: Some(u64::from(transaction)),
         block_number: Some(2),
         block_hash: Some(B256::repeat_byte(2)),
     };
@@ -627,6 +649,54 @@ async fn postgres_internal_transfers_in_one_transaction_keep_distinct_trace_path
         (3, "6".to_string(), "0".to_string()),
         "synthetic log_index=0 cannot identify different internal calls"
     );
+}
+
+#[tokio::test]
+async fn postgres_deep_trace_paths_fit_receipts_and_remain_replay_safe() {
+    let fixture = Fixture::new_trace().await;
+    let callback = no_code_callback(Arc::new(fixture.params.clone())).trace_callback;
+    let first = vec![99; 1023];
+    let mut second = first.clone();
+    second[1022] = 100;
+    callback(vec![native_trace(1, 1, &first), native_trace(2, 1, &second)]).await.unwrap();
+    callback(vec![native_trace(2, 1, &second)]).await.unwrap();
+    let position = fixture.position().await;
+    drop(callback);
+    fixture.finish().await;
+    assert_eq!(position, (2, "3".to_string(), "0".to_string()));
+}
+
+#[tokio::test]
+async fn postgres_v1_receipt_migration_preserves_log_keys_and_replay_protection() {
+    let fixture = Fixture::new().await;
+    let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+    callback(fixture.events(&[1, 2])).await.unwrap();
+    fixture
+        .client
+        .batch_execute(include_str!("../database/postgres/testdata/event_applications_v1.sql"))
+        .await
+        .unwrap();
+    let schema = generate_indexer_contract_schema_name(
+        &fixture.params.indexer_name,
+        &fixture.params.contract_name,
+    );
+    let namespace = generate_internal_event_table_name(&schema, &fixture.params.event_info.name);
+    for event in fixture.events(&[1, 2]) {
+        fixture.client.execute("INSERT INTO rindexer_internal.event_applications VALUES ($1, 'ethereum', 2, $2, $3, $4)",
+            &[&namespace, &event.tx_information.block_hash.as_slice(), &event.tx_information.transaction_hash.as_slice(), &event.tx_information.log_index.to_string()]).await.unwrap();
+    }
+    fixture
+        .client
+        .batch_execute(crate::database::postgres::event_applications::schema_sql())
+        .await
+        .unwrap();
+    let positions: Vec<String> = fixture.client.query("SELECT event_position FROM rindexer_internal.event_applications WHERE namespace = $1 ORDER BY event_position", &[&namespace]).await.unwrap().iter().map(|row| row.get(0)).collect();
+    callback(fixture.events(&[1, 2])).await.unwrap();
+    let position = fixture.position().await;
+    drop(callback);
+    fixture.finish().await;
+    assert_eq!(positions, ["1", "2"]);
+    assert_eq!(position, (2, "3".to_string(), "2".to_string()));
 }
 
 #[tokio::test]
@@ -720,6 +790,15 @@ async fn postgres_existing_untracked_history_requires_reviewed_migration() {
 
 #[tokio::test]
 async fn postgres_reorg_reversal_releases_event_identity_for_canonical_replay() {
+    assert_reorg_replay(ReplayKind::AtomicEvent).await;
+}
+
+#[tokio::test]
+async fn postgres_native_reorg_reversal_releases_trace_identity_for_canonical_replay() {
+    assert_reorg_replay(ReplayKind::NativeTransfer).await;
+}
+
+async fn assert_reorg_replay(kind: ReplayKind) {
     use crate::{
         indexer::reorg::{
             task::{
@@ -730,14 +809,25 @@ async fn postgres_reorg_reversal_releases_event_identity_for_canonical_replay() 
         },
         manifest::contract::{ColumnType, SetAction},
     };
-    let fixture = Fixture::new().await;
-    let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
-    callback(fixture.events(&[1, 2])).await.unwrap();
+    let fixture = match kind {
+        ReplayKind::NativeTransfer => Fixture::new_trace().await,
+        _ => Fixture::new().await,
+    };
+    let callbacks = no_code_callback(Arc::new(fixture.params.clone()));
+    let apply = || match kind {
+        ReplayKind::NativeTransfer => {
+            (callbacks.trace_callback)(vec![native_trace(1, 1, &[0]), native_trace(2, 1, &[1])])
+        }
+        _ => (callbacks.event_callback)(fixture.events(&[1, 2])),
+    };
+    apply().await.unwrap();
     let schema = generate_indexer_contract_schema_name(
         &fixture.params.indexer_name,
         &fixture.params.contract_name,
     );
     let cursor = generate_internal_event_table_name(&schema, &fixture.params.event_info.name);
+    // Model dispatcher completion for a callback whose transaction defers progress.
+    fixture.client.batch_execute(&format!("UPDATE rindexer_internal.{cursor} SET last_synced_block = 2 WHERE network = 'ethereum'")).await.unwrap();
     let totals = fixture.params.tables[0].full_table_name.clone();
     let mut plan = DerivedTableRollbackPlan::default();
     plan.try_add_operation(
@@ -754,11 +844,11 @@ async fn postgres_reorg_reversal_releases_event_identity_for_canonical_replay() 
         detection_point: 2,
         event_tables: vec![EventTableInfo::try_new(
             schema,
-            "value".to_string(),
+            crate::helpers::camel_to_snake(&fixture.params.event_info.name),
             cursor,
-            "Replay".to_string(),
-            "Contract".to_string(),
-            "Value".to_string(),
+            fixture.params.indexer_name.clone(),
+            fixture.params.contract_name.clone(),
+            fixture.params.event_info.name.clone(),
         )
         .unwrap()],
         derived_tables: vec![DerivedTableInfo::try_new(
@@ -791,10 +881,17 @@ async fn postgres_reorg_reversal_releases_event_identity_for_canonical_replay() 
     .await
     .unwrap();
     let reversed = fixture.position().await;
-    callback(fixture.events(&[1, 2])).await.unwrap();
+    apply().await.unwrap();
     let replayed = fixture.position().await;
-    drop(callback);
+    drop(callbacks);
     fixture.finish().await;
     assert_eq!(reversed, (0, "0".to_string(), "1".to_string()));
-    assert_eq!(replayed, (2, "3".to_string(), "2".to_string()));
+    assert_eq!(
+        replayed,
+        (
+            2,
+            "3".to_string(),
+            if matches!(kind, ReplayKind::AtomicEvent) { "2" } else { "1" }.to_string()
+        )
+    );
 }

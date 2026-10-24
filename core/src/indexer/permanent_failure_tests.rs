@@ -250,6 +250,7 @@ fn transfer(network: &str) -> TraceResult {
         from: alloy::primitives::Address::ZERO,
         to: alloy::primitives::Address::ZERO,
         value: alloy::primitives::U256::ONE,
+        trace_address: None,
         tx_information: metadata,
         found_in_request: source.found_in_request,
     }
@@ -384,6 +385,7 @@ async fn postgres_trace_parameter_nul_remains_terminal_through_the_trace_adapter
         from: Address::ZERO,
         to: Address::ZERO,
         value: U256::ONE,
+        trace_address: None,
         tx_information: metadata,
         found_in_request: source.found_in_request,
     };

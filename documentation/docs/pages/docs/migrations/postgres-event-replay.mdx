@@ -1,21 +1,26 @@
 # PostgreSQL event replay receipts
 
-No-code contract-event indexing can now retry a PostgreSQL COMMIT with
+No-code contract-event and native-transfer indexing can now retry a PostgreSQL COMMIT with
 an unknown outcome without duplicating its raw events or applying derived
 operations again. This includes a connection failure after PostgreSQL commits but
 before the client receives confirmation.
 
 ## Supported path
 
-This guarantee applies to managed PostgreSQL raw contract events and their derived
+This guarantee applies to managed PostgreSQL raw contract events, native transfers and their derived
 operations, including factory-discovery callbacks, higher callback concurrency,
-and configurations with ClickHouse, CSV, streams or chat clients. Native-transfer
-and block traces and custom Rust callbacks retain their previous PostgreSQL replay
-behavior. Use one writer process; this change does not coordinate cursor
+and configurations with ClickHouse, CSV, streams or chat clients. Block traces and
+custom Rust callbacks retain their previous PostgreSQL replay behavior.
+Use one writer process; this change does not coordinate cursor
 publication between independent processes.
 
 A receipt identifies the event stream namespace, network, block hash, transaction
-hash and log index. The receipt, selected raw rows, derived-table operations and
+hash and event position. Contract events retain their decimal log index as the
+position. A native transaction root uses `root`; an internal call uses `trace:`
+followed by the hexadecimal Keccak-256 digest of its full trace path encoded as a
+compact JSON integer array. This bounds the index key even for deep call paths.
+The raw table and stream payload `log_index` fields retain their existing format.
+The receipt, selected raw rows, derived-table operations and
 an eligible cursor commit in one transaction. Only newly claimed events enter aggregation,
 so regrouping an overlapping batch does not reapply old additions. A transaction
 failure rolls back its claims too. A cursor already ahead of an unseen event does
@@ -23,7 +28,8 @@ not suppress that event.
 
 PostgreSQL owns the cursor only for a serialized callback with no other sink or
 factory bookkeeping. Otherwise the dispatcher advances the cursor after the full
-callback succeeds, in dispatch order. An independent sink can fail after the PG
+callback succeeds, in dispatch order. Native transfers always defer their shared
+trace cursor to the dispatcher. An independent sink can fail after the PG
 effect group commits: the cursor stays behind, and replay skips those PG effects
 while retrying the other output. CSV and other independent outputs may receive the
 same events again. Their writes and publications do not become exactly-once or
@@ -55,7 +61,7 @@ you must independently reconcile every affected derived result and establish a
 consistent replay boundary; that migration is not automated here.
 
 Enabling callback concurrency or another sink keeps the same PG receipt history;
-it does not switch the contract-event stream back to untracked writes. Direct SQL
+it does not switch the stream back to untracked writes. Direct SQL
 and custom Rust writers must not bypass this managed application path. A failed
 migration affects that stream; other event streams can continue.
 
@@ -64,6 +70,36 @@ backup point. Manually dropping or editing just one of them is unsupported. Keep
 direct SQL writers and custom callbacks from writing into these managed tables.
 Changes that require recomputing historical derived operations require a coordinated
 rebuild of the associated receipt history too.
+
+### Upgrading the earlier contract-event receipt implementation
+
+Startup renames the internal receipt column `log_index` to `event_position` in
+place. Existing contract-event keys and replay protection are preserved; this
+rename alone does not require a rebuild. Stop writers before upgrading and update
+any SQL that reads this internal column. Existing native-transfer rows that were
+written without receipts still require the reviewed migration described above.
+
+### Native-transfer inputs and Rust consumers
+
+`TraceResult::NativeTransfer` now includes `trace_address: Option<Vec<usize>>`.
+For handwritten enum literals, supply `None` for a full-block transaction root or
+`Some(full_path)` for a trace-derived call. Update exhaustive patterns to bind the
+field or use `..`. Existing constructors populate it; generated user handler data
+shapes do not change. Run `rindexer codegen typings` to keep bindings current.
+
+Managed PostgreSQL native transfers require mined block and transaction hashes.
+A zero-hash placeholder stops the affected stream before any batch effects;
+the engine health endpoint reports HTTP 503. Correct the input source and restart.
+The retained `debug_traceBlockByNumber` adapter supplies incomplete identities and
+cannot feed this managed PostgreSQL path. The production native-transfer processor
+uses full-block transactions; complete trace inputs with real hashes and call
+paths are also accepted. This change does not activate internal-call fetching or
+repair historical data from incomplete traces.
+
+Missing block number, block hash or transaction index in a full-block transaction
+now returns a fetch error before callbacks run. The processor retries without
+advancing the cursor, rather than panicking. The public `new_native_transfer`
+constructor retains its existing mined-metadata precondition.
 
 ## Storage and runtime cost
 
