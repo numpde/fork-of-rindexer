@@ -1022,3 +1022,106 @@ async fn postgres_buffered_reorg_batch_leaves_raw_derived_receipts_and_cursor_un
     drop(callbacks);
     fixture.finish().await;
 }
+
+#[tokio::test]
+async fn postgres_startup_requires_readable_reorg_window() {
+    let fixture = Fixture::new().await;
+    fixture.client.batch_execute("DROP TABLE rindexer_internal.reorg_block_hashes").await.unwrap();
+    let manifest: crate::manifest::core::Manifest = serde_json::from_value(json!({
+        "name": "Replay", "project_type": "no-code", "contracts": [],
+        "networks": [{"name": "ethereum", "chain_id": 1, "rpc": "http://unused.invalid", "reorg_handling": {"enabled": true}}]
+    })).unwrap();
+    let registry = Arc::new(crate::event::callback_registry::EventCallbackRegistry::new());
+    let trace_registry = Arc::new(crate::event::callback_registry::TraceCallbackRegistry::new());
+    let progress = crate::indexer::IndexingEventsProgressState::monitor(&[], &[], None).await;
+    let result = crate::indexer::start::start_indexing_contract_events(
+        &manifest,
+        fixture._directory.path(),
+        Some(fixture.client.clone()),
+        None,
+        &manifest.to_indexer(),
+        registry,
+        trace_registry,
+        &[],
+        true,
+        Default::default(),
+        progress,
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "startup must not treat an unreadable persisted window as an empty one"
+    );
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_startup_stops_after_canonical_validation_rpc_error() {
+    use crate::{
+        blockclock::BlockClock,
+        event::callback_registry::TraceCallbackRegistry,
+        event::contract_setup::{AddressDetails, IndexingContractSetup, NetworkContract},
+        indexer::IndexingEventsProgressState,
+        provider::mock::MockChainProvider,
+    };
+    use alloy::{
+        primitives::{Address, U64},
+        rpc::types::ValueOrArray,
+    };
+    let fixture = Fixture::new().await;
+    fixture.client.batch_execute(&format!(
+        "INSERT INTO rindexer_internal.reorg_block_hashes (network, block_number, block_hash, parent_hash) VALUES ('ethereum', 100, '{:#x}', '{:#x}')",
+        B256::repeat_byte(100), B256::repeat_byte(99),
+    )).await.unwrap();
+    let manifest: crate::manifest::core::Manifest = serde_json::from_value(json!({
+        "name": "Replay", "project_type": "no-code", "contracts": [],
+        "networks": [{"name": "ethereum", "chain_id": 1, "rpc": "http://unused.invalid", "reorg_handling": {"enabled": true}}]
+    })).unwrap();
+    let provider = Arc::new(
+        MockChainProvider::new(1)
+            .with_block_number(2)
+            .with_block_fetch_error("canonical history unavailable"),
+    );
+    let mut registry = super::permanent_failure_tests::registry(
+        &fixture.params,
+        Arc::new(|_| Box::pin(async { Ok(()) })),
+    );
+    let id = registry.events[0].id.clone();
+    registry.events[0].contract.details.push(NetworkContract {
+        id,
+        network: "ethereum".to_string(),
+        indexing_contract_setup: IndexingContractSetup::Address(AddressDetails {
+            address: ValueOrArray::Value(Address::ZERO),
+            indexed_filters: None,
+        }),
+        cached_provider: provider.clone(),
+        block_clock: BlockClock::new(None, None, provider),
+        decoder: crate::event::callback_registry::noop_decoder(),
+        start_block: Some(U64::from(1)),
+        end_block: Some(U64::from(2)),
+        disable_logs_bloom_checks: true,
+    });
+    let result = crate::indexer::start::start_indexing_contract_events(
+        &manifest,
+        fixture._directory.path(),
+        Some(fixture.client.clone()),
+        None,
+        &manifest.to_indexer(),
+        registry.complete(),
+        Arc::new(TraceCallbackRegistry::new()),
+        &[],
+        true,
+        Default::default(),
+        IndexingEventsProgressState::monitor(&[], &[], None).await,
+    )
+    .await;
+    let rejected = result.is_err();
+    if let Ok((tasks, _, _, _, _)) = result {
+        for task in tasks {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+    assert!(rejected, "startup must not launch indexing after canonical validation failed");
+    fixture.finish().await;
+}

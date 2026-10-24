@@ -978,6 +978,7 @@ pub mod mock {
         logs: Vec<Log>,
         blocks: Vec<Arc<AnyRpcBlock>>,
         block_number: U64,
+        block_fetch_error: Option<String>,
         receipts: Vec<AnyTransactionReceipt>,
         traces: Vec<LocalizedTransactionTrace>,
         shared_tip_logs: Option<Arc<SharedTipLogs>>,
@@ -991,10 +992,16 @@ pub mod mock {
                 logs: vec![],
                 blocks: vec![],
                 block_number: U64::ZERO,
+                block_fetch_error: None,
                 receipts: vec![],
                 traces: vec![],
                 shared_tip_logs: None,
             }
+        }
+
+        pub fn with_block_fetch_error(mut self, message: &str) -> Self {
+            self.block_fetch_error = Some(message.to_string());
+            self
         }
 
         pub fn with_block_number(mut self, n: u64) -> Self {
@@ -1093,6 +1100,9 @@ pub mod mock {
             block_numbers: &[U64],
             _include_txs: bool,
         ) -> Result<Vec<AnyRpcBlock>, ProviderError> {
+            if let Some(message) = &self.block_fetch_error {
+                return Err(ProviderError::CustomError(message.clone()));
+            }
             use std::collections::HashSet;
             let requested: HashSet<u64> = block_numbers.iter().map(|n| n.to::<u64>()).collect();
             Ok(self

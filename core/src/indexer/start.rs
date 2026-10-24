@@ -717,7 +717,7 @@ fn build_derived_tables_for_event(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn start_indexing_contract_events(
+pub(super) async fn start_indexing_contract_events(
     manifest: &Manifest,
     project_path: &Path,
     postgres: Option<Arc<PostgresClient>>,

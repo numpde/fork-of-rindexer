@@ -600,6 +600,155 @@ mod tests {
         }
     }
 
+    fn header(number: u64, parent: u8) -> alloy::network::AnyRpcBlock {
+        use alloy::network::{AnyHeader, AnyRpcBlock, AnyRpcHeader};
+        use alloy::rpc::types::{Block, BlockTransactions};
+        AnyRpcBlock::new(
+            Block::new(
+                AnyRpcHeader::from_sealed(
+                    AnyHeader { number, parent_hash: hash(parent), ..Default::default() }
+                        .seal(hash(number as u8)),
+                ),
+                BlockTransactions::Full(vec![]),
+            )
+            .into(),
+        )
+    }
+
+    async fn reject_gap(provider: Arc<dyn ChainProvider>, parent: u8) {
+        let mut coordinator = make_coordinator(make_window_with_blocks(&[(100, 100, 99)]));
+        coordinator.provider = Some(provider);
+        let result = coordinator.on_new_block(105, hash(105), hash(parent)).await;
+        assert!(result.is_err(), "unvalidated ancestry must block the head");
+        assert_eq!(coordinator.window.block_numbers(), vec![100]);
+        assert_eq!(coordinator.window.get(100), Some(&(hash(100), hash(99))));
+    }
+
+    #[tokio::test]
+    async fn gap_rpc_failure_does_not_accept_head() {
+        reject_gap(crate::provider::JsonRpcCachedProvider::mock(1), 104).await;
+    }
+
+    #[tokio::test]
+    async fn gap_missing_header_does_not_accept_head() {
+        reject_gap(
+            Arc::new(crate::provider::mock::MockChainProvider::new(1).with_blocks(vec![
+                header(101, 100),
+                header(102, 101),
+                header(104, 103),
+            ])),
+            104,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn gap_disconnected_headers_leave_window_unchanged() {
+        reject_gap(
+            Arc::new(crate::provider::mock::MockChainProvider::new(1).with_blocks(vec![
+                header(101, 100),
+                header(102, 101),
+                header(103, 88),
+                header(104, 103),
+            ])),
+            104,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn gap_duplicate_header_does_not_accept_head() {
+        reject_gap(
+            Arc::new(crate::provider::mock::MockChainProvider::new(1).with_blocks(vec![
+                header(101, 100),
+                header(102, 101),
+                header(102, 101),
+                header(104, 103),
+            ])),
+            104,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn gap_head_must_connect_to_complete_response() {
+        reject_gap(
+            Arc::new(crate::provider::mock::MockChainProvider::new(1).with_blocks(vec![
+                header(101, 100),
+                header(102, 101),
+                header(103, 102),
+                header(104, 103),
+            ])),
+            88,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn complete_out_of_order_gap_response_is_accepted() {
+        let mut coordinator = make_coordinator(make_window_with_blocks(&[(100, 100, 99)]));
+        coordinator.provider =
+            Some(Arc::new(crate::provider::mock::MockChainProvider::new(1).with_blocks(vec![
+                header(104, 103),
+                header(102, 101),
+                header(101, 100),
+                header(103, 102),
+            ])));
+        assert!(coordinator.on_new_block(105, hash(105), hash(104)).await.unwrap().is_none());
+        assert_eq!(coordinator.window.block_numbers(), (100..=105).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn startup_incomplete_canonical_response_is_rejected() {
+        let mut coordinator = make_coordinator(make_window_with_blocks(&[
+            (98, 98, 97),
+            (99, 99, 98),
+            (100, 100, 99),
+        ]));
+        coordinator.provider = Some(Arc::new(
+            crate::provider::mock::MockChainProvider::new(1).with_blocks(vec![header(100, 99)]),
+        ));
+        assert!(
+            coordinator.validate_on_startup().await.is_err(),
+            "matching the tip alone does not validate persisted ancestry"
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_header_rpc_failure_does_not_clear_window_or_publish_rewind() {
+        let mut coordinator = make_coordinator(make_window_with_blocks(&[(100, 100, 99)]));
+        coordinator.network = "failed-rollback-validation".to_string();
+        coordinator.provider = Some(Arc::new(crate::provider::mock::MockChainProvider::new(1)
+            .with_block_fetch_error("canonical history unavailable")));
+        let reorgs = super::super::subscribe_reorgs(&coordinator.network);
+        let task = coordinator.try_create_reorg_task_for_block_range(100, 100).unwrap();
+        let result = coordinator.handle_reorg(task, &ReorgContext {
+            postgres: None, clickhouse: None, registry: None, trace_registry: None,
+        }).await;
+        assert!(result.is_err(), "rollback must wait for its canonical replacement headers");
+        assert_eq!(coordinator.window.block_numbers(), vec![100]);
+        assert_eq!(reorgs.take_rewind(), None);
+    }
+
+    #[tokio::test]
+    async fn startup_disconnected_canonical_response_is_rejected() {
+        let mut coordinator = make_coordinator(make_window_with_blocks(&[
+            (98, 98, 97),
+            (99, 99, 98),
+            (100, 100, 99),
+        ]));
+        coordinator.provider =
+            Some(Arc::new(crate::provider::mock::MockChainProvider::new(1).with_blocks(vec![
+                header(98, 97),
+                header(99, 88),
+                header(100, 99),
+            ])));
+        assert!(
+            coordinator.validate_on_startup().await.is_err(),
+            "hash matches do not excuse disconnected RPC headers"
+        );
+    }
+
     #[tokio::test]
     async fn test_on_new_block_valid_chain() {
         // Build a window with blocks 10, 11, 12
