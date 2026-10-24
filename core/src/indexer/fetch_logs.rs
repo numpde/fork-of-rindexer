@@ -2706,6 +2706,98 @@ mod tests {
 
     // --- shared tip logs: live-loop tests ---
 
+    #[tokio::test(start_paused = true)]
+    async fn all_live_streams_refetch_after_shared_rollback() {
+        use crate::indexer::reorg::{BlockChainWindow, ReorgBlockHashPersistence};
+        use futures::poll;
+
+        let network = "shared-reorg-rewind";
+        let provider = Arc::new(
+            MockChainProvider::new(1)
+                .with_blocks((97..=100).map(|n| tip_block(n, hash_of(n), Bloom::ZERO)).collect()),
+        );
+        let mut window = BlockChainWindow::try_new(20).unwrap();
+        for n in 97..=100 {
+            window.insert(n, hash_of(n), hash_of(n - 1));
+        }
+        let coordinator = Arc::new(Mutex::new(
+            ReorgCoordinator::new(
+                network.to_string(),
+                window,
+                Arc::new(ReorgBlockHashPersistence::new(None, None)),
+                provider.clone(),
+                vec![],
+                vec![],
+                vec![],
+            )
+            .unwrap(),
+        ));
+        let mut streams = Vec::new();
+        let mut receivers = Vec::new();
+        for _ in 0..2 {
+            let (tx, rx) = mpsc::channel(4);
+            receivers.push(rx);
+            let provider = provider.clone();
+            let coordinator = coordinator.clone();
+            streams.push(Box::pin(async move {
+                live_indexing_stream(
+                    false,
+                    BlockClock::new(None, None, provider.clone()),
+                    provider,
+                    &tx,
+                    U64::from(100),
+                    &B256::ZERO,
+                    &U64::ZERO,
+                    RindexerEventFilter::empty_for_test()
+                        .set_from_block(U64::from(101))
+                        .set_to_block(U64::from(101)),
+                    "test",
+                    network,
+                    true,
+                    None,
+                    CancellationToken::new(),
+                    Some(coordinator),
+                    None,
+                    None,
+                    &EventCallbackRegistry::default(),
+                    None,
+                )
+                .await;
+            }));
+        }
+        // Both streams have observed the old tip and are waiting for the next poll.
+        for stream in &mut streams {
+            assert!(poll!(stream.as_mut()).is_pending());
+        }
+        let mut guard = coordinator.lock().await;
+        let task = guard.try_create_reorg_task_for_block_range(98, 100).unwrap();
+        guard
+            .handle_reorg(
+                task,
+                &ReorgContext {
+                    postgres: None,
+                    clickhouse: None,
+                    registry: None,
+                    trace_registry: None,
+                },
+            )
+            .await
+            .unwrap();
+        drop(guard);
+
+        for (stream, receiver) in streams.iter_mut().zip(&mut receivers) {
+            let batch = tokio::time::timeout(Duration::from_secs(1), async {
+                tokio::select! {
+                    _ = stream => panic!("live stream ended"),
+                    batch = receiver.recv() => batch.unwrap().unwrap(),
+                }
+            })
+            .await
+            .expect("every stream must refetch the rolled-back range");
+            assert_eq!((batch.from_block, batch.to_block), (U64::from(98), U64::from(100)));
+        }
+    }
+
     type TipAnswer = (Duration, Result<Vec<Log>, String>);
 
     /// Scripted unfiltered answers per block for the shared fetcher. An exhausted queue repeats
