@@ -22,9 +22,10 @@ use crate::{
     event::{
         callback_registry::{
             CallbackFailures, EventCallbackRegistry, EventCallbackRegistryInformation,
-            EventCallbackType, FailedStream,
+            EventCallbackType, FailedStream, TraceCallbackRegistry,
+            TraceCallbackRegistryInformation, TraceCallbackType, TraceResult,
         },
-        contract_setup::ContractInformation,
+        contract_setup::{ContractInformation, TraceInformation},
     },
     health::HealthServer,
 };
@@ -39,6 +40,17 @@ struct PostgresCase {
 
 impl PostgresCase {
     async fn new(abi_type: &str, components: Option<Value>) -> Self {
+        let mut input = json!({"name": "value", "type": abi_type, "indexed": false});
+        if let Some(components) = components {
+            input["components"] = components;
+        }
+        Self::new_event(
+            json!({"name": "Value", "type": "event", "anonymous": false, "inputs": [input]}),
+        )
+        .await
+    }
+
+    async fn new_event(definition: Value) -> Self {
         use crate::{
             abi::{ABIItem, EventInfo},
             database::{
@@ -51,12 +63,6 @@ impl PostgresCase {
         };
         let (client, container) = super::input_validation_tests::postgres_client().await;
         let mut params = params();
-        let mut input = json!({"name": "value", "type": abi_type, "indexed": false});
-        if let Some(components) = components {
-            input["components"] = components;
-        }
-        let definition =
-            json!({"name": "Value", "type": "event", "anonymous": false, "inputs": [input]});
         params.event = serde_json::from_value(definition.clone()).unwrap();
         params.event_info =
             EventInfo::new(serde_json::from_value::<ABIItem>(definition).unwrap()).unwrap();
@@ -216,6 +222,191 @@ async fn postgres_binary_nul_remains_storable() {
 }
 
 const ID: &str = "permanent-failure";
+
+fn trace_registry(callback: TraceCallbackType) -> TraceCallbackRegistry {
+    let mut registry = TraceCallbackRegistry::new();
+    registry.register_event(TraceCallbackRegistryInformation {
+        id: ID.to_string(),
+        indexer_name: "trace_failures".to_string(),
+        contract_name: "EvmTraces".to_string(),
+        event_name: "NativeTransfer".to_string(),
+        trace_information: TraceInformation {
+            name: "NativeTransfer".to_string(),
+            details: vec![],
+            reorg_safe_distance: None,
+        },
+        callback,
+        tables: Arc::new(vec![]),
+        streams_clients: Arc::new(None),
+    });
+    registry
+}
+
+fn transfer(network: &str) -> TraceResult {
+    let source = event(&params(), 2);
+    let mut metadata = source.tx_information;
+    metadata.network = network.to_string();
+    TraceResult::NativeTransfer {
+        from: alloy::primitives::Address::ZERO,
+        to: alloy::primitives::Address::ZERO,
+        value: alloy::primitives::U256::ONE,
+        tx_information: metadata,
+        found_in_request: source.found_in_request,
+    }
+}
+
+#[tokio::test]
+async fn trace_failure_state_survives_completion_and_reaches_health() {
+    let registry = trace_registry(Arc::new(|_| async { Ok(()) }.boxed()));
+    let state = registry.failure_state();
+    state.record(failure(), "private trace diagnostic".to_string());
+    let completed = registry.complete();
+    assert_eq!(
+        completed.failure_state().snapshot().len(),
+        1,
+        "network registries must share failures with their health owner"
+    );
+    let (status, body) = health(vec![completed.failure_state()]).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!body.to_string().contains("private trace diagnostic"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn trace_transient_errors_retry_without_recording_terminal_state() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let observed = attempts.clone();
+    let registry = trace_registry(Arc::new(move |_| {
+        let attempt = observed.fetch_add(1, Ordering::SeqCst);
+        async move {
+            if attempt < 2 {
+                Err("temporary trace failure".into())
+            } else {
+                Ok(())
+            }
+        }
+        .boxed()
+    }));
+    let trace = transfer("ethereum");
+    timeout(Duration::from_secs(10), registry.trigger_event(&ID.to_string(), vec![trace]))
+        .await
+        .expect("bounded trace retries")
+        .expect("third attempt succeeds");
+    assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    assert!(registry.failure_state().snapshot().is_empty());
+}
+
+#[tokio::test]
+async fn trace_terminal_state_blocks_only_its_network() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let observed = attempts.clone();
+    let registry = trace_registry(Arc::new(move |_| {
+        observed.fetch_add(1, Ordering::SeqCst);
+        async { Ok(()) }.boxed()
+    }));
+    registry.failure_state().record(failure(), "terminal trace callback".to_string());
+    let other = transfer("other-network");
+    registry
+        .trigger_event(&ID.to_string(), vec![other])
+        .await
+        .expect("independent trace network continues");
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    let blocked = transfer("ethereum");
+    registry
+        .trigger_event(&ID.to_string(), vec![blocked])
+        .await
+        .expect_err("failed trace network stays blocked");
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn trace_terminal_state_blocks_empty_batches_without_advancing_cursor() {
+    use crate::{
+        event::config::TraceProcessingConfig,
+        indexer::{
+            native_transfer::native_transfer_block_consumer, progress::IndexingEventsProgressState,
+            task_tracker::active_indexing_count,
+        },
+        provider::mock::MockChainProvider,
+    };
+    use alloy::primitives::U64;
+    let directory = tempfile::tempdir().unwrap();
+    let registry = trace_registry(Arc::new(|_| async { Ok(()) }.boxed()));
+    registry.failure_state().record(failure(), "terminal trace callback".to_string());
+    let registry = registry.complete();
+    let progress = IndexingEventsProgressState::monitor(&[], &registry.events, None).await;
+    let config = Arc::new(TraceProcessingConfig {
+        id: ID.to_string(),
+        chain_id: 1,
+        project_path: directory.path().to_path_buf(),
+        start_block: U64::from(1),
+        end_block: U64::from(2),
+        indexer_name: "trace_failures".to_string(),
+        contract_name: "EvmTraces".to_string(),
+        event_name: "TraceEvents".to_string(),
+        network: "ethereum".to_string(),
+        progress,
+        postgres: None,
+        csv_details: None,
+        registry,
+        method: crate::manifest::native_transfer::TraceProcessingMethod::TraceBlock,
+        stream_last_synced_block_file_path: Some("cursor".to_string()),
+        cancel_token: tokio_util::sync::CancellationToken::new(),
+    });
+    let path = directory
+        .path()
+        .join("cursor/EvmTraces/last-synced-blocks/evmtraces-ethereum-traceevents.txt");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "1").unwrap();
+    let outcome = native_transfer_block_consumer(
+        Arc::new(MockChainProvider::new(1)),
+        &[U64::from(2)],
+        "ethereum",
+        &config,
+    )
+    .await;
+    assert!(outcome.is_err(), "a failed trace stream cannot authorize an empty-range checkpoint");
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "1");
+    assert_eq!(active_indexing_count(), 0);
+}
+
+#[tokio::test]
+async fn postgres_trace_parameter_nul_remains_terminal_through_the_trace_adapter() {
+    use alloy::primitives::{Address, U256};
+    let mut definition: Vec<Value> =
+        serde_json::from_str(crate::indexer::native_transfer::NATIVE_TRANSFER_ABI).unwrap();
+    let fixture = PostgresCase::new_event(definition.remove(0)).await;
+    let source = event(&fixture.params, 2);
+    let mut metadata = source.tx_information;
+    // Native transfers have no ABI text payload; the network parameter is also
+    // stored as PostgreSQL text and exercises the same callback preflight.
+    metadata.network = "ethereum\0invalid".to_string();
+    let trace = TraceResult::NativeTransfer {
+        from: Address::ZERO,
+        to: Address::ZERO,
+        value: U256::ONE,
+        tx_information: metadata,
+        found_in_request: source.found_in_request,
+    };
+    let callback = no_code_callback(Arc::new(fixture.params.clone())).trace_callback;
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let observed = attempts.clone();
+    let registry = trace_registry(Arc::new(move |traces| {
+        observed.fetch_add(1, Ordering::SeqCst);
+        callback(traces)
+    }));
+    let outcome =
+        timeout(Duration::from_secs(5), registry.trigger_event(&ID.to_string(), vec![trace])).await;
+    let position = fixture.position().await;
+    let failures = registry.failure_state().snapshot();
+    drop(registry);
+    fixture.finish().await;
+    outcome
+        .expect("the trace adapter must preserve the permanent classification")
+        .expect_err("unrepresentable trace input must fail");
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(position, (0, "1".to_string()));
+    assert_eq!(failures.len(), 1);
+}
 
 fn registry(params: &NoCodeCallbackParams, callback: EventCallbackType) -> EventCallbackRegistry {
     let mut registry = EventCallbackRegistry::new();

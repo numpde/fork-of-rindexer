@@ -35,15 +35,17 @@ if ! test -f "$RINDEXER_GRAPHQL_PREBUILT" || ! test -f /build/graphql/input.sha2
   printf '%s\n' "$key" > /build/graphql/input.sha256
 fi
 case "$1" in
+  trace-bindings)
+    exec python3 -B containers/development/typings.py check-traces --root /work ;;
   codegen-typings)
     exec python3 -B containers/development/typings.py generate --root /work >&3 ;;
   compile) exec cargo nextest run --frozen -p rindexer --test postgres_bytea_array --no-run ;;
   permanent-failures)
     cargo nextest run --frozen -p rindexer --lib --no-run \
-      -E 'test(/permanent_failure_tests/) & not test(/::postgres_/)'
+      -E '(test(/permanent_failure_tests/) | test(/^indexer::native_transfer::tests::/)) & not test(/::postgres_/)'
     exec timeout --signal=TERM --kill-after=20s 900s cargo nextest run --frozen \
       -p rindexer --lib --no-fail-fast --no-capture \
-      -E 'test(/permanent_failure_tests/) & not test(/::postgres_/)'
+      -E '(test(/permanent_failure_tests/) | test(/^indexer::native_transfer::tests::/)) & not test(/::postgres_/)'
     ;;
   permanent-failures-compile)
     exec cargo nextest run --frozen -p rindexer --lib --no-run \

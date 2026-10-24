@@ -119,9 +119,7 @@ def refresh(checkout, archive, write):
     return changed
 
 
-def generate(checkout):
-    roots = output_roots(checkout)
-    current_files(checkout, roots)
+def build_cli(checkout):
     manifest = checkout / "cli/Cargo.toml"
     metadata = json.loads(subprocess.check_output([
         "cargo", "metadata", "--frozen", "--no-deps", "--format-version", "1",
@@ -137,6 +135,13 @@ def generate(checkout):
         "--no-default-features", "--bin", binaries[0]["name"],
     ], check=True, stdout=sys.stderr)
     binary = Path(metadata["target_directory"]) / "debug" / binaries[0]["name"]
+    return binary
+
+
+def generate(checkout):
+    roots = output_roots(checkout)
+    current_files(checkout, roots)
+    binary = build_cli(checkout)
     for root in roots:
         project = checkout / root.parents[2]
         # Remove stale bindings only in the disposable source copy.
@@ -150,9 +155,28 @@ def generate(checkout):
             archive.add(checkout / path, arcname=str(path), recursive=False)
 
 
+def check_traces(checkout):
+    # This existing Rust project is a compilation fixture. Enable traces only in
+    # the disposable copy, so generated trace code is exercised without changing
+    # the checked-in example's indexing behavior or introducing a second lockfile.
+    project = checkout / "examples/rindexer_rust_playground"
+    manifest = project / "rindexer.yaml"
+    original = manifest.read_text()
+    if any(line.startswith("native_transfers:") for line in original.splitlines()):
+        raise ValueError("The trace compilation fixture must start without native_transfers")
+    binary = build_cli(checkout)
+    manifest.write_text(original + "\nnative_transfers: true\n")
+    subprocess.run([str(binary), "codegen", "--path", str(project), "typings"],
+                   check=True, stdout=sys.stderr)
+    with (project / "Cargo.toml").open("rb") as source:
+        package = tomllib.load(source)["package"]["name"]
+    subprocess.run(["cargo", "clippy", "--frozen", "-p", package, "--all-targets",
+                    "--", "-D", "warnings"], check=True, stdout=sys.stderr)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["roots", "generate", "check", "update"])
+    parser.add_argument("action", choices=["roots", "generate", "check", "update", "check-traces"])
     parser.add_argument("--root", required=True, type=Path)
     parser.add_argument("--archive", type=Path)
     arguments = parser.parse_args()
@@ -164,6 +188,9 @@ def main():
             return 0
         if arguments.action == "generate":
             generate(checkout)
+            return 0
+        if arguments.action == "check-traces":
+            check_traces(checkout)
             return 0
         if arguments.archive is None:
             parser.error("check and update require --archive")

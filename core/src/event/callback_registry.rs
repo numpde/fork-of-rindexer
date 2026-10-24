@@ -537,6 +537,11 @@ pub struct TraceCallbackRegistry {
 }
 
 impl TraceCallbackRegistry {
+    #[cfg(test)]
+    pub(crate) fn failure_state(&self) -> Arc<CallbackFailures> {
+        Arc::new(CallbackFailures::default())
+    }
+
     pub fn new() -> Self {
         TraceCallbackRegistry { events: Vec::new(), on_reorg: Vec::new() }
     }

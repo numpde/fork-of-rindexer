@@ -218,6 +218,11 @@ codegen/typings/check: tests/posture ## Generate workspace example typings offli
 codegen/typings/update: tests/posture ## Regenerate only workspace example typings (writes generated Rust source)
 	@$(call refresh_typings,update)
 
+.PHONY: tests/trace-bindings/docker
+tests/trace-bindings/docker: tests/posture ## Generate and compile trace bindings in a copied example without changing its configuration
+	@$(call offline_runner,$$dependency_image)
+	$(compose) run --rm --no-deps -T offline trace-bindings
+
 help: ## Show supported container-development commands
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z0-9_\/.-]+:.*## / {printf "%-24s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
