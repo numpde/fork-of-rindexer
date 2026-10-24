@@ -473,6 +473,20 @@ async fn apply_postgres_events(
         .await
         .inspect_err(|error| log_table_failure(params, error))?
     };
+    // Constants and RPC results can introduce text that was absent from the raw
+    // event. Validate resolved PG inputs before staging any derived or raw writes.
+    for operation in &prepared.ops {
+        for row in &operation.rows {
+            if let Some((column, _)) =
+                row.columns.iter().find(|(_, value)| value.postgres_text_contains_nul())
+            {
+                return Err(CallbackError::Permanent(format!(
+                    "Cannot store {:?}::{:?} in PostgreSQL custom table {:?}, column {:?}: the resolved text/JSONB value contains U+0000; this callback attempt made no raw or derived writes",
+                    params.contract_name, params.event_info.name, operation.table.full_table_name, column,
+                )));
+            }
+        }
+    }
     // Preparation can await RPC with these claims held. No effects have been
     // staged yet; dropping the transaction on error/shutdown releases the claims.
     if !is_running() {

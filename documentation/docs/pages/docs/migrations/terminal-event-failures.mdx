@@ -2,7 +2,9 @@
 
 No-code event indexing now stops the affected event stream on its network when a
 log cannot be decoded with the configured ABI, or when a raw PostgreSQL event
-value contains NUL in text, a text array, or JSONB. Retrying those same inputs
+value contains NUL in text, a text array, or JSONB. Resolved PostgreSQL custom-table
+values are checked too, including values from `$constant(...)` and RPC calls.
+Retrying those same inputs
 cannot succeed. PostgreSQL binary values can still contain zero bytes.
 
 The callback rejects the batch before making writes or publishing its outputs.
@@ -11,6 +13,13 @@ batches remain committed. With concurrent callbacks, another batch may already
 have produced effects before the failure becomes known; stopping it cannot undo
 those effects. This change does not make replayed effects idempotent or make
 independent PostgreSQL, ClickHouse, CSV and stream writes atomic.
+
+For a resolved PostgreSQL custom-table NUL, the callback stops after preparation
+and before staging raw or derived writes. Its tentative receipt claims roll back
+too, so correcting the source and restarting can apply the same events. The error
+identifies the custom table and column without printing the resolved value. A
+schema change cannot make PostgreSQL text or JSONB accept NUL. Binary columns
+continue to accept zero bytes.
 
 Other event streams and networks can continue. A dependency group stops when a
 prerequisite stream fails. Retryable errors, including existing Rust handlers'
