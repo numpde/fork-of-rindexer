@@ -618,6 +618,10 @@ pub fn drop_tables_for_indexer_sql(project_path: &Path, indexer: &Indexer) -> Co
 }
 
 #[cfg(test)]
+#[path = "unsigned_integer_custom_table_tests.rs"]
+mod unsigned_integer_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::indexer::Indexer;

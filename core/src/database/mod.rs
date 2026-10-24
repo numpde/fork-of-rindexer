@@ -5,3 +5,6 @@ mod dynamic_bytes_array_tests;
 pub mod generate;
 pub mod postgres;
 pub mod sql_type_wrapper;
+
+#[cfg(test)]
+mod unsigned_integer_tests;

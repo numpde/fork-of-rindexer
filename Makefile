@@ -233,9 +233,8 @@ rust/format/check: tests/posture ## Check Rust formatting without modifying the 
 	@$(call offline_runner,$$toolchain_image)
 	$(compose) run --rm --no-deps -T offline fmt
 
-# Formatting spans the workspace; Clippy covers only rindexer and this integration
-# target, not the upstream workspace/all-features linting command.
-rust/checks: rust/format/check ## Run Clippy for the migrated PostgreSQL target offline
+# Match upstream's workspace lint command, including the regression test code.
+rust/checks: rust/format/check ## Run workspace Clippy for all targets offline
 	@$(call offline_runner,$$dependency_image)
 	$(compose) run --rm --no-deps -T offline clippy
 
@@ -263,3 +262,17 @@ tests/dynamic-bytes-array/docker: tests/posture ## Run the dynamic bytes-array r
 tests: tests/checks tests/posture tests/postgres ## Run the currently migrated container suites only
 
 ci: rust/checks tests ## Validate the first container-development slice (not all upstream suites)
+
+# Unsigned integer regressions: no dependency acquisition and no Docker access
+# inside tests. Keep pure encoding checks separate from real PostgreSQL readback.
+.PHONY: tests/unsigned-integers/docker tests/unsigned-integers/postgres
+
+tests/unsigned-integers/docker: tests/posture ## Check unsigned event/custom-table types, binary encoding and signed controls offline
+	@$(call offline_runner,$$dependency_image)
+	$(compose) run --rm --no-deps -T offline unsigned-integers
+
+tests/unsigned-integers/postgres: tests/posture ## Check unsigned writes, schema checks and blockchain reorg reversal in PostgreSQL
+	@$(call offline_runner,$$dependency_image)
+	$(compose) run --rm --no-deps -T offline unsigned-integers-compile
+	$(compose) up -d --no-build --pull never --wait --wait-timeout 90 postgres
+	$(compose) run --rm --no-deps -T postgres-tests unsigned-integers-postgres

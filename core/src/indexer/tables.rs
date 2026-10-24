@@ -3997,6 +3997,11 @@ pub async fn process_table_operations(
     .await
 }
 
+/// PostgreSQL batch parameters are mapped separately from ClickHouse.
+fn column_type_to_postgres_batch_sql_type(column_type: &ColumnType) -> BatchOperationSqlType {
+    column_type_to_batch_sql_type(column_type)
+}
+
 /// Maps ColumnType to BatchOperationSqlType.
 fn column_type_to_batch_sql_type(column_type: &ColumnType) -> BatchOperationSqlType {
     match column_type {
@@ -4161,7 +4166,7 @@ async fn execute_postgres_operation(
                 DynamicColumnDefinition::new(
                     column.name.clone(),
                     value,
-                    column_type_to_batch_sql_type(column_type),
+                    column_type_to_postgres_batch_sql_type(column_type),
                     behavior,
                     action,
                 )
@@ -4887,6 +4892,20 @@ fn format_wrapper_for_sql(w: &EthereumSqlTypeWrapper) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsigned_integer_batch_types_preserve_signed_and_clickhouse_mappings() {
+        for (column_type, postgres, clickhouse) in [
+            (ColumnType::Uint16, "INTEGER", "Int16"),
+            (ColumnType::Uint32, "BIGINT", "Int32"),
+            (ColumnType::Int16, "SMALLINT", "Int16"),
+            (ColumnType::Int32, "INTEGER", "Int32"),
+            (ColumnType::Uint8, "SMALLINT", "Int16"),
+        ] {
+            assert_eq!(column_type_to_postgres_batch_sql_type(&column_type).as_str(), postgres);
+            assert_eq!(column_type_to_batch_sql_type(&column_type).as_clickhouse_str(), clickhouse);
+        }
+    }
 
     #[test]
     fn test_evaluate_filter_equals() {

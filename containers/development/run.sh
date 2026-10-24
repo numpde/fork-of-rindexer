@@ -31,6 +31,24 @@ if ! test -f "$RINDEXER_GRAPHQL_PREBUILT" || ! test -f /build/graphql/input.sha2
 fi
 case "$1" in
   compile) exec cargo nextest run --frozen -p rindexer --test postgres_bytea_array --no-run ;;
+  unsigned-integers)
+    # A cold dependency compilation is not part of the test execution timeout.
+    cargo nextest run --frozen -p rindexer --lib --no-run \
+      -E '(test(/unsigned_integer/) | test(/^manifest::contract::tests::test_pg_type_/)) & not test(/::postgres_/)'
+    exec timeout --signal=TERM --kill-after=20s 900s cargo nextest run --frozen \
+      -p rindexer --lib --no-fail-fast --no-capture \
+      -E '(test(/unsigned_integer/) | test(/^manifest::contract::tests::test_pg_type_/)) & not test(/::postgres_/)'
+    ;;
+  unsigned-integers-compile)
+    exec cargo nextest run --frozen -p rindexer --lib --no-run \
+      -E 'test(/^database::(generate::)?unsigned_integer_tests::postgres_/)'
+    ;;
+  unsigned-integers-postgres)
+    : "${RINDEXER_TEST_POSTGRES_URL:?missing explicit PostgreSQL fixture}"
+    exec timeout --signal=TERM --kill-after=20s 900s cargo nextest run --frozen \
+      -p rindexer --lib --test-threads 2 --no-fail-fast --no-capture \
+      -E 'test(/^database::(generate::)?unsigned_integer_tests::postgres_/)'
+    ;;
   dynamic-bytes-array)
     # Exercise the decoder/converter regression only; no database is required.
     exec timeout --signal=TERM --kill-after=20s 900s cargo nextest run --frozen \
@@ -40,7 +58,7 @@ case "$1" in
   postgres)
     : "${RINDEXER_TEST_POSTGRES_URL:?missing explicit PostgreSQL fixture}"
     exec timeout --signal=TERM --kill-after=20s 900s cargo nextest run --frozen -p rindexer --test postgres_bytea_array --test-threads 2 --no-capture ;;
-  clippy) exec cargo clippy --frozen -p rindexer --test postgres_bytea_array -- -D warnings ;;
+  clippy) exec cargo clippy --frozen --workspace --all-targets -- -D warnings ;;
   verify) printf '%s\n' 'Offline dependency inputs and GraphQL executable are ready.' ;;
   *) printf 'Unsupported development command: %s\n' "$1" >&2; exit 2 ;;
 esac
