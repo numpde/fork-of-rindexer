@@ -79,6 +79,16 @@ impl ReorgCoordinator {
         block_hash: B256,
         parent_hash: B256,
     ) -> anyhow::Result<Option<ReorgTask>> {
+        // A one-block fork can preserve its parent and tip height. Compare the
+        // observed block itself before treating a matching parent as progress.
+        if let Some((stored_hash, _)) = self.window.get(block_number) {
+            if *stored_hash != block_hash {
+                warn!(network = %self.network, block_number,
+                    previous_hash = %stored_hash, replacement_hash = %block_hash,
+                    "Block hash changed at retained height — reorg detected");
+                return self.prepare_reorg_task(block_number).await.map(Some);
+            }
+        }
         match self.window.validate_parent(block_number, parent_hash) {
             ParentValidation::Valid => {}
             ParentValidation::Mismatch { expected, got } => {
@@ -90,11 +100,6 @@ impl ReorgCoordinator {
                 if block_number <= latest {
                     // Other pipelines can revisit a header at/below the retained window.
                     // Do not grow the window backwards or invent missing ancestry there.
-                    if let Some((stored, _)) = self.window.get(block_number) {
-                        if *stored != block_hash {
-                            return self.handle_mismatch(block_number, *stored, block_hash).await;
-                        }
-                    }
                     return Ok(None);
                 }
                 let provider = self
@@ -194,20 +199,27 @@ impl ReorgCoordinator {
             %got,
             "Parent hash mismatch — reorg detected"
         );
+        self.prepare_reorg_task(block_number).await.map(Some)
+    }
+
+    async fn prepare_reorg_task(&self, block_number: u64) -> anyhow::Result<ReorgTask> {
         metrics::record_reorg_detection_source(&self.network, "rpc");
 
         let (fork_point, canonical_blocks) = self.find_fork_point().await?;
-        let depth = block_number.saturating_sub(fork_point) + 1;
+        // Another pipeline may expose the changed hash below our retained tip.
+        // Its descendants are invalidated too, including finalized buffers.
+        let detection_point = self.window.latest_block().unwrap_or(block_number).max(block_number);
+        let depth = detection_point.saturating_sub(fork_point) + 1;
         metrics::record_reorg(&self.network, depth);
 
-        Ok(Some(ReorgTask {
+        Ok(ReorgTask {
             network: self.network.clone(),
             fork_point,
-            detection_point: block_number,
+            detection_point,
             event_tables: self.event_tables.clone(),
             derived_tables: self.derived_tables.clone(),
             canonical_blocks,
-        }))
+        })
     }
 
     /// Called once on restart before indexing resumes.

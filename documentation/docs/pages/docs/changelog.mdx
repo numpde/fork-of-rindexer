@@ -16,6 +16,7 @@
 
 ### Bug fixes
 -------------------------------------------------
+- fix: detect a changed block hash at a retained height even when its parent and the chain tip height are unchanged. One-block live forks now trigger rollback and replacement-history refetch for every affected stream. Previously missed replacements need review or reindexing; the existing parent-mismatch log message is preserved.
 - fix: PostgreSQL now stores nonempty signed `int136[]`–`int256[]` event arrays as arrays of decimal strings, preserving element order and signed extrema through INSERT and COPY. Existing VARCHAR array columns and SQL NULL for empty arrays are unchanged; previously failing batches can be retried after upgrading. Scalar bind types now reject these arrays before writing.
 - fix: preserve signed `int40`–`int64` values and arrays through PostgreSQL INSERT and COPY with NUMERIC encoding, including negative values and signed extrema. ABI-decoding negative values of these widths no longer panics. Explicit custom-table BIGINT encoding and SQL NULL for empty arrays remain supported; unrelated bind types now fail before writing.
 - fix: reorg gap filling, fork detection and rollback now require complete, connected canonical header responses. Missing, repeated or disconnected headers and RPC failures block progress instead of accepting an unvalidated head; complete out-of-order responses remain supported. Live polling retries without accepting the new head.

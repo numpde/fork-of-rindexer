@@ -74,3 +74,61 @@ async fn changed_tip_hash_with_same_parent_rolls_back_and_rewinds_every_stream_o
     assert_eq!(stream_a.take_rewind(), None);
     assert_eq!(stream_b.take_rewind(), None);
 }
+
+#[tokio::test]
+async fn changed_retained_hash_invalidates_through_the_last_observed_head() {
+    let network = "retained-height-fork";
+    let hash = |number| B256::repeat_byte(number);
+    let mut window = BlockChainWindow::try_new(20).unwrap();
+    for number in 98..=100 {
+        window.insert(u64::from(number), hash(number), hash(number - 1));
+    }
+    let provider = Arc::new(MockChainProvider::new(1).with_blocks(vec![
+        block(98, hash(98), hash(97)),
+        block(99, hash(199), hash(98)),
+        block(100, hash(200), hash(199)),
+    ]));
+    let clients = Arc::new(Some(crate::streams::StreamsClients::empty_for_test()));
+    clients
+        .as_ref()
+        .as_ref()
+        .unwrap()
+        .test_seed_finalized_buffer(network, "Value", &[99, 100], 10)
+        .await;
+    let mut coordinator = ReorgCoordinator::new(
+        network.to_string(),
+        window,
+        Arc::new(ReorgBlockHashPersistence::new(None, None)),
+        provider,
+        vec![],
+        vec![],
+        vec![clients.clone()],
+    )
+    .unwrap();
+    let task = coordinator
+        .on_new_block(99, hash(199), hash(98))
+        .await
+        .unwrap()
+        .expect("retained block changed");
+    assert_eq!(task.fork_point, 99);
+    assert_eq!(
+        task.detection_point, 100,
+        "a lower observation must invalidate later retained blocks too"
+    );
+    coordinator
+        .handle_reorg(
+            task,
+            &ReorgContext {
+                postgres: None,
+                clickhouse: None,
+                registry: None,
+                trace_registry: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        clients.as_ref().as_ref().unwrap().test_buffered_blocks(network).await.is_empty(),
+        "later orphaned blocks must not remain eligible for finalized delivery"
+    );
+}
