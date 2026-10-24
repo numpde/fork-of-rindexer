@@ -298,10 +298,16 @@ async fn assert_lost_commit_replay(deferred_cursor: bool) {
     params.atomic_safe_concurrency = !deferred_cursor;
     params.postgres = Some(client(&proxy.url).await);
     let callback = no_code_callback(Arc::new(params)).event_callback;
+    let commit_errors = crate::metrics::definitions::ATOMIC_BATCHES_TOTAL
+        .with_label_values(&["commit_error", "error"]);
+    let rollbacks = crate::metrics::definitions::ATOMIC_BATCHES_TOTAL
+        .with_label_values(&["rolled_back", "error"]);
+    let before = (commit_errors.get(), rollbacks.get());
     let first = tokio::time::timeout(Duration::from_secs(20), callback(fixture.events(&[1, 2])))
         .await
         .unwrap();
     let after_server_commit = fixture.position().await;
+    let after_failure = (commit_errors.get(), rollbacks.get());
     let dropped = proxy.dropped.load(Ordering::SeqCst);
     let replay = callback(fixture.events(&[1, 2])).await;
     let after_replay = fixture.position().await;
@@ -310,6 +316,11 @@ async fn assert_lost_commit_replay(deferred_cursor: bool) {
     fixture.finish().await;
     assert!(dropped, "drop the real PostgreSQL COMMIT response");
     assert!(first.is_err(), "client must see an uncertain commit outcome");
+    assert_eq!(
+        after_failure,
+        (before.0 + 1.0, before.1),
+        "a lost COMMIT response must not be reported as a proven rollback"
+    );
     assert_eq!(
         after_server_commit,
         (2, "3".to_string(), if deferred_cursor { "0" } else { "2" }.to_string()),
@@ -536,7 +547,11 @@ async fn postgres_failed_write_rolls_back_receipts_with_all_effects() {
         .await
         .unwrap();
     let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+    let rollbacks = crate::metrics::definitions::ATOMIC_BATCHES_TOTAL
+        .with_label_values(&["rolled_back", "error"]);
+    let before_rollback = rollbacks.get();
     let failed = callback(fixture.events(&[1, 2])).await;
+    let after_rollback = rollbacks.get();
     let after_failure = fixture.position().await;
     fixture
         .client
@@ -551,6 +566,11 @@ async fn postgres_failed_write_rolls_back_receipts_with_all_effects() {
     drop(callback);
     fixture.finish().await;
     assert!(failed.is_err());
+    assert_eq!(
+        after_rollback,
+        before_rollback + 1.0,
+        "a rejected pre-COMMIT write remains a rollback"
+    );
     assert_eq!(after_failure, (0, "0".to_string(), "0".to_string()));
     corrected.unwrap();
     assert_eq!(after_retry, (2, "3".to_string(), "2".to_string()));
