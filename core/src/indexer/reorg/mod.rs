@@ -8,7 +8,7 @@ use anyhow::Context;
 use serde::Serialize;
 use std::{
     collections::HashMap,
-    sync::{Arc, LazyLock, Mutex as StdMutex},
+    sync::{Arc, LazyLock, Mutex as StdMutex, Weak},
 };
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
@@ -30,6 +30,41 @@ pub use window::BlockChainWindow;
 
 static EVENT_WRITER_BARRIERS: LazyLock<StdMutex<HashMap<String, Arc<RwLock<()>>>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+type PendingRewind = StdMutex<Option<u64>>;
+static REORG_SUBSCRIBERS: LazyLock<StdMutex<HashMap<String, Vec<Weak<PendingRewind>>>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+/// Each fetcher consumes its own pending rewind. Coalescing to the earliest fork
+/// preserves recovery when several rollbacks finish before a slow fetcher polls.
+pub(crate) struct ReorgSubscription(Arc<PendingRewind>);
+
+impl ReorgSubscription {
+    pub(crate) fn take_rewind(&self) -> Option<u64> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+}
+
+pub(crate) fn subscribe_reorgs(network: &str) -> ReorgSubscription {
+    let pending = Arc::new(StdMutex::new(None));
+    let mut subscribers = REORG_SUBSCRIBERS.lock().unwrap_or_else(|e| e.into_inner());
+    let entries = subscribers.entry(network.to_string()).or_default();
+    entries.retain(|entry| entry.strong_count() > 0);
+    entries.push(Arc::downgrade(&pending));
+    ReorgSubscription(pending)
+}
+
+fn publish_rewind(network: &str, fork_point: u64) {
+    let mut subscribers = REORG_SUBSCRIBERS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(entries) = subscribers.get_mut(network) {
+        entries.retain(|entry| {
+            let Some(pending) = entry.upgrade() else { return false };
+            let mut rewind = pending.lock().unwrap_or_else(|e| e.into_inner());
+            *rewind = Some(rewind.map_or(fork_point, |old| old.min(fork_point)));
+            true
+        });
+    }
+}
 
 /// One read/write barrier per network: event callbacks hold a read guard while
 /// writing, and reorg recovery holds the write guard from snapshot through rollback.
@@ -279,6 +314,19 @@ pub fn reorg_safe_distance_for_chain(chain_id: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fetchers_consume_rewinds_independently_and_keep_the_earliest_fork() {
+        let a = super::subscribe_reorgs("coalesced-rewinds");
+        let b = super::subscribe_reorgs("coalesced-rewinds");
+        super::publish_rewind("coalesced-rewinds", 98);
+        assert_eq!(a.take_rewind(), Some(98));
+        super::publish_rewind("coalesced-rewinds", 101);
+        assert_eq!(a.take_rewind(), Some(101));
+        assert_eq!(b.take_rewind(), Some(98));
+        assert_eq!(b.take_rewind(), None);
+        assert_eq!(a.take_rewind(), None);
+    }
+
     use super::*;
 
     use crate::manifest::contract::ReorgSafeDistance;

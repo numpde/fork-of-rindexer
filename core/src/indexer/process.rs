@@ -535,6 +535,7 @@ async fn live_indexing_for_contract_event_dependencies(
 
     let reorg_coordinator = reorg_coordinator;
     let writer_barrier = event_writer_barrier(&network);
+    let reorgs = crate::indexer::reorg::subscribe_reorgs(&network);
 
     let (pg_client, ch_client, event_registry) = events
         .first()
@@ -561,6 +562,14 @@ async fn live_indexing_for_contract_event_dependencies(
         }
 
         let iteration_start = Instant::now();
+
+        if let Some(fork_point) = reorgs.take_rewind() {
+            for details in ordering_live_indexing_details_map.values() {
+                let mut details = details.lock().await;
+                details.filter = details.filter.clone().set_from_block(U64::from(fork_point));
+                details.last_seen_block_number = U64::from(fork_point.saturating_sub(1));
+            }
+        }
 
         // a consistent latest block number across all events in the batch is required to avoid race conditions
         let latest_block = match cached_provider.get_latest_block().await {

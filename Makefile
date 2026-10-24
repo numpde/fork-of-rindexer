@@ -341,6 +341,11 @@ ci: rust/checks tests ## Validate the first container-development slice (not all
 .PHONY: tests/permanent-failures/docker tests/permanent-failures/postgres
 
 .PHONY: tests/postgres-replay/docker
+.PHONY: tests/reorg/docker
+tests/reorg/docker: tests/posture ## Check shared network rewinds, reorg validation and stale-work fencing offline
+	@$(call offline_runner,$$dependency_image)
+	$(compose) run --rm --no-deps -T offline reorg
+
 tests/postgres-replay/docker: tests/posture ## Check uncertain PostgreSQL commits, replayed events and derived effects
 	@$(call offline_runner,$$dependency_image)
 	$(compose) run --rm --no-deps -T offline postgres-replay-compile

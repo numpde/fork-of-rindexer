@@ -1191,6 +1191,7 @@ async fn live_indexing_stream(
     trace_registry: Option<&TraceCallbackRegistry>,
 ) {
     let mut last_seen_block_number = last_seen_block_number;
+    let reorgs = crate::indexer::reorg::subscribe_reorgs(network);
     let mut log_response_to_large_to_block: Option<U64> = None;
     let tip_logs = cached_provider.shared_tip_logs();
     let mut heartbeat = HeartbeatTracker::new(Duration::from_secs(300));
@@ -1227,6 +1228,16 @@ async fn live_indexing_stream(
 
         if !is_running() || cancel_token.is_cancelled() || tx.is_closed() {
             break;
+        }
+
+        if let Some(fork_point) = reorgs.take_rewind() {
+            current_filter = current_filter.set_from_block(U64::from(fork_point));
+            last_seen_block_number = U64::from(fork_point.saturating_sub(1));
+            log_response_to_large_to_block = None;
+            block_cache.clear();
+            if let Some(tip_logs) = tip_logs.as_deref() {
+                tip_logs.invalidate_from(fork_point);
+            }
         }
 
         // Reth reorg signal — instant detection via ExEx notification.

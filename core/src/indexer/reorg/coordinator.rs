@@ -437,6 +437,7 @@ impl ReorgCoordinator {
                 return Err(error);
             }
         };
+        super::publish_rewind(&self.network, reorg_task.fork_point);
         drop(writer_guard);
 
         let affected_tx_hashes: Vec<B256> =

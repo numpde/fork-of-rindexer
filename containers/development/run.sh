@@ -35,6 +35,13 @@ if ! test -f "$RINDEXER_GRAPHQL_PREBUILT" || ! test -f /build/graphql/input.sha2
   printf '%s\n' "$key" > /build/graphql/input.sha256
 fi
 case "$1" in
+  reorg)
+    cargo nextest run --frozen -p rindexer --lib --no-run \
+      -E '(test(/^indexer::reorg::/) | test(/^indexer::fetch_logs::tests::all_live_streams_refetch_after_shared_rollback$/) | (test(/^indexer::native_transfer::tests::/) & test(/reorg/)))'
+    exec timeout --signal=TERM --kill-after=20s 900s cargo nextest run --frozen \
+      -p rindexer --lib --no-fail-fast --no-capture \
+      -E '(test(/^indexer::reorg::/) | test(/^indexer::fetch_logs::tests::all_live_streams_refetch_after_shared_rollback$/) | (test(/^indexer::native_transfer::tests::/) & test(/reorg/)))'
+    ;;
   postgres-replay-compile)
     exec cargo nextest run --frozen -p rindexer --lib --no-run -E 'test(/postgres_replay_tests::/)'
     ;;

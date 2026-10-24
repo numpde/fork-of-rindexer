@@ -247,6 +247,7 @@ pub async fn native_transfer_block_fetch(
     trace_registry: Arc<TraceCallbackRegistry>,
 ) -> Result<(), ProcessEventError> {
     let mut last_seen_block = start_block;
+    let reorgs = crate::indexer::reorg::subscribe_reorgs(&network);
 
     loop {
         if !is_running() || cancel_token.is_cancelled() || block_tx.is_closed() {
@@ -258,6 +259,10 @@ pub async fn native_transfer_block_fetch(
         // the CPU when the chain tip is idle. Mirrors the
         // `target_iteration_duration` used in the contract-event fetch loop.
         sleep(Duration::from_millis(200)).await;
+
+        if let Some(fork_point) = reorgs.take_rewind() {
+            last_seen_block = U64::from(fork_point.saturating_sub(1));
+        }
 
         let latest_block = publisher.get_latest_block().await;
 

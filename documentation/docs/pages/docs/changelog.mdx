@@ -13,6 +13,7 @@
 
 ### Bug fixes
 -------------------------------------------------
+- fix: a completed network reorg rollback now rewinds every running event, dependency and native-transfer fetcher on that network, so streams that did not detect the fork also refetch replacement history. Previously missing replacement events require review or reindexing; this does not repair old gaps automatically.
 - fix: cancelling a live dependency checkpoint for a block skipped by its logs bloom now releases active-task accounting, so graceful shutdown does not wait for work that was already cancelled. Normal checkpoint completion keeps the same cursor behavior.
 - fix: native-transfer block fetching now rejects missing or repeated requested blocks and responses without full transaction objects before running callbacks or advancing the cursor. These RPC failures retry the same range; complete blocks with no transactions still succeed. Previously skipped history is not repaired automatically and requires review or reindexing.
 - fix: PostgreSQL factory discovery now accepts already-stored child addresses when a batch is replayed or overlaps another batch, including large batches. Bookkeeping preserves its existing factory/address/network primary key and no longer fails with duplicate-key errors after the raw callback has committed. No schema migration is required; ClickHouse and CSV keep their existing behavior.
