@@ -1,0 +1,34 @@
+# PostgreSQL signed integer storage
+
+Raw event fields declared as `int40`, `int48`, `int56` or `int64` already use
+PostgreSQL `NUMERIC` columns, including `NUMERIC[]` for arrays. The corrected
+encoder now sends that format through both INSERT and binary COPY. Existing
+generated event columns do not need a type migration. ABI-decoding negative
+values of these widths also succeeds instead of panicking.
+
+## Existing history
+
+Earlier versions could silently store incorrect numeric values. For example,
+`int64(42)` could become zero, including an array element. Some values or write
+routes instead failed. Upgrading prevents future encoding errors; it cannot
+identify or repair previously corrupted rows.
+
+Identify affected fields from the original ABIs, including flattened tuple fields
+and arrays. Back up the database and stop writers before a reviewed rebuild or
+reconciliation from trusted logs. Review raw events, derived results, application
+receipts and progress together. Replaying logs against existing receipts does not
+repair values already recorded as applied; clearing receipts alone can duplicate
+other effects. See [PostgreSQL event replay receipts](/docs/migrations/postgres-event-replay).
+
+## Rust callers and custom columns
+
+`EthereumSqlTypeWrapper::I64` and `VecI64` now declare `NUMERIC` and
+`NUMERIC_ARRAY` from `to_type()` to match generated event columns. Handwritten
+binary COPY into `BIGINT` or `BIGINT[]` must explicitly supply `INT8` or
+`INT8_ARRAY` to `BinaryCopyInWriter`, or use parameterized INSERT. Do not infer
+BIGINT COPY types from these wrappers' `to_type()` after upgrading.
+
+Explicit BIGINT serialization remains supported. Managed custom-table operations
+already supply their declared schema types, so their `int64` columns remain
+`BIGINT`. Empty integer arrays retain the existing SQL `NULL` behavior.
+ClickHouse schema and value formatting are unchanged.

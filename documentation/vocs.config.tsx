@@ -237,6 +237,10 @@ export default defineConfig({
           link: "/docs/migrations/unsigned-integer-storage",
         },
         {
+          text: "PostgreSQL signed integer storage",
+          link: "/docs/migrations/signed-integer-storage",
+        },
+        {
           text: "Terminal Indexing Failures",
           link: "/docs/migrations/terminal-event-failures",
         },

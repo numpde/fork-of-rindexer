@@ -48,10 +48,9 @@ fn signed_numeric_schema_bind_types_and_encoding_agree() {
 
 #[test]
 fn signed_numeric_rejects_unrelated_bind_types_before_writing() {
-    for (wrapper, ty) in [
-        (decoded("int64", &[42]), Type::INT4),
-        (decoded("int64[]", &[42]), Type::INT4_ARRAY),
-    ] {
+    for (wrapper, ty) in
+        [(decoded("int64", &[42]), Type::INT4), (decoded("int64[]", &[42]), Type::INT4_ARRAY)]
+    {
         let mut bytes = BytesMut::new();
         assert!(wrapper.to_sql(&ty, &mut bytes).is_err());
         assert!(bytes.is_empty());
