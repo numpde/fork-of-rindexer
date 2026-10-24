@@ -506,6 +506,7 @@ pub async fn native_transfer_block_consumer(
     if block_numbers.is_empty() {
         return Ok(());
     }
+    let generation = crate::indexer::reorg::reorg_generation(network_name);
     let blocks = provider.get_block_by_number_batch(block_numbers, true).await?;
     // A successful RPC call is not proof that every requested block and its
     // transactions arrived. Validate the whole response before either handler.
@@ -563,6 +564,11 @@ pub async fn native_transfer_block_consumer(
 
     let writer_barrier = event_writer_barrier(network_name);
     let _writer_guard = writer_barrier.read().await;
+    if generation != crate::indexer::reorg::reorg_generation(network_name) {
+        return Err(ProviderError::CustomError(format!(
+            "Cannot apply native-transfer batch on network {network_name:?}: a reorg completed while fetching; retry the block range"
+        )).into());
+    }
 
     // Empty transfer ranges still checkpoint after any block callbacks succeed.
     let _activity = ActiveCallback::start();
@@ -599,6 +605,7 @@ pub async fn native_transfer_block_consumer_debug(
     if let Some(failure) = config.terminal_failure() {
         return Err(failure.into());
     }
+    let generation = crate::indexer::reorg::reorg_generation(network_name);
     let trace_futures: Vec<_> =
         block_numbers.iter().map(|n| provider_trace_call(provider.clone(), &config, *n)).collect();
     let trace_calls = try_join_all(trace_futures).await?;
@@ -669,6 +676,11 @@ pub async fn native_transfer_block_consumer_debug(
 
     let writer_barrier = event_writer_barrier(network_name);
     let _writer_guard = writer_barrier.read().await;
+    if generation != crate::indexer::reorg::reorg_generation(network_name) {
+        return Err(ProviderError::CustomError(format!(
+            "Cannot apply native-transfer batch on network {network_name:?}: a reorg completed while fetching; retry the block range"
+        )).into());
+    }
 
     let _activity = ActiveCallback::start();
     if !native_transfers.is_empty() {

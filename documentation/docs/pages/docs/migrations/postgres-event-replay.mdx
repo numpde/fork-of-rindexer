@@ -14,6 +14,19 @@ custom Rust callbacks retain their previous PostgreSQL replay behavior.
 Use one writer process; this change does not coordinate cursor
 publication between independent processes.
 
+Network rollback now notifies every running fetcher to refetch replacement history.
+Event batches carry the rollback generation captured before their fetch. The
+dispatcher checks it while holding the same read barrier that protects writes;
+stale batches, including empty checkpoint batches, do not run callbacks or advance
+progress. This protects the managed event path before raw rows, derived effects
+or application receipts are written. It does not repair orphaned rows or missing
+replacement history created by earlier versions; review or rebuild affected ranges.
+
+Handwritten `FetchLogsResult` producers must populate `reorg_generation` using
+`rindexer::indexer::reorg::reorg_generation(network)` **before** fetching logs.
+Do not relabel an already fetched response with the latest generation. Generated
+event bindings use the engine's producer and need no changes for this field.
+
 A receipt identifies the event stream namespace, network, block hash, transaction
 hash and event position. Contract events retain their decimal log index as the
 position. A native transaction root uses `root`; an internal call uses `trace:`

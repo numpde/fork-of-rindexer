@@ -5,6 +5,7 @@ use tokio::sync::oneshot;
 #[derive(Default)]
 pub(super) struct CallbackCheckpoints {
     previous: Option<oneshot::Receiver<()>>,
+    generation: u64,
 }
 
 pub(super) struct CheckpointTurn {
@@ -13,6 +14,15 @@ pub(super) struct CheckpointTurn {
 }
 
 impl CallbackCheckpoints {
+    pub(super) fn for_generation(&mut self, generation: u64) {
+        if self.generation != generation {
+            // The exclusive rollback barrier drained old callbacks. Replacement
+            // work starts a new ordering chain, independent of cancelled old turns.
+            self.previous = None;
+            self.generation = generation;
+        }
+    }
+
     pub(super) fn next(&mut self) -> CheckpointTurn {
         let (complete, receiver) = oneshot::channel();
         let previous = self.previous.replace(receiver);

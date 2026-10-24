@@ -52,6 +52,8 @@ pub struct ReorgInfo {
 }
 
 pub struct FetchLogsResult {
+    /// Network rollback generation captured before fetching this batch.
+    pub reorg_generation: u64,
     pub logs: Vec<Log>,
     pub from_block: U64,
     pub to_block: U64,
@@ -81,6 +83,7 @@ pub fn fetch_logs_stream(
 
     tokio::spawn(async move {
         let mut current_filter = config.to_event_filter().unwrap();
+        let reorgs = crate::indexer::reorg::subscribe_reorgs(&config.network_contract().network);
 
         let snapshot_to_block = current_filter.to_block();
         let from_block = current_filter.from_block();
@@ -220,36 +223,10 @@ pub fn fetch_logs_stream(
                     IndexingEventProgressStatus::completed_log()
                 );
 
-                if config.live_indexing() && !force_no_live_indexing {
-                    let registry = config.registry();
-                    let live_from = snapshot_to_block + U64::from(1);
-                    let live_filter =
-                        current_filter.clone().set_from_block(live_from).set_to_block(live_from);
-
-                    live_indexing_stream(
-                        config.timestamps(),
-                        config.network_contract().block_clock.clone(),
-                        config.network_contract().cached_provider.clone(),
-                        &tx,
-                        snapshot_to_block,
-                        &config.topic_id(),
-                        &config.indexing_distance_from_head(),
-                        live_filter,
-                        &config.info_log_name(),
-                        &config.network_contract().network,
-                        config.network_contract().disable_logs_bloom_checks,
-                        original_max_limit,
-                        config.cancel_token().clone(),
-                        reorg_coordinator,
-                        config.postgres(),
-                        config.clickhouse(),
-                        &registry,
-                        trace_registry.as_deref(),
-                    )
-                    .await;
-                }
-
-                return;
+                // Continue through the common historical/live transition. Its
+                // subscription still contains any rewind published during workers.
+                let next = snapshot_to_block + U64::from(1);
+                current_filter = current_filter.set_from_block(next).set_to_block(next);
             } else {
                 info!(
                     "{} - Range too small ({} blocks) for parallel fetching, using sequential",
@@ -276,7 +253,16 @@ pub fn fetch_logs_stream(
             }
         }
 
-        while current_filter.from_block() <= snapshot_to_block {
+        loop {
+            let (reorg_generation, rewind) = reorgs.snapshot();
+            if let Some(fork_point) = rewind {
+                current_filter = current_filter
+                    .set_from_block(U64::from(fork_point))
+                    .set_to_block(snapshot_to_block);
+            }
+            if current_filter.from_block() > snapshot_to_block {
+                break;
+            }
             if !is_running() || config.cancel_token().is_cancelled() || tx.is_closed() {
                 break;
             }
@@ -291,6 +277,7 @@ pub fn fetch_logs_stream(
                 max_block_range_limitation,
                 snapshot_to_block,
                 &config.info_log_name(),
+                reorg_generation,
             )
             .await;
 
@@ -332,6 +319,7 @@ pub fn fetch_logs_stream(
         if config.live_indexing() && !force_no_live_indexing {
             let registry = config.registry();
             live_indexing_stream(
+                reorgs,
                 config.timestamps(),
                 config.network_contract().block_clock.clone(),
                 config.network_contract().cached_provider.clone(),
@@ -374,6 +362,7 @@ async fn fetch_historic_logs_stream<P: ChainProvider>(
     max_block_range_limitation: Option<U64>,
     snapshot_to_block: U64,
     info_log_name: &str,
+    reorg_generation: u64,
 ) -> Option<ProcessHistoricLogsStreamResult> {
     let from_block = current_filter.from_block();
     let to_block = current_filter.to_block();
@@ -447,7 +436,13 @@ async fn fetch_historic_logs_stream<P: ChainProvider>(
 
             if timestamps {
                 if let Ok(logs) = block_clock.attach_log_timestamps(logs).await {
-                    sender.send(Ok(FetchLogsResult { logs, from_block, to_block, reorg: None }));
+                    sender.send(Ok(FetchLogsResult {
+                        reorg_generation,
+                        logs,
+                        from_block,
+                        to_block,
+                        reorg: None,
+                    }));
                 } else {
                     return Some(ProcessHistoricLogsStreamResult {
                         next: current_filter
@@ -457,7 +452,13 @@ async fn fetch_historic_logs_stream<P: ChainProvider>(
                     });
                 }
             } else {
-                sender.send(Ok(FetchLogsResult { logs, from_block, to_block, reorg: None }));
+                sender.send(Ok(FetchLogsResult {
+                    reorg_generation,
+                    logs,
+                    from_block,
+                    to_block,
+                    reorg: None,
+                }));
             }
 
             if logs_empty {
@@ -774,6 +775,8 @@ async fn parallel_worker(
 
     // Hoist per-worker constants out of the fetch loop — each one costs
     // heap allocations or Arc refcount bumps on every iteration.
+    let reorg_generation =
+        crate::indexer::reorg::reorg_generation(&config.network_contract().network);
     let timestamps = config.timestamps();
     let block_clock = config.network_contract().block_clock.clone();
     let cached_provider = Arc::clone(&config.network_contract().cached_provider);
@@ -802,6 +805,7 @@ async fn parallel_worker(
             state.max_block_range_limitation,
             sub_range_end,
             &info_log_name,
+            reorg_generation,
         )
         .await;
 
@@ -934,6 +938,7 @@ async fn fetch_logs_once<P: ChainProvider + ?Sized>(
     max_block_range_limitation: Option<U64>,
     snapshot_to_block: U64,
     info_log_name: &str,
+    reorg_generation: u64,
 ) -> (Option<FetchLogsResult>, Option<ProcessHistoricLogsStreamResult>, Option<FetchErrorKind>) {
     let from_block = current_filter.from_block();
     let to_block = current_filter.to_block();
@@ -983,7 +988,13 @@ async fn fetch_logs_once<P: ChainProvider + ?Sized>(
 
             let result = if timestamps {
                 if let Ok(logs) = block_clock.attach_log_timestamps(logs).await {
-                    Some(FetchLogsResult { logs, from_block, to_block, reorg: None })
+                    Some(FetchLogsResult {
+                        reorg_generation,
+                        logs,
+                        from_block,
+                        to_block,
+                        reorg: None,
+                    })
                 } else {
                     return (
                         None,
@@ -997,7 +1008,7 @@ async fn fetch_logs_once<P: ChainProvider + ?Sized>(
                     );
                 }
             } else {
-                Some(FetchLogsResult { logs, from_block, to_block, reorg: None })
+                Some(FetchLogsResult { reorg_generation, logs, from_block, to_block, reorg: None })
             };
 
             if logs_empty {
@@ -1171,6 +1182,7 @@ async fn fetch_tip_window(
 /// within a safe range, updating the filter, and sending the logs to the provided channel.
 #[allow(clippy::too_many_arguments)]
 async fn live_indexing_stream(
+    reorgs: crate::indexer::reorg::ReorgSubscription,
     timestamps: bool,
     block_clock: BlockClock,
     cached_provider: Arc<dyn ChainProvider>,
@@ -1191,7 +1203,6 @@ async fn live_indexing_stream(
     trace_registry: Option<&TraceCallbackRegistry>,
 ) {
     let mut last_seen_block_number = last_seen_block_number;
-    let reorgs = crate::indexer::reorg::subscribe_reorgs(network);
     let mut log_response_to_large_to_block: Option<U64> = None;
     let tip_logs = cached_provider.shared_tip_logs();
     let mut heartbeat = HeartbeatTracker::new(Duration::from_secs(300));
@@ -1230,7 +1241,8 @@ async fn live_indexing_stream(
             break;
         }
 
-        if let Some(fork_point) = reorgs.take_rewind() {
+        let (reorg_generation, rewind) = reorgs.snapshot();
+        if let Some(fork_point) = rewind {
             current_filter = current_filter.set_from_block(U64::from(fork_point));
             last_seen_block_number = U64::from(fork_point.saturating_sub(1));
             log_response_to_large_to_block = None;
@@ -1290,6 +1302,7 @@ async fn live_indexing_stream(
 
             let _ = tx
                 .send(Ok(FetchLogsResult {
+                    reorg_generation,
                     logs: vec![],
                     from_block: U64::from(fork_block),
                     to_block: U64::from(fork_block),
@@ -1502,6 +1515,7 @@ async fn live_indexing_stream(
                                     );
                                 if let Err(e) = tx
                                     .send(Ok(FetchLogsResult {
+                                        reorg_generation,
                                         logs: Vec::new(),
                                         from_block,
                                         to_block,
@@ -1660,6 +1674,7 @@ async fn live_indexing_stream(
                                             } else {
                                                 let _ = tx
                                                     .send(Ok(FetchLogsResult {
+                                                        reorg_generation,
                                                         logs: vec![],
                                                         from_block: U64::from(min_removed_block),
                                                         to_block: U64::from(min_removed_block),
@@ -1728,6 +1743,7 @@ async fn live_indexing_stream(
 
                                         if let Err(e) = tx
                                             .send(Ok(FetchLogsResult {
+                                                reorg_generation,
                                                 logs,
                                                 from_block,
                                                 to_block,
@@ -2449,6 +2465,7 @@ mod tests {
             None,
             U64::from(500),
             "test",
+            0,
         )
         .await;
 
@@ -2475,6 +2492,7 @@ mod tests {
             None,
             U64::from(500),
             "test",
+            0,
         )
         .await;
 
@@ -2501,6 +2519,7 @@ mod tests {
             None,
             U64::from(500),
             "test",
+            0,
         )
         .await;
 
@@ -2531,6 +2550,7 @@ mod tests {
             None,
             U64::from(500),
             "test",
+            0,
         )
         .await;
 
@@ -2573,6 +2593,7 @@ mod tests {
             None,
             U64::from(7),
             "test",
+            0,
         )
         .await;
 
@@ -2603,6 +2624,7 @@ mod tests {
             Some(U64::from(50)), // max range = 50
             U64::from(5000),
             "test",
+            0,
         )
         .await;
 
@@ -2629,6 +2651,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(4);
 
         live_indexing_stream(
+            crate::indexer::reorg::subscribe_reorgs("test"),
             false,
             block_clock,
             provider,
@@ -2682,6 +2705,7 @@ mod tests {
         tokio::time::timeout(
             Duration::from_secs(2),
             live_indexing_stream(
+                crate::indexer::reorg::subscribe_reorgs("test"),
                 false,
                 block_clock,
                 provider,
@@ -2752,6 +2776,7 @@ mod tests {
             let coordinator = coordinator.clone();
             streams.push(Box::pin(async move {
                 live_indexing_stream(
+                    crate::indexer::reorg::subscribe_reorgs(network),
                     false,
                     BlockClock::new(None, None, provider.clone()),
                     provider,
@@ -3031,6 +3056,7 @@ mod tests {
         let topic_id = filter.event_signature();
         let registry = EventCallbackRegistry::default();
         let stream = live_indexing_stream(
+            crate::indexer::reorg::subscribe_reorgs(network),
             false,
             block_clock,
             provider.clone(),
@@ -3571,6 +3597,7 @@ mod tests {
                 .iter()
                 .map(|&b| {
                     Ok(FetchLogsResult {
+                        reorg_generation: 0,
                         logs: vec![],
                         from_block: U64::from(b),
                         to_block: U64::from(b),
@@ -3810,7 +3837,7 @@ mod tests {
 
             let bc = BlockClock::new(None, None, Arc::new(MockChainProvider::new(1)));
             let (result, next, kind) =
-                fetch_logs_once(false, &bc, &mock, filter, None, U64::from(500), "test").await;
+                fetch_logs_once(false, &bc, &mock, filter, None, U64::from(500), "test", 0).await;
 
             let r =
                 result.expect("empty logs still return a result so sink can advance checkpoint");
@@ -3831,7 +3858,7 @@ mod tests {
 
             let bc = BlockClock::new(None, None, Arc::new(MockChainProvider::new(1)));
             let (_result, next, _kind) =
-                fetch_logs_once(false, &bc, &mock, filter, None, U64::from(500), "test").await;
+                fetch_logs_once(false, &bc, &mock, filter, None, U64::from(500), "test", 0).await;
 
             assert!(next.is_none(), "no further work past snapshot_to_block");
         }
@@ -3846,7 +3873,7 @@ mod tests {
 
             let bc = BlockClock::new(None, None, Arc::new(MockChainProvider::new(1)));
             let (result, next, _kind) =
-                fetch_logs_once(false, &bc, &mock, filter, None, U64::from(500), "test").await;
+                fetch_logs_once(false, &bc, &mock, filter, None, U64::from(500), "test", 0).await;
 
             let r = result.expect("should return logs");
             assert_eq!(r.logs.len(), 2);
@@ -3864,7 +3891,7 @@ mod tests {
 
             let bc = BlockClock::new(None, None, Arc::new(MockChainProvider::new(1)));
             let (result, next, _kind) =
-                fetch_logs_once(false, &bc, &mock, filter, None, U64::from(500), "test").await;
+                fetch_logs_once(false, &bc, &mock, filter, None, U64::from(500), "test", 0).await;
 
             assert!(result.is_none(), "no logs emitted for inverted range");
             let next = next.expect("self-correction returns a fixed next filter");

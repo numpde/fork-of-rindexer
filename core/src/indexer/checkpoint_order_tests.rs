@@ -43,16 +43,23 @@ struct Fixture {
 
 impl Fixture {
     async fn new(callback: EventCallbackType) -> Self {
-        let directory = tempfile::tempdir().expect("checkpoint directory");
-        let provider =
-            Arc::new(MockChainProvider::new(1).with_block_number(10).with_logs(vec![Log {
+        Self::with_logs(
+            callback,
+            vec![Log {
                 block_hash: Some(B256::repeat_byte(2)),
                 block_number: Some(2),
                 transaction_hash: Some(B256::repeat_byte(2)),
                 transaction_index: Some(0),
                 log_index: Some(0),
                 ..Default::default()
-            }]));
+            }],
+        )
+        .await
+    }
+
+    async fn with_logs(callback: EventCallbackType, logs: Vec<Log>) -> Self {
+        let directory = tempfile::tempdir().expect("checkpoint directory");
+        let provider = Arc::new(MockChainProvider::new(1).with_block_number(10).with_logs(logs));
         let network = NetworkContract {
             id: "checkpoint".to_string(),
             network: "ethereum".to_string(),
@@ -160,6 +167,7 @@ impl Fixture {
             self.permits.clone(),
             &mut self.checkpoints,
             Ok(FetchLogsResult {
+                reorg_generation: crate::indexer::reorg::reorg_generation("ethereum"),
                 logs,
                 from_block: U64::from(block),
                 to_block: U64::from(block),
@@ -183,38 +191,76 @@ async fn buffered_empty_reorg_batch_cannot_checkpoint() {
 
 async fn assert_buffered_reorg_batch_is_rejected(empty: bool) {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use futures::StreamExt;
-    use crate::indexer::reorg::{
-        BlockChainWindow, ReorgBlockHashPersistence, ReorgContext, ReorgCoordinator,
-    };
 
     let calls = Arc::new(AtomicUsize::new(0));
     let callback_calls = calls.clone();
     let mut fixture = Fixture::new(Arc::new(move |_| {
         callback_calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(async { Ok(()) })
-    })).await;
-    let mut stream = crate::indexer::fetch_logs::fetch_logs_stream(
-        fixture.config.clone(), true, None, None,
-    );
-    let mut batch = timeout(Duration::from_secs(5), stream.next()).await
-        .expect("fetch completes").expect("fetched batch").expect("valid batch");
+    }))
+    .await;
+    dispatch_buffered_after_rollback(&mut fixture, empty).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "orphaned work must never reach effects");
+}
+
+pub(crate) async fn reject_buffered_callback_after_rollback(
+    callback: EventCallbackType,
+    logs: Vec<Log>,
+) {
+    let mut fixture = Fixture::with_logs(callback, logs).await;
+    dispatch_buffered_after_rollback(&mut fixture, false).await;
+}
+
+async fn dispatch_buffered_after_rollback(fixture: &mut Fixture, empty: bool) {
+    use crate::indexer::reorg::{
+        BlockChainWindow, ReorgBlockHashPersistence, ReorgContext, ReorgCoordinator,
+    };
+    use futures::StreamExt;
+    let mut stream =
+        crate::indexer::fetch_logs::fetch_logs_stream(fixture.config.clone(), true, None, None);
+    let mut batch = timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("fetch completes")
+        .expect("fetched batch")
+        .expect("valid batch");
     assert!(!batch.logs.is_empty(), "exercise actual fetched logs");
-    if empty { batch.logs.clear(); }
+    if empty {
+        batch.logs.clear();
+    }
     // Hold the fetched batch outside dispatch until rollback is complete.
     let mut coordinator = ReorgCoordinator::new(
-        "ethereum".to_string(), BlockChainWindow::try_new(20).unwrap(),
+        "ethereum".to_string(),
+        BlockChainWindow::try_new(20).unwrap(),
         Arc::new(ReorgBlockHashPersistence::new(None, None)),
-        fixture.config.network_contract().cached_provider.clone(), vec![], vec![], vec![],
-    ).unwrap();
+        fixture.config.network_contract().cached_provider.clone(),
+        vec![],
+        vec![],
+        vec![],
+    )
+    .unwrap();
     let task = coordinator.try_create_reorg_task_for_block_range(2, 10).unwrap();
-    coordinator.handle_reorg(task, &ReorgContext {
-        postgres: None, clickhouse: None, registry: None, trace_registry: None,
-    }).await.unwrap();
-    handle_logs_result(fixture.config.clone(), fixture.permits.clone(),
-        &mut fixture.checkpoints, Ok(batch)).await.expect("discard stale batch")
-        .await.expect("dispatch completes");
-    assert_eq!(calls.load(Ordering::SeqCst), 0, "orphaned work must never reach effects");
+    coordinator
+        .handle_reorg(
+            task,
+            &ReorgContext {
+                postgres: None,
+                clickhouse: None,
+                registry: None,
+                trace_registry: None,
+            },
+        )
+        .await
+        .unwrap();
+    handle_logs_result(
+        fixture.config.clone(),
+        fixture.permits.clone(),
+        &mut fixture.checkpoints,
+        Ok(batch),
+    )
+    .await
+    .expect("discard stale batch")
+    .await
+    .expect("dispatch completes");
     assert_eq!(fixture.cursor(), "1", "orphaned work cannot checkpoint");
 }
 
@@ -471,6 +517,7 @@ async fn terminal_callback_cancels_pending_callbacks_and_blocks_empty_tail() {
         fixture.permits.clone(),
         &mut fixture.checkpoints,
         Ok(FetchLogsResult {
+            reorg_generation: crate::indexer::reorg::reorg_generation("ethereum"),
             logs: vec![],
             from_block: U64::from(4),
             to_block: U64::from(4),

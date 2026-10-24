@@ -984,3 +984,41 @@ async fn assert_reorg_replay(kind: ReplayKind) {
         )
     );
 }
+
+#[tokio::test]
+async fn postgres_buffered_reorg_batch_leaves_raw_derived_receipts_and_cursor_unchanged() {
+    let fixture = Fixture::new().await;
+    let callbacks = no_code_callback(Arc::new(fixture.params.clone()));
+    let events = fixture.events(&[2]);
+    let before = fixture.position().await;
+    crate::indexer::process::checkpoint_order_tests::reject_buffered_callback_after_rollback(
+        callbacks.event_callback.clone(),
+        events.iter().map(|event| event.log.clone()).collect(),
+    )
+    .await;
+    assert_eq!(fixture.position().await, before);
+    assert_eq!(
+        fixture
+            .client
+            .query_one("SELECT count(*) FROM rindexer_internal.event_applications", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        0
+    );
+    // The input is representable: a fresh replay must apply the callback normally.
+    (callbacks.event_callback)(events).await.unwrap();
+    assert_eq!(fixture.position().await.0, 1);
+    assert_eq!(fixture.position().await.1, "2");
+    assert_eq!(
+        fixture
+            .client
+            .query_one("SELECT count(*) FROM rindexer_internal.event_applications", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        1
+    );
+    drop(callbacks);
+    fixture.finish().await;
+}

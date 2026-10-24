@@ -18,7 +18,7 @@ use callback_checkpoint::{CallbackCheckpoints, CheckpointTurn};
 
 #[cfg(test)]
 #[path = "checkpoint_order_tests.rs"]
-mod checkpoint_order_tests;
+pub(crate) mod checkpoint_order_tests;
 
 use crate::helpers::is_relevant_block;
 use crate::indexer::heartbeat::{HeartbeatAction, HeartbeatTracker};
@@ -179,26 +179,32 @@ async fn process_event_logs(
 
         // Reorg-bearing batches bypass coalescing — the coordinator's rollback
         // semantics require standalone delivery in order.
-        let (mut coalesced_logs, mut final_from_block, mut final_to_block) = match result {
-            Ok(fetch_result) => {
-                if fetch_result.reorg.is_some() {
-                    dispatch_batch(
-                        &config,
-                        &callback_permits,
-                        &mut checkpoints,
-                        fetch_result,
-                        block_until_indexed,
-                        &mut in_flight,
+        let (mut coalesced_logs, mut final_from_block, mut final_to_block, reorg_generation) =
+            match result {
+                Ok(fetch_result) => {
+                    if fetch_result.reorg.is_some() {
+                        dispatch_batch(
+                            &config,
+                            &callback_permits,
+                            &mut checkpoints,
+                            fetch_result,
+                            block_until_indexed,
+                            &mut in_flight,
+                        )
+                        .await?;
+                        continue;
+                    }
+                    (
+                        fetch_result.logs,
+                        fetch_result.from_block,
+                        fetch_result.to_block,
+                        fetch_result.reorg_generation,
                     )
-                    .await?;
-                    continue;
                 }
-                (fetch_result.logs, fetch_result.from_block, fetch_result.to_block)
-            }
-            Err(e) => {
-                return Err(Box::new(ProviderError::CustomError(e.to_string())));
-            }
-        };
+                Err(e) => {
+                    return Err(Box::new(ProviderError::CustomError(e.to_string())));
+                }
+            };
 
         // Drain any additional READY results (non-blocking via now_or_never).
         // SAFETY: tokio mpsc Receiver::recv/poll_recv is cancel-safe — dropping
@@ -208,7 +214,9 @@ async fn process_event_logs(
         while coalesced_logs.len() < MAX_COALESCE_LOGS {
             match logs_stream.next().now_or_never() {
                 Some(Some(Ok(fetch_result))) => {
-                    if fetch_result.reorg.is_some() {
+                    if fetch_result.reorg.is_some()
+                        || fetch_result.reorg_generation != reorg_generation
+                    {
                         // Flush coalesced + reorg, then `continue 'outer` to
                         // rebuild coalescing state with fresh block-range vars
                         // (otherwise the stale min/max would poison the next
@@ -218,6 +226,7 @@ async fn process_event_logs(
                             &callback_permits,
                             &mut checkpoints,
                             FetchLogsResult {
+                                reorg_generation,
                                 logs: std::mem::take(&mut coalesced_logs),
                                 from_block: final_from_block,
                                 to_block: final_to_block,
@@ -267,6 +276,7 @@ async fn process_event_logs(
             &callback_permits,
             &mut checkpoints,
             FetchLogsResult {
+                reorg_generation,
                 logs: coalesced_logs,
                 from_block: final_from_block,
                 to_block: final_to_block,
@@ -563,7 +573,8 @@ async fn live_indexing_for_contract_event_dependencies(
 
         let iteration_start = Instant::now();
 
-        if let Some(fork_point) = reorgs.take_rewind() {
+        let (reorg_generation, rewind) = reorgs.snapshot();
+        if let Some(fork_point) = rewind {
             for details in ordering_live_indexing_details_map.values() {
                 let mut details = details.lock().await;
                 details.filter = details.filter.clone().set_from_block(U64::from(fork_point));
@@ -773,6 +784,9 @@ async fn live_indexing_for_contract_event_dependencies(
                 // No event task spawns on this skip path, but the checkpoint write below
                 // must still be tracked so graceful shutdown waits for it.
                 let _writer_guard = writer_barrier.read().await;
+                if reorg_generation != crate::indexer::reorg::reorg_generation(&network) {
+                    break;
+                }
                 let _activity = ActiveCallback::start();
                 update_progress_and_last_synced_task(Arc::clone(config), to_block, || {}).await;
                 continue;
@@ -817,8 +831,13 @@ async fn live_indexing_for_contract_event_dependencies(
                     // clone here over the full logs way less overhead
                     let last_log = logs.last().cloned();
 
-                    let fetched_logs =
-                        Ok(FetchLogsResult { logs, from_block, to_block, reorg: None });
+                    let fetched_logs = Ok(FetchLogsResult {
+                        reorg_generation,
+                        logs,
+                        from_block,
+                        to_block,
+                        reorg: None,
+                    });
 
                     let result = handle_logs_result(
                         Arc::clone(config),
@@ -987,6 +1006,14 @@ async fn handle_logs_result(
             let writer_guard =
                 event_writer_barrier(&config.network_contract().network).read_owned().await;
 
+            if result.reorg_generation
+                != crate::indexer::reorg::reorg_generation(&config.network_contract().network)
+            {
+                // Rollback already deleted this generation's effects and rewound its
+                // fetchers. A stale batch must not claim receipts or publish progress.
+                return Ok(tokio::spawn(async {}));
+            }
+            checkpoints.for_generation(result.reorg_generation);
             debug!("{} - Processing {} logs", config.info_log_name(), result.logs.len());
 
             let fn_data = result

@@ -32,38 +32,65 @@ static EVENT_WRITER_BARRIERS: LazyLock<StdMutex<HashMap<String, Arc<RwLock<()>>>
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 
 type PendingRewind = StdMutex<Option<u64>>;
-static REORG_SUBSCRIBERS: LazyLock<StdMutex<HashMap<String, Vec<Weak<PendingRewind>>>>> =
+#[derive(Default)]
+struct NetworkRecovery {
+    generation: u64,
+    subscribers: Vec<Weak<PendingRewind>>,
+}
+static NETWORK_RECOVERY: LazyLock<StdMutex<HashMap<String, NetworkRecovery>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 
 /// Each fetcher consumes its own pending rewind. Coalescing to the earliest fork
 /// preserves recovery when several rollbacks finish before a slow fetcher polls.
-pub(crate) struct ReorgSubscription(Arc<PendingRewind>);
+pub(crate) struct ReorgSubscription {
+    network: String,
+    pending: Arc<PendingRewind>,
+}
 
 impl ReorgSubscription {
-    pub(crate) fn take_rewind(&self) -> Option<u64> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).take()
+    // Consume the rewind and snapshot its generation under the publication lock.
+    // A rollback after this point leaves another pending rewind and invalidates work.
+    pub(crate) fn snapshot(&self) -> (u64, Option<u64>) {
+        let recovery = NETWORK_RECOVERY.lock().unwrap_or_else(|e| e.into_inner());
+        let generation = recovery.get(&self.network).map_or(0, |state| state.generation);
+        let rewind = self.pending.lock().unwrap_or_else(|e| e.into_inner()).take();
+        (generation, rewind)
     }
+
+    pub(crate) fn take_rewind(&self) -> Option<u64> {
+        self.snapshot().1
+    }
+}
+
+/// Snapshot before fetching a manually constructed `FetchLogsResult`. The
+/// dispatcher rejects responses if a network rollback completes after this point.
+pub fn reorg_generation(network: &str) -> u64 {
+    NETWORK_RECOVERY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(network)
+        .map_or(0, |state| state.generation)
 }
 
 pub(crate) fn subscribe_reorgs(network: &str) -> ReorgSubscription {
     let pending = Arc::new(StdMutex::new(None));
-    let mut subscribers = REORG_SUBSCRIBERS.lock().unwrap_or_else(|e| e.into_inner());
-    let entries = subscribers.entry(network.to_string()).or_default();
-    entries.retain(|entry| entry.strong_count() > 0);
-    entries.push(Arc::downgrade(&pending));
-    ReorgSubscription(pending)
+    let mut recovery = NETWORK_RECOVERY.lock().unwrap_or_else(|e| e.into_inner());
+    let state = recovery.entry(network.to_string()).or_default();
+    state.subscribers.retain(|entry| entry.strong_count() > 0);
+    state.subscribers.push(Arc::downgrade(&pending));
+    ReorgSubscription { network: network.to_string(), pending }
 }
 
 fn publish_rewind(network: &str, fork_point: u64) {
-    let mut subscribers = REORG_SUBSCRIBERS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(entries) = subscribers.get_mut(network) {
-        entries.retain(|entry| {
-            let Some(pending) = entry.upgrade() else { return false };
-            let mut rewind = pending.lock().unwrap_or_else(|e| e.into_inner());
-            *rewind = Some(rewind.map_or(fork_point, |old| old.min(fork_point)));
-            true
-        });
-    }
+    let mut recovery = NETWORK_RECOVERY.lock().unwrap_or_else(|e| e.into_inner());
+    let state = recovery.entry(network.to_string()).or_default();
+    state.generation = state.generation.checked_add(1).expect("reorg generation exhausted");
+    state.subscribers.retain(|entry| {
+        let Some(pending) = entry.upgrade() else { return false };
+        let mut rewind = pending.lock().unwrap_or_else(|e| e.into_inner());
+        *rewind = Some(rewind.map_or(fork_point, |old| old.min(fork_point)));
+        true
+    });
 }
 
 /// One read/write barrier per network: event callbacks hold a read guard while

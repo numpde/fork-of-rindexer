@@ -26,6 +26,7 @@ async fn parallel_fetch_retries_missing_block_number_without_a_successful_batch(
         None,
         U64::from(2),
         "test",
+        0,
     ))
     .catch_unwind()
     .await
@@ -53,6 +54,7 @@ async fn serial_fetch_retries_missing_block_number_without_a_successful_batch() 
         None,
         U64::from(2),
         "test",
+        0,
     ))
     .catch_unwind()
     .await
