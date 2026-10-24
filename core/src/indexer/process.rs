@@ -12,6 +12,14 @@ use tokio::{
 };
 use tracing::{debug, error, info, warn};
 
+#[path = "callback_checkpoint.rs"]
+mod callback_checkpoint;
+use callback_checkpoint::{CallbackCheckpoints, CheckpointTurn};
+
+#[cfg(test)]
+#[path = "checkpoint_order_tests.rs"]
+mod checkpoint_order_tests;
+
 use crate::helpers::is_relevant_block;
 use crate::indexer::heartbeat::{HeartbeatAction, HeartbeatTracker};
 use crate::indexer::reorg::{
@@ -101,6 +109,7 @@ async fn process_event_logs(
     };
 
     let callback_permits = Arc::new(Semaphore::new(callback_concurrency));
+    let mut checkpoints = CallbackCheckpoints::default();
 
     let mut logs_stream = fetch_logs_stream(
         Arc::clone(&config),
@@ -121,11 +130,12 @@ async fn process_event_logs(
     async fn dispatch_batch(
         config: &Arc<EventProcessingConfig>,
         permits: &Arc<Semaphore>,
+        checkpoints: &mut CallbackCheckpoints,
         result: FetchLogsResult,
         block_until_indexed: bool,
         in_flight: &mut FuturesUnordered<JoinHandle<()>>,
     ) -> Result<(), Box<ProviderError>> {
-        let task = handle_logs_result(Arc::clone(config), permits.clone(), Ok(result))
+        let task = handle_logs_result(Arc::clone(config), permits.clone(), checkpoints, Ok(result))
             .await
             .map_err(|e| Box::new(ProviderError::CustomError(e.to_string())))?;
         if block_until_indexed {
@@ -152,6 +162,7 @@ async fn process_event_logs(
                     dispatch_batch(
                         &config,
                         &callback_permits,
+                        &mut checkpoints,
                         fetch_result,
                         block_until_indexed,
                         &mut in_flight,
@@ -182,6 +193,7 @@ async fn process_event_logs(
                         dispatch_batch(
                             &config,
                             &callback_permits,
+                            &mut checkpoints,
                             FetchLogsResult {
                                 logs: std::mem::take(&mut coalesced_logs),
                                 from_block: final_from_block,
@@ -195,6 +207,7 @@ async fn process_event_logs(
                         dispatch_batch(
                             &config,
                             &callback_permits,
+                            &mut checkpoints,
                             fetch_result,
                             block_until_indexed,
                             &mut in_flight,
@@ -229,6 +242,7 @@ async fn process_event_logs(
         dispatch_batch(
             &config,
             &callback_permits,
+            &mut checkpoints,
             FetchLogsResult {
                 logs: coalesced_logs,
                 from_block: final_from_block,
@@ -768,6 +782,7 @@ async fn live_indexing_for_contract_event_dependencies(
                     let result = handle_logs_result(
                         Arc::clone(config),
                         callback_permits.clone(),
+                        &mut CallbackCheckpoints::default(),
                         fetched_logs,
                     )
                     .await;
@@ -848,6 +863,7 @@ async fn trigger_event(
     config: Arc<EventProcessingConfig>,
     fn_data: Vec<EventResult>,
     to_block: U64,
+    checkpoint: CheckpointTurn,
 ) {
     indexing_event_processing();
 
@@ -885,7 +901,18 @@ async fn trigger_event(
         // in no_code.rs), custom Rust handlers, the trace path (its outer
         // advance ignores the callback result), and factory discovery events
         // (child-address bookkeeping commits after the callback).
-        update_progress_and_last_synced_task(config, to_block, indexing_event_processed).await;
+        let update = update_progress_and_last_synced_task(
+            config.clone(),
+            to_block,
+            indexing_event_processed,
+        );
+        if checkpoint.commit(update).await.is_err() {
+            error!(
+                "{} - Cannot advance cursor because an earlier callback did not complete",
+                config.info_log_name()
+            );
+            indexing_event_processed();
+        }
     } else {
         indexing_event_processed();
     }
@@ -894,6 +921,7 @@ async fn trigger_event(
 async fn handle_logs_result(
     config: Arc<EventProcessingConfig>,
     callback_permits: Arc<Semaphore>,
+    checkpoints: &mut CallbackCheckpoints,
     result: Result<FetchLogsResult, Box<dyn std::error::Error + Send>>,
 ) -> Result<JoinHandle<()>, Box<dyn std::error::Error + Send>> {
     match result {
@@ -926,17 +954,18 @@ async fn handle_logs_result(
                         as Box<dyn std::error::Error + Send>
                 })?;
 
+            let checkpoint = checkpoints.next();
             if let Ok(permit) = callback_permits.clone().acquire_owned().await {
                 let task = tokio::spawn(async move {
                     let _writer_guard = writer_guard;
-                    trigger_event(config, fn_data, result.to_block).await;
+                    trigger_event(config, fn_data, result.to_block, checkpoint).await;
                     drop(permit)
                 });
 
                 Ok(task)
             } else {
                 let _writer_guard = writer_guard;
-                trigger_event(config, fn_data, result.to_block).await;
+                trigger_event(config, fn_data, result.to_block, checkpoint).await;
                 Ok(tokio::spawn(async {}))
             }
         }

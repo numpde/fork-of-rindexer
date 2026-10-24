@@ -267,6 +267,12 @@ ci: rust/checks tests ## Validate the first container-development slice (not all
 
 .PHONY: tests/event-inputs/docker tests/event-inputs/postgres
 
+.PHONY: tests/checkpoint-order/docker
+
+tests/checkpoint-order/docker: tests/posture ## Check concurrent callbacks and durable checkpoint ordering offline
+	@$(call offline_runner,$$dependency_image)
+	$(compose) run --rm --no-deps -T offline checkpoint-order
+
 tests/event-inputs/docker: tests/posture ## Check event inputs and nearby fetch/callback regressions offline
 	@$(call offline_runner,$$dependency_image)
 	$(compose) run --rm --no-deps -T offline event-inputs

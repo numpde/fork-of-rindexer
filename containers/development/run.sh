@@ -31,6 +31,13 @@ if ! test -f "$RINDEXER_GRAPHQL_PREBUILT" || ! test -f /build/graphql/input.sha2
 fi
 case "$1" in
   compile) exec cargo nextest run --frozen -p rindexer --test postgres_bytea_array --no-run ;;
+  checkpoint-order)
+    cargo nextest run --frozen -p rindexer --lib --no-run \
+      -E 'test(/^indexer::process::checkpoint_order_tests::/)'
+    exec timeout --signal=TERM --kill-after=20s 900s cargo nextest run --frozen \
+      -p rindexer --lib --no-fail-fast --no-capture \
+      -E 'test(/^indexer::process::checkpoint_order_tests::/)'
+    ;;
   event-inputs)
     cargo nextest run --frozen -p rindexer --lib --no-run \
       -E '(test(/input_validation_tests/) | test(/^indexer::fetch_logs::/) | test(/^event::callback_registry::/) | test(/^helpers::evm_log::/)) & not test(/::postgres_/)'
