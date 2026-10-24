@@ -379,7 +379,7 @@ async fn postgres_explicit_reset_clears_receipts_before_rebuilding_history() {
 }
 
 #[tokio::test]
-async fn postgres_configuration_cannot_switch_receipted_stream_to_untracked_writes() {
+async fn postgres_receipted_stream_can_enable_concurrency_without_reapplying_effects() {
     let fixture = Fixture::new().await;
     let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
     callback(fixture.events(&[1, 2])).await.unwrap();
@@ -391,8 +391,87 @@ async fn postgres_configuration_cannot_switch_receipted_stream_to_untracked_writ
     let position = fixture.position().await;
     drop(callback);
     fixture.finish().await;
-    assert!(matches!(result, Err(crate::event::callback_registry::CallbackError::Permanent(_))));
+    result.expect("enabling concurrency must retain PostgreSQL receipt protection");
     assert_eq!(position, (2, "3".to_string(), "2".to_string()));
+}
+
+async fn assert_replay_with_deferred_cursor(configure: impl FnOnce(&mut NoCodeCallbackParams)) {
+    let fixture = Fixture::new().await;
+    let mut params = fixture.params.clone();
+    configure(&mut params);
+    let callback = no_code_callback(Arc::new(params)).event_callback;
+    callback(fixture.events(&[1, 2])).await.unwrap();
+    callback(fixture.events(&[1, 2])).await.unwrap();
+    let position = fixture.position().await;
+    drop(callback);
+    fixture.finish().await;
+    assert_eq!(
+        position,
+        (2, "3".to_string(), "0".to_string()),
+        "PG effects apply once, but the outer dispatcher still owns this cursor"
+    );
+}
+
+#[tokio::test]
+async fn postgres_concurrent_configuration_keeps_effects_replay_safe_without_early_cursor() {
+    assert_replay_with_deferred_cursor(|params| params.atomic_safe_concurrency = false).await;
+}
+
+#[tokio::test]
+async fn postgres_factory_configuration_keeps_effects_replay_safe_without_early_cursor() {
+    assert_replay_with_deferred_cursor(|params| params.is_factory_event = true).await;
+}
+
+#[tokio::test]
+async fn postgres_csv_replay_keeps_pg_effects_once_and_replays_csv_independently() {
+    let output = tempfile::NamedTempFile::new().unwrap();
+    assert_replay_with_deferred_cursor(|params| {
+        params.csv = Some(Arc::new(crate::AsyncCsvAppender::new(output.path().to_str().unwrap())));
+    })
+    .await;
+    let rows = csv::ReaderBuilder::new()
+        .has_headers(false)
+        .from_path(output.path())
+        .unwrap()
+        .records()
+        .count();
+    assert_eq!(rows, 4, "PG receipts must not suppress independent CSV re-delivery");
+}
+
+#[tokio::test]
+async fn postgres_committed_effects_survive_csv_failure_without_reapplication_on_retry() {
+    let fixture = Fixture::new().await;
+    let mut params = fixture.params.clone();
+    params.csv =
+        Some(Arc::new(crate::AsyncCsvAppender::new(fixture._directory.path().to_str().unwrap())));
+    let callback = no_code_callback(Arc::new(params.clone())).event_callback;
+    let rejected_csv = callback(fixture.events(&[1, 2])).await;
+    let pg_committed = fixture.position().await;
+    drop(callback);
+    let output = tempfile::NamedTempFile::new().unwrap();
+    params.csv = Some(Arc::new(crate::AsyncCsvAppender::new(output.path().to_str().unwrap())));
+    let callback = no_code_callback(Arc::new(params)).event_callback;
+    let retry = callback(fixture.events(&[1, 2])).await;
+    let after_retry = fixture.position().await;
+    drop(callback);
+    fixture.finish().await;
+    assert!(rejected_csv.is_err(), "directory is not a writable CSV file");
+    assert_eq!(
+        pg_committed,
+        (2, "3".to_string(), "0".to_string()),
+        "PG effects commit as one group before independent outputs"
+    );
+    retry.unwrap();
+    assert_eq!(after_retry, pg_committed, "retrying another sink must not reapply PG effects");
+    assert_eq!(
+        csv::ReaderBuilder::new()
+            .has_headers(false)
+            .from_path(output.path())
+            .unwrap()
+            .records()
+            .count(),
+        2
+    );
 }
 
 #[tokio::test]
