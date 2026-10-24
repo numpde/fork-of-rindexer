@@ -1021,15 +1021,86 @@ mod tests {
 
     #[tokio::test]
     async fn native_transfer_block_consumer_empty_blocks() {
-        // Provider has no blocks registered → consumer returns Ok with no work.
-        let provider = Arc::new(MockChainProvider::new(1));
+        // An actual empty block is evidence that there are no transfers to emit.
+        let blocks = [10, 11]
+            .into_iter()
+            .map(|number| {
+                let mut block = make_block_with_native_transfer(
+                    number,
+                    Address::ZERO,
+                    Address::repeat_byte(1),
+                    U256::ONE,
+                );
+                block.transactions = alloy::rpc::types::BlockTransactions::Full(vec![]);
+                block
+            })
+            .collect();
+        let provider = Arc::new(MockChainProvider::new(1).with_blocks(blocks));
         let config = make_trace_config_async().await;
         let block_numbers = vec![U64::from(10), U64::from(11)];
 
         let result =
             native_transfer_block_consumer(provider, &block_numbers, "ethereum", &config).await;
 
-        assert!(result.is_ok(), "Expected Ok when no blocks are returned");
+        assert!(result.is_ok(), "Complete empty blocks can be checkpointed");
+    }
+
+    #[tokio::test]
+    async fn missing_native_blocks_do_not_call_handlers_or_checkpoint() {
+        assert_incomplete_native_response("missing").await;
+    }
+
+    #[tokio::test]
+    async fn partial_native_blocks_do_not_call_handlers_or_checkpoint() {
+        assert_incomplete_native_response("partial").await;
+    }
+
+    #[tokio::test]
+    async fn duplicate_native_blocks_do_not_substitute_for_missing_blocks() {
+        assert_incomplete_native_response("duplicate").await;
+    }
+
+    #[tokio::test]
+    async fn hash_only_native_blocks_do_not_call_handlers_or_checkpoint() {
+        assert_incomplete_native_response("hashes").await;
+    }
+
+    async fn assert_incomplete_native_response(case: &str) {
+        use futures::FutureExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let (_directory, config, _, path) = callback_case(Arc::new(move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            async { Ok(()) }.boxed()
+        }))
+        .await;
+        let mut block =
+            make_block_with_native_transfer(42, Address::ZERO, Address::repeat_byte(1), U256::ONE);
+        let (blocks, requested) = match case {
+            "missing" => (vec![], vec![U64::from(42)]),
+            "partial" => (vec![block], vec![U64::from(42), U64::from(43)]),
+            "duplicate" => (vec![block.clone(), block], vec![U64::from(42), U64::from(43)]),
+            "hashes" => {
+                block.transactions = alloy::rpc::types::BlockTransactions::Hashes(vec![
+                    alloy::primitives::B256::repeat_byte(1),
+                ]);
+                (vec![block], vec![U64::from(42)])
+            }
+            _ => panic!("unknown RPC fixture"),
+        };
+        let provider = Arc::new(MockChainProvider::new(1).with_blocks(blocks));
+        let result =
+            native_transfer_block_consumer(provider, &requested, "ethereum", &config).await;
+        let cursor = std::fs::read_to_string(path).unwrap();
+        assert!(result.is_err(), "{case} RPC data cannot establish a completed block range");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "validate the entire response before any callback"
+        );
+        assert_eq!(cursor, "1");
+        assert_eq!(crate::indexer::task_tracker::active_indexing_count(), 0);
     }
 
     #[tokio::test]
