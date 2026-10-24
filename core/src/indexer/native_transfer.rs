@@ -261,7 +261,7 @@ pub async fn native_transfer_block_fetch(
         sleep(Duration::from_millis(200)).await;
 
         if let Some(fork_point) = reorgs.take_rewind() {
-            last_seen_block = U64::from(fork_point.saturating_sub(1));
+            last_seen_block = last_seen_block.min(U64::from(fork_point.saturating_sub(1)));
         }
 
         let latest_block = publisher.get_latest_block().await;
@@ -301,7 +301,8 @@ pub async fn native_transfer_block_fetch(
                                 fork_point,
                                 "Native transfer tip reorg - rewinding fetch cursor",
                             );
-                            last_seen_block = U64::from(fork_point.saturating_sub(1));
+                            last_seen_block =
+                                last_seen_block.min(U64::from(fork_point.saturating_sub(1)));
                             continue;
                         }
                         Ok(None) => {}
@@ -355,7 +356,8 @@ pub async fn native_transfer_block_fetch(
                             // `from_block = last_seen_block + 1 = rewind_to`, matching the
                             // coordinator's rollback which deletes rows with
                             // `block_number >= fork_point`.
-                            last_seen_block = U64::from(rewind_to.saturating_sub(1));
+                            last_seen_block =
+                                last_seen_block.min(U64::from(rewind_to.saturating_sub(1)));
                             continue;
                         }
                         NativeTransferReorgOutcome::Failed => {
