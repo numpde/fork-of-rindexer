@@ -39,7 +39,7 @@ use crate::{
         fetch_logs::{fetch_logs_stream, FetchLogsResult},
         last_synced::update_progress_and_last_synced_task,
         progress::IndexingEventProgressStatus,
-        task_tracker::{indexing_event_processed, indexing_event_processing, ActiveCallback},
+        task_tracker::ActiveCallback,
     },
     is_running,
     provider::ProviderError,
@@ -764,13 +764,8 @@ async fn live_indexing_for_contract_event_dependencies(
                 // No event task spawns on this skip path, but the checkpoint write below
                 // must still be tracked so graceful shutdown waits for it.
                 let _writer_guard = writer_barrier.read().await;
-                indexing_event_processing();
-                update_progress_and_last_synced_task(
-                    Arc::clone(config),
-                    to_block,
-                    indexing_event_processed,
-                )
-                .await;
+                let _activity = ActiveCallback::start();
+                update_progress_and_last_synced_task(Arc::clone(config), to_block, || {}).await;
                 continue;
             }
 

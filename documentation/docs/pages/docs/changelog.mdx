@@ -13,6 +13,7 @@
 
 ### Bug fixes
 -------------------------------------------------
+- fix: cancelling a live dependency checkpoint for a block skipped by its logs bloom now releases active-task accounting, so graceful shutdown does not wait for work that was already cancelled. Normal checkpoint completion keeps the same cursor behavior.
 - fix: native-transfer block fetching now rejects missing or repeated requested blocks and responses without full transaction objects before running callbacks or advancing the cursor. These RPC failures retry the same range; complete blocks with no transactions still succeed. Previously skipped history is not repaired automatically and requires review or reindexing.
 - fix: PostgreSQL factory discovery now accepts already-stored child addresses when a batch is replayed or overlaps another batch, including large batches. Bookkeeping preserves its existing factory/address/network primary key and no longer fails with duplicate-key errors after the raw callback has committed. No schema migration is required; ClickHouse and CSV keep their existing behavior.
 - fix: protect managed PostgreSQL native-transfer raw rows and derived operations from duplicate or overlapping replay, including an uncertain COMMIT outcome. Internal calls use their full trace path for receipt identity; native-transfer cursor publication stays with the dispatcher. Missing mined transaction metadata now returns a fetch error before callbacks instead of panicking. Custom Rust callbacks retain their existing replay behavior.
