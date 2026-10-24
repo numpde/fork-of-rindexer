@@ -114,6 +114,23 @@ case "$1" in
       -p rindexer --lib --no-fail-fast --no-capture \
       -E '(test(/unsigned_integer/) | test(/^manifest::contract::tests::test_pg_type_/)) & not test(/::postgres_/)'
     ;;
+  signed-integers)
+    cargo nextest run --frozen -p rindexer --lib --no-run \
+      -E 'test(/^database::signed_integer_tests::/) & not test(/::postgres_/)'
+    exec timeout --signal=TERM --kill-after=20s 900s cargo nextest run --frozen \
+      -p rindexer --lib --no-fail-fast --no-capture \
+      -E 'test(/^database::signed_integer_tests::/) & not test(/::postgres_/)'
+    ;;
+  signed-integers-compile)
+    exec cargo nextest run --frozen -p rindexer --lib --no-run \
+      -E 'test(/^database::signed_integer_tests::postgres_/)'
+    ;;
+  signed-integers-postgres)
+    : "${RINDEXER_TEST_POSTGRES_URL:?missing explicit PostgreSQL fixture}"
+    exec timeout --signal=TERM --kill-after=20s 900s cargo nextest run --frozen \
+      -p rindexer --lib --test-threads 2 --no-fail-fast --no-capture \
+      -E 'test(/^database::signed_integer_tests::postgres_/)'
+    ;;
   unsigned-integers-compile)
     exec cargo nextest run --frozen -p rindexer --lib --no-run \
       -E 'test(/^database::(generate::)?unsigned_integer_tests::postgres_/)'

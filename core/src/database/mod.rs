@@ -7,4 +7,7 @@ pub mod postgres;
 pub mod sql_type_wrapper;
 
 #[cfg(test)]
+mod signed_integer_tests;
+
+#[cfg(test)]
 mod unsigned_integer_tests;

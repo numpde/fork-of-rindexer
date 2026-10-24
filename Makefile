@@ -396,3 +396,14 @@ tests/unsigned-integers/postgres: tests/posture ## Check unsigned writes, schema
 	$(compose) run --rm --no-deps -T offline unsigned-integers-compile
 	$(compose) up -d --no-build --pull never --wait --wait-timeout 90 postgres
 	$(compose) run --rm --no-deps -T postgres-tests unsigned-integers-postgres
+
+.PHONY: tests/signed-integers/docker tests/signed-integers/postgres
+tests/signed-integers/docker: tests/posture ## Check ABI signed integer bind types, binary encoding and compatibility controls offline
+	@$(call offline_runner,$$dependency_image)
+	$(compose) run --rm --no-deps -T offline signed-integers
+
+tests/signed-integers/postgres: tests/posture ## Read back signed integer scalars and arrays through PostgreSQL INSERT and COPY
+	@$(call offline_runner,$$dependency_image)
+	$(compose) run --rm --no-deps -T offline signed-integers-compile
+	$(compose) up -d --no-build --pull never --wait --wait-timeout 90 postgres
+	$(compose) run --rm --no-deps -T postgres-tests signed-integers-postgres
