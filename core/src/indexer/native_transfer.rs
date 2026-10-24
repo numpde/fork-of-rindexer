@@ -1349,6 +1349,65 @@ mod tests {
         Arc::new(Mutex::new(coord))
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn network_reorg_does_not_advance_a_lagging_native_publisher() {
+        use futures::poll;
+        let network = "lagging-native-reorg";
+        let provider = Arc::new(
+            MockChainProvider::new(1).with_blocks(
+                (81..=100)
+                    .map(|number| {
+                        make_block_with_parent(number, b256(number as u8), b256((number - 1) as u8))
+                    })
+                    .collect(),
+            ),
+        );
+        let coordinator = make_test_coordinator(network, &[], provider.clone());
+        let (tx, mut rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let mut publisher = Box::pin(native_transfer_block_fetch(
+            provider,
+            tx,
+            U64::from(80),
+            None,
+            U64::ZERO,
+            network.to_string(),
+            cancel.clone(),
+            None,
+            "indexer".to_string(),
+            Some(coordinator.clone()),
+            None,
+            Arc::new(TraceCallbackRegistry::new()),
+        ));
+        // The publisher has subscribed and is waiting for its first head poll.
+        assert!(poll!(publisher.as_mut()).is_pending());
+        let mut guard = coordinator.lock().await;
+        let task = guard.try_create_reorg_task_for_block_range(98, 100).unwrap();
+        guard
+            .handle_reorg(
+                task,
+                &ReorgContext {
+                    postgres: None,
+                    clickhouse: None,
+                    registry: None,
+                    trace_registry: None,
+                },
+            )
+            .await
+            .unwrap();
+        drop(guard);
+        let first = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::select! {
+                result = publisher.as_mut() => panic!("publisher ended: {result:?}"),
+                first = rx.recv() => first.unwrap(),
+            }
+        })
+        .await
+        .unwrap();
+        cancel.cancel();
+        assert_eq!(first, U64::from(81), "blocks before the fork are still unprocessed");
+    }
+
     #[tokio::test]
     async fn native_transfer_detects_no_reorg_on_canonical_chain() {
         // Window has blocks 10, 11. Provider returns canonical 12, 13 whose
