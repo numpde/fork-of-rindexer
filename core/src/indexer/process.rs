@@ -859,13 +859,30 @@ async fn live_indexing_for_contract_event_dependencies(
     }
 }
 
+/// Count the whole callback lifecycle, including its checkpoint wait. Task
+/// cancellation or panic must release shutdown accounting as well as permits.
+struct ActiveCallback;
+
+impl ActiveCallback {
+    fn start() -> Self {
+        indexing_event_processing();
+        Self
+    }
+}
+
+impl Drop for ActiveCallback {
+    fn drop(&mut self) {
+        indexing_event_processed();
+    }
+}
+
 async fn trigger_event(
     config: Arc<EventProcessingConfig>,
     fn_data: Vec<EventResult>,
     to_block: U64,
     checkpoint: CheckpointTurn,
 ) {
-    indexing_event_processing();
+    let _activity = ActiveCallback::start();
 
     // Record events processed metric
     let event_count = fn_data.len() as u64;
@@ -901,20 +918,13 @@ async fn trigger_event(
         // in no_code.rs), custom Rust handlers, the trace path (its outer
         // advance ignores the callback result), and factory discovery events
         // (child-address bookkeeping commits after the callback).
-        let update = update_progress_and_last_synced_task(
-            config.clone(),
-            to_block,
-            indexing_event_processed,
-        );
+        let update = update_progress_and_last_synced_task(config.clone(), to_block, || {});
         if checkpoint.commit(update).await.is_err() {
             error!(
                 "{} - Cannot advance cursor because an earlier callback did not complete",
                 config.info_log_name()
             );
-            indexing_event_processed();
         }
-    } else {
-        indexing_event_processed();
     }
 }
 
