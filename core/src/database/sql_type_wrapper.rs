@@ -961,8 +961,7 @@ impl ToSql for EthereumSqlTypeWrapper {
                 } else {
                     let values_strings: Vec<String> =
                         values.iter().map(|v| v.to_string()).collect();
-                    let formatted_str = values_strings.join(",");
-                    String::to_sql(&formatted_str, ty, out)
+                    values_strings.to_sql_checked(ty, out)
                 }
             }
             EthereumSqlTypeWrapper::VecI256Bytes(values) => {

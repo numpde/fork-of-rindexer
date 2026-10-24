@@ -32,3 +32,15 @@ Explicit BIGINT serialization remains supported. Managed custom-table operations
 already supply their declared schema types, so their `int64` columns remain
 `BIGINT`. Empty integer arrays retain the existing SQL `NULL` behavior.
 ClickHouse schema and value formatting are unchanged.
+
+## Wide signed arrays
+
+Nonempty `int136[]` through `int256[]` event fields now serialize as PostgreSQL
+arrays of decimal strings. Earlier versions sent comma-joined string bytes,
+which PostgreSQL rejected as invalid binary array data. Both INSERT and COPY
+now preserve element order and the complete signed value range.
+
+Existing generated `VARCHAR(78)[]` columns need no type change. Empty arrays
+retain SQL `NULL`, and ClickHouse formatting is unchanged. Restart indexing after
+upgrading to retry a previously rejected batch from its durable checkpoint.
+Review any manually skipped history separately; this fix does not recreate it.
