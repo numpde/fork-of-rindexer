@@ -238,7 +238,13 @@ async fn dispatch_buffered_after_rollback(fixture: &mut Fixture, empty: bool) {
         vec![],
     )
     .unwrap();
-    let task = coordinator.try_create_reorg_task_for_block_range(2, 10).unwrap();
+    let mut task = coordinator.try_create_reorg_task_for_block_range(2, 10).unwrap();
+    // Supply a complete replacement chain; the fetch provider here serves logs only.
+    task.canonical_blocks = (2..=10)
+        .map(|number| {
+            (number, B256::repeat_byte(number as u8), B256::repeat_byte((number - 1) as u8))
+        })
+        .collect();
     coordinator
         .handle_reorg(
             task,

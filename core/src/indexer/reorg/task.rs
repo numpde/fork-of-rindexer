@@ -1517,25 +1517,34 @@ impl ReorgTask {
         );
 
         // Use pre-fetched canonical blocks if available; otherwise fall back to RPC.
-        let canonical: Vec<(u64, B256, B256)> = if !self.canonical_blocks.is_empty() {
-            self.canonical_blocks
-                .iter()
-                .filter(|(n, _, _)| *n >= self.fork_point && *n <= self.detection_point)
-                .copied()
-                .collect()
+        let mut cached: Vec<_> = self
+            .canonical_blocks
+            .iter()
+            .filter(|(number, _, _)| *number >= self.fork_point && *number <= self.detection_point)
+            .copied()
+            .collect();
+        cached.sort_by_key(|(number, _, _)| *number);
+        let complete = cached.first().is_some_and(|(number, _, _)| *number == self.fork_point)
+            && cached.last().is_some_and(|(number, _, _)| *number == self.detection_point)
+            && cached
+                .windows(2)
+                .all(|pair| pair[0].0.checked_add(1) == Some(pair[1].0) && pair[1].2 == pair[0].1);
+        let canonical: Vec<(u64, B256, B256)> = if complete {
+            cached
         } else if let Some(provider) = provider {
             let block_numbers: Vec<U64> =
                 (self.fork_point..=self.detection_point).map(|n| U64::from(n)).collect();
-            match provider.get_block_by_number_batch(&block_numbers, false).await {
-                Ok(blocks) => blocks
-                    .iter()
-                    .map(|b| (b.header.number, b.header.hash, b.header.parent_hash))
-                    .collect(),
-                Err(e) => {
-                    tracing::error!("Failed to fetch corrected blocks for reorg range: {}", e);
-                    vec![]
-                }
-            }
+            super::fetch_canonical_headers(provider.as_ref(), &block_numbers)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Cannot prepare rollback on network {} for blocks {}..{}",
+                        self.network, self.fork_point, self.detection_point
+                    )
+                })?
+                .iter()
+                .map(|block| (block.header.number, block.header.hash, block.header.parent_hash))
+                .collect()
         } else {
             vec![]
         };

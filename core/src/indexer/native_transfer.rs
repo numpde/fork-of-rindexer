@@ -1379,16 +1379,21 @@ mod tests {
     #[tokio::test]
     async fn native_transfer_rewinds_to_fork_point_on_reorg() {
         // Window has block 11 with hash=11, parent=10 (pre-reorg state).
-        // Canonical chain now says block 11 has hash=0xFE / parent=10 (reorged).
+        // Canonical blocks 10 and 11 now have hashes 0xFD and 0xFE (reorged).
         // Fetch range 12..=12 with canonical block 12 whose parent_hash=0xFE
         // does NOT match the window's stored hash of block 11 → reorg.
         //
         // The coordinator then fetches missing blocks from the provider to locate
-        // the fork point; we expose canonical 11 so find_fork_point can succeed.
-        let canonical_11 = make_block_with_parent(11, b256(0xFE), b256(10));
+        // the fork point; we expose the complete canonical window so find_fork_point can succeed.
+        let canonical_10 = make_block_with_parent(10, b256(0xFD), b256(9));
+        let canonical_11 = make_block_with_parent(11, b256(0xFE), b256(0xFD));
         let canonical_12 = make_block_with_parent(12, b256(12), b256(0xFE));
         let provider: Arc<dyn ChainProvider> =
-            Arc::new(MockChainProvider::new(1).with_blocks(vec![canonical_11, canonical_12]));
+            Arc::new(MockChainProvider::new(1).with_blocks(vec![
+                canonical_10,
+                canonical_11,
+                canonical_12,
+            ]));
 
         let coordinator =
             make_test_coordinator("ethereum", &[(10, 10, 9), (11, 11, 10)], provider.clone());
@@ -1406,7 +1411,7 @@ mod tests {
         .await;
 
         // Coordinator's find_fork_point compares the window's entries against
-        // canonical hashes. With window blocks [10, 11] and canonical [11@0xFE, 12@12],
+        // canonical hashes. With window blocks [10, 11] and canonical [10@0xFD, 11@0xFE],
         // no canonical hash matches any window entry → fork_point falls back to the
         // oldest window block (10).
         //

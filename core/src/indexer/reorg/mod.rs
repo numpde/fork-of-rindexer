@@ -19,6 +19,7 @@ use crate::event::callback_registry::{EventCallbackRegistry, TraceCallbackRegist
 use crate::indexer::fetch_logs::ReorgInfo;
 use crate::metrics::indexing as metrics;
 use crate::notifications::ChainStateNotification;
+use crate::provider::ChainProvider;
 
 pub use coordinator::ReorgCoordinator;
 pub use persistence::ReorgBlockHashPersistence;
@@ -98,6 +99,39 @@ fn publish_rewind(network: &str, fork_point: u64) {
 pub(crate) fn event_writer_barrier(network: &str) -> Arc<RwLock<()>> {
     let mut barriers = EVENT_WRITER_BARRIERS.lock().unwrap_or_else(|e| e.into_inner());
     barriers.entry(network.to_string()).or_default().clone()
+}
+
+/// Canonical-history decisions need the complete requested connected sequence.
+/// Normalize RPC ordering, but never infer missing headers or accept a partial read.
+pub(crate) async fn fetch_canonical_headers(
+    provider: &dyn ChainProvider,
+    requested: &[U64],
+) -> anyhow::Result<Vec<alloy::network::AnyRpcBlock>> {
+    let mut blocks = provider
+        .get_block_by_number_batch(requested, false)
+        .await
+        .context("Cannot fetch canonical block headers")?;
+    anyhow::ensure!(
+        blocks.len() == requested.len(),
+        "Cannot validate canonical history: requested {} headers but received {}",
+        requested.len(),
+        blocks.len()
+    );
+    blocks.sort_by_key(|block| block.header.number);
+    for (number, block) in requested.iter().zip(&blocks) {
+        anyhow::ensure!(number.to::<u64>() == block.header.number,
+            "Cannot validate canonical history at block {}: response contains block {} instead (missing, repeated or unrequested header)", number, block.header.number);
+    }
+    for pair in blocks.windows(2) {
+        anyhow::ensure!(
+            pair[0].header.number.checked_add(1) == Some(pair[1].header.number)
+                && pair[1].header.parent_hash == pair[0].header.hash,
+            "Cannot validate canonical history: block {} does not connect to block {}",
+            pair[1].header.number,
+            pair[0].header.number
+        );
+    }
+    Ok(blocks)
 }
 
 /// Validates that a string is safe to use as a SQL identifier (table name, column name, schema).

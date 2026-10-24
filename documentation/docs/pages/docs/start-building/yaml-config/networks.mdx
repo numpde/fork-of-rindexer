@@ -8,6 +8,20 @@ You can have multiple networks in a single YAML file.
 
 ## Fields
 
+### reorg_handling
+
+When `reorg_handling.enabled` is `true`, rindexer validates persisted block
+history before starting indexing. A database read error, unsuccessful canonical
+header read or failed startup rollback stops startup. Repair the database or RPC
+failure and restart. Do not clear the persisted window to bypass validation;
+inconsistent history needs review and may require reindexing affected ranges.
+
+During live indexing, a gap in observed heads must be filled with every requested
+header in one connected chain before the new head is accepted. Incomplete,
+repeated or disconnected headers cause the poller to retry. Header response order
+may differ from request order. This validation does not repair gaps created by
+earlier versions automatically.
+
 ### name
 
 The name of the network it should be unique to the YAML so you can not have 2 networks with the same name in the same

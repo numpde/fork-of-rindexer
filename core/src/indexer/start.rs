@@ -1,6 +1,7 @@
 use std::{collections::HashMap, path::Path, sync::Arc};
 
 use alloy::primitives::U64;
+use anyhow::Context;
 use futures::future::try_join_all;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
@@ -20,9 +21,9 @@ use crate::event::config::{ContractEventProcessingConfig, FactoryEventProcessing
 use crate::helpers::{camel_to_snake, format_duration};
 use crate::indexer::native_transfer::native_transfer_block_processor;
 use crate::indexer::reorg::{
-    reorg_safe_distance_for_chain, BlockChainWindow, DerivedColumnJournal, DerivedColumnRollback,
-    DerivedTableInfo, DerivedTableRollbackOp, DerivedTableRollbackPlan, EventTableInfo,
-    ReorgBlockHashPersistence, ReorgContext, ReorgCoordinator,
+    reorg_safe_distance_for_chain, DerivedColumnJournal, DerivedColumnRollback, DerivedTableInfo,
+    DerivedTableRollbackOp, DerivedTableRollbackPlan, EventTableInfo, ReorgBlockHashPersistence,
+    ReorgContext, ReorgCoordinator,
 };
 use crate::indexer::Indexer;
 use crate::manifest::network::ReorgHandlingConfig;
@@ -100,6 +101,9 @@ pub enum StartIndexingError {
 
     #[error("Invalid configuration: {0}")]
     ConfigError(#[from] anyhow::Error),
+
+    #[error("{0:#}")]
+    ReorgRecovery(#[source] anyhow::Error),
 }
 
 #[derive(Clone)]
@@ -943,23 +947,10 @@ pub(super) async fn start_indexing_contract_events(
             .unwrap_or_else(|| 2 * reorg_safe_distance_for_chain(*chain_id) as usize);
         let event_tables = network_event_tables.get(network_name).cloned().unwrap_or_default();
 
-        let window = match reorg_persistence.load(network_name, window_size).await {
-            Ok(window) => {
-                info!(
-                    "Loaded {} blocks into reorg window for network {}",
-                    window.len(),
-                    network_name,
-                );
-                window
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to load reorg window from persistence for {}: {}. Using empty window.",
-                    network_name, e
-                );
-                BlockChainWindow::try_new(window_size)?
-            }
-        };
+        let window = reorg_persistence.load(network_name, window_size).await
+            .with_context(|| format!("Cannot start indexing network {network_name}: persisted reorg window could not be loaded"))
+                .map_err(StartIndexingError::ReorgRecovery)?;
+        info!("Loaded {} blocks into reorg window for network {}", window.len(), network_name);
 
         // Get a provider for this network from any registry event targeting it.
         // Native-transfer-only networks have no entry in `registry.events`, so fall back
@@ -998,34 +989,17 @@ pub(super) async fn start_indexing_contract_events(
             .with_rollback_plan(rollback_plan);
 
             // Run startup validation
-            match coordinator.validate_on_startup().await {
-                Ok(Some(startup_task)) => {
-                    warn!(
-                        "Startup reorg detected on {} (fork_point: {}, depth: {}). Executing rollback before indexing.",
-                        network_name,
-                        startup_task.fork_point,
-                        startup_task.detection_point.saturating_sub(startup_task.fork_point) + 1,
-                    );
-                    let reorg_ctx = ReorgContext {
-                        postgres: postgres.as_deref(),
-                        clickhouse: clickhouse.as_ref(),
-                        registry: Some(&registry),
-                        trace_registry: Some(&trace_registry),
-                    };
-                    if let Err(e) = coordinator.handle_reorg(startup_task, &reorg_ctx).await {
-                        error!(
-                            "Failed to execute startup reorg rollback for {}: {}",
-                            network_name, e
-                        );
-                    }
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    error!(
-                        "Startup reorg validation failed for {}: {}. Proceeding without validation.",
-                        network_name, e
-                    );
-                }
+            if let Some(startup_task) = coordinator.validate_on_startup().await
+                .with_context(|| format!("Cannot start indexing network {network_name}: canonical reorg history could not be validated"))
+                .map_err(StartIndexingError::ReorgRecovery)? {
+                warn!("Startup reorg detected on {} (fork_point: {}, depth: {}). Executing rollback before indexing.", network_name, startup_task.fork_point, startup_task.detection_point.saturating_sub(startup_task.fork_point) + 1);
+                let reorg_ctx = ReorgContext {
+                    postgres: postgres.as_deref(), clickhouse: clickhouse.as_ref(),
+                    registry: Some(&registry), trace_registry: Some(&trace_registry),
+                };
+                coordinator.handle_reorg(startup_task, &reorg_ctx).await
+                    .with_context(|| format!("Cannot start indexing network {network_name}: startup reorg rollback did not complete"))
+                .map_err(StartIndexingError::ReorgRecovery)?;
             }
 
             // Keep the coordinator in the map so non-blocking tasks (contract events
@@ -1253,23 +1227,14 @@ pub(super) async fn start_indexing_contract_events(
                 let event_tables =
                     network_event_tables.get(network_name).cloned().unwrap_or_default();
 
-                let window = match reorg_persistence.load(network_name, window_size).await {
-                    Ok(window) => {
-                        info!(
-                            "Dependency events - Loaded {} blocks into reorg window for network {}",
-                            window.len(),
-                            network_name,
-                        );
-                        window
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Dependency events - Failed to load reorg window for {}: {}. Using empty window.",
-                            network_name, e
-                        );
-                        BlockChainWindow::try_new(window_size)?
-                    }
-                };
+                let window = reorg_persistence.load(network_name, window_size).await
+            .with_context(|| format!("Cannot start indexing network {network_name}: persisted reorg window could not be loaded"))
+                .map_err(StartIndexingError::ReorgRecovery)?;
+                info!(
+                    "Dependency events - Loaded {} blocks into reorg window for network {}",
+                    window.len(),
+                    network_name
+                );
 
                 // Get a provider from any dependency event config for this network.
                 // Fall back to the trace registry so native-transfer-only networks still
@@ -1309,36 +1274,18 @@ pub(super) async fn start_indexing_contract_events(
                     )?
                     .with_rollback_plan(rollback_plan);
 
-                    match coordinator.validate_on_startup().await {
-                        Ok(Some(startup_task)) => {
-                            warn!(
-                                "Dependency events - Startup reorg detected on {} (fork_point: {}, depth: {}). Executing rollback.",
-                                network_name,
-                                startup_task.fork_point,
-                                startup_task.detection_point.saturating_sub(startup_task.fork_point) + 1,
-                            );
-                            let reorg_ctx = ReorgContext {
-                                postgres: postgres.as_deref(),
-                                clickhouse: clickhouse.as_ref(),
-                                registry: Some(&registry),
-                                trace_registry: Some(&trace_registry),
-                            };
-                            if let Err(e) = coordinator.handle_reorg(startup_task, &reorg_ctx).await
-                            {
-                                error!(
-                                    "Dependency events - Failed to execute startup reorg rollback for {}: {}",
-                                    network_name, e
-                                );
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            error!(
-                                "Dependency events - Startup reorg validation failed for {}: {}. Proceeding without validation.",
-                                network_name, e
-                            );
-                        }
-                    }
+                    if let Some(startup_task) = coordinator.validate_on_startup().await
+                .with_context(|| format!("Cannot start indexing network {network_name}: canonical reorg history could not be validated"))
+                .map_err(StartIndexingError::ReorgRecovery)? {
+                warn!("Dependency events - Startup reorg detected on {} (fork_point: {}, depth: {}). Executing rollback.", network_name, startup_task.fork_point, startup_task.detection_point.saturating_sub(startup_task.fork_point) + 1);
+                let reorg_ctx = ReorgContext {
+                    postgres: postgres.as_deref(), clickhouse: clickhouse.as_ref(),
+                    registry: Some(&registry), trace_registry: Some(&trace_registry),
+                };
+                coordinator.handle_reorg(startup_task, &reorg_ctx).await
+                    .with_context(|| format!("Cannot start indexing network {network_name}: startup reorg rollback did not complete"))
+                .map_err(StartIndexingError::ReorgRecovery)?;
+            }
 
                     let shared = Arc::new(Mutex::new(coordinator));
                     dep_coordinators.insert(network_name.clone(), shared.clone());

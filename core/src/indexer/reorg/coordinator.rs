@@ -80,99 +80,68 @@ impl ReorgCoordinator {
         parent_hash: B256,
     ) -> anyhow::Result<Option<ReorgTask>> {
         match self.window.validate_parent(block_number, parent_hash) {
-            ParentValidation::Valid => {
-                self.window.insert(block_number, block_hash, parent_hash);
-                self.persist_and_maybe_prune(block_number, block_hash, parent_hash).await?;
-                self.flush_finalized_buffers(block_number).await;
-                Ok(None)
+            ParentValidation::Valid => {}
+            ParentValidation::Mismatch { expected, got } => {
+                return self.handle_mismatch(block_number, expected, got).await;
             }
+            ParentValidation::NoPreviousBlock if self.window.is_empty() || block_number == 0 => {}
             ParentValidation::NoPreviousBlock => {
-                if self.window.is_empty() || block_number == 0 {
-                    self.window.insert(block_number, block_hash, parent_hash);
-                    self.persist_and_maybe_prune(block_number, block_hash, parent_hash).await?;
-                    self.flush_finalized_buffers(block_number).await;
-                    return Ok(None);
-                }
-
-                // Gap detected: the poller skipped one or more blocks. Fetch the
-                // missing blocks from the canonical chain, then validate each one
-                // against the window to detect reorgs that happened during the gap.
-                let window_latest = self.window.latest_block().unwrap(); // safe: window non-empty
-                let gap_start = window_latest + 1;
-                let gap_end = block_number; // exclusive — we don't fetch block_number itself
-                if gap_start < gap_end {
-                    info!(
-                        network = %self.network,
-                        block_number,
-                        window_latest,
-                        gap_size = gap_end - gap_start,
-                        "Filling block gap in reorg window"
-                    );
-                    if let Some(provider) = &self.provider {
-                        let missing: Vec<U64> = (gap_start..gap_end).map(U64::from).collect();
-                        if let Ok(blocks) =
-                            provider.get_block_by_number_batch(&missing, false).await
-                        {
-                            // Validate each fetched block against the window in order.
-                            // The first fetched block's parent_hash must match the
-                            // window's latest block hash — if it doesn't, a reorg
-                            // happened during the gap.
-                            for b in &blocks {
-                                match self
-                                    .window
-                                    .validate_parent(b.header.number, b.header.parent_hash)
-                                {
-                                    ParentValidation::Mismatch { expected, got } => {
-                                        return self
-                                            .handle_mismatch(block_number, expected, got)
-                                            .await;
-                                    }
-                                    _ => {
-                                        self.window.insert(
-                                            b.header.number,
-                                            b.header.hash,
-                                            b.header.parent_hash,
-                                        );
-                                        self.persist_and_maybe_prune(
-                                            b.header.number,
-                                            b.header.hash,
-                                            b.header.parent_hash,
-                                        )
-                                        .await?;
-                                    }
-                                }
-                            }
+                let latest = self.window.latest_block().expect("nonempty window");
+                if block_number <= latest {
+                    // Other pipelines can revisit a header at/below the retained window.
+                    // Do not grow the window backwards or invent missing ancestry there.
+                    if let Some((stored, _)) = self.window.get(block_number) {
+                        if *stored != block_hash {
+                            return self.handle_mismatch(block_number, *stored, block_hash).await;
                         }
                     }
+                    return Ok(None);
                 }
-
-                // Re-validate the incoming block now that the gap is filled.
-                self.insert_or_detect_reorg(block_number, block_hash, parent_hash).await
-            }
-            ParentValidation::Mismatch { expected, got } => {
-                self.handle_mismatch(block_number, expected, got).await
+                let provider = self
+                    .provider
+                    .as_ref()
+                    .context("Cannot fill reorg validation gap: no provider configured")?;
+                let missing: Vec<U64> = ((latest + 1)..block_number).map(U64::from).collect();
+                let blocks = super::fetch_canonical_headers(provider.as_ref(), &missing)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Cannot fill reorg window for network {} before block {block_number}",
+                            self.network
+                        )
+                    })?;
+                let last =
+                    blocks.last().context("Cannot connect new head: ancestry gap is empty")?;
+                anyhow::ensure!(last.header.hash == parent_hash,
+                    "Cannot accept block {block_number} on network {}: its parent does not match the final gap header at block {}", self.network, last.header.number);
+                let first = &blocks[0];
+                let expected = self.window.get(latest).expect("latest retained header").0;
+                if first.header.parent_hash != expected {
+                    return self
+                        .handle_mismatch(block_number, expected, first.header.parent_hash)
+                        .await;
+                }
+                // Validate the entire response before publishing any of it. A bad
+                // later header must not leave a partially advanced in-memory window.
+                for block in &blocks {
+                    self.persist_and_maybe_prune(
+                        block.header.number,
+                        block.header.hash,
+                        block.header.parent_hash,
+                    )
+                    .await?;
+                    self.window.insert(
+                        block.header.number,
+                        block.header.hash,
+                        block.header.parent_hash,
+                    );
+                }
             }
         }
-    }
-
-    /// Insert a block after validation, or trigger reorg detection on mismatch.
-    async fn insert_or_detect_reorg(
-        &mut self,
-        block_number: u64,
-        block_hash: B256,
-        parent_hash: B256,
-    ) -> anyhow::Result<Option<ReorgTask>> {
-        match self.window.validate_parent(block_number, parent_hash) {
-            ParentValidation::Valid | ParentValidation::NoPreviousBlock => {
-                self.window.insert(block_number, block_hash, parent_hash);
-                self.persist_and_maybe_prune(block_number, block_hash, parent_hash).await?;
-                self.flush_finalized_buffers(block_number).await;
-                Ok(None)
-            }
-            ParentValidation::Mismatch { expected, got } => {
-                self.handle_mismatch(block_number, expected, got).await
-            }
-        }
+        self.persist_and_maybe_prune(block_number, block_hash, parent_hash).await?;
+        self.window.insert(block_number, block_hash, parent_hash);
+        self.flush_finalized_buffers(block_number).await;
+        Ok(None)
     }
 
     /// Fan `StreamsClients::flush_finalized` out in parallel across every
@@ -255,8 +224,7 @@ impl ReorgCoordinator {
             .ok_or_else(|| anyhow::anyhow!("No provider configured for startup validation"))?;
 
         let block_numbers_u64: Vec<U64> = block_numbers.iter().map(|&n| U64::from(n)).collect();
-        let blocks = provider
-            .get_block_by_number_batch(&block_numbers_u64, false)
+        let blocks = super::fetch_canonical_headers(provider.as_ref(), &block_numbers_u64)
             .await
             .context("Failed to fetch blocks for startup validation")?;
 
@@ -392,8 +360,7 @@ impl ReorgCoordinator {
             .ok_or_else(|| anyhow::anyhow!("No provider configured for fork point detection"))?;
 
         let block_numbers_u64: Vec<U64> = block_numbers.iter().map(|&n| U64::from(n)).collect();
-        let blocks = provider
-            .get_block_by_number_batch(&block_numbers_u64, false)
+        let blocks = super::fetch_canonical_headers(provider.as_ref(), &block_numbers_u64)
             .await
             .context("Failed to fetch blocks for fork point detection")?;
 
@@ -718,13 +685,23 @@ mod tests {
     async fn rollback_header_rpc_failure_does_not_clear_window_or_publish_rewind() {
         let mut coordinator = make_coordinator(make_window_with_blocks(&[(100, 100, 99)]));
         coordinator.network = "failed-rollback-validation".to_string();
-        coordinator.provider = Some(Arc::new(crate::provider::mock::MockChainProvider::new(1)
-            .with_block_fetch_error("canonical history unavailable")));
+        coordinator.provider = Some(Arc::new(
+            crate::provider::mock::MockChainProvider::new(1)
+                .with_block_fetch_error("canonical history unavailable"),
+        ));
         let reorgs = super::super::subscribe_reorgs(&coordinator.network);
         let task = coordinator.try_create_reorg_task_for_block_range(100, 100).unwrap();
-        let result = coordinator.handle_reorg(task, &ReorgContext {
-            postgres: None, clickhouse: None, registry: None, trace_registry: None,
-        }).await;
+        let result = coordinator
+            .handle_reorg(
+                task,
+                &ReorgContext {
+                    postgres: None,
+                    clickhouse: None,
+                    registry: None,
+                    trace_registry: None,
+                },
+            )
+            .await;
         assert!(result.is_err(), "rollback must wait for its canonical replacement headers");
         assert_eq!(coordinator.window.block_numbers(), vec![100]);
         assert_eq!(reorgs.take_rewind(), None);
