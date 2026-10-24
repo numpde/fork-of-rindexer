@@ -48,6 +48,9 @@ pub fn set_pool_connections(database: &str, active: usize, idle: usize) {
 
 /// Record the outcome of one atomic no-code batch.
 ///
+/// An error here must be known to precede COMMIT. Use [`record_atomic_commit`]
+/// when recording the result of the COMMIT attempt itself.
+///
 /// `status` is `committed` or `rolled_back`; `reason` is `ok` on success and otherwise
 /// `deadlock`, `cursor_missing` or `error`. Classification is text-based because this
 /// write path returns `String` errors (pre-existing); the label set is bounded to
@@ -62,6 +65,17 @@ pub fn record_atomic_batch(result: &Result<(), String>) {
     };
 
     ATOMIC_BATCHES_TOTAL.with_label_values(&[status, reason]).inc();
+}
+
+/// Record the result of attempting COMMIT. An error is an observation at the
+/// client, not proof that PostgreSQL rolled the transaction back.
+pub fn record_atomic_commit(result: &Result<(), String>) {
+    match result {
+        Ok(()) => record_atomic_batch(result),
+        Err(error) => ATOMIC_BATCHES_TOTAL
+            .with_label_values(&["commit_error", classify_atomic_batch_error(error)])
+            .inc(),
+    }
 }
 
 /// Maps an atomic-batch error text onto the bounded `reason` label set. Expects the

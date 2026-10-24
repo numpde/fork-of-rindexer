@@ -243,7 +243,7 @@ pub static DB_POOL_CONNECTIONS: Lazy<GaugeVec> = Lazy::new(|| {
 
 /// Atomic no-code batches: custom-table operations, their reorg journal rows, the raw
 /// event rows committed in one Postgres transaction, with the cursor when eligible.
-/// Labels: status (committed/rolled_back), reason (ok/deadlock/cursor_missing/error)
+/// Labels: status (committed/rolled_back/commit_error), reason (ok/deadlock/cursor_missing/error)
 pub static ATOMIC_BATCHES_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     register_counter_vec!(
         "rindexer_atomic_batches_total",

@@ -77,6 +77,13 @@ rindexer_rpc_request_duration_seconds_count{method="eth_getLogs",network="mainne
 `rindexer_atomic_batches_total{status,reason}` counts no-code PostgreSQL application
 transactions, including those whose cursor is published later by the dispatcher.
 It does not establish atomic delivery to other storage systems or streams.
+`status="committed"` means COMMIT succeeded at the client;
+`status="rolled_back"` means effect staging failed before COMMIT was attempted;
+`status="commit_error"` means COMMIT reported an error and may already have
+succeeded on the server. Do not infer rollback from `commit_error`. Downstream
+metric consumers must accept this additional status value. The counter starts
+when effect staging begins; receipt admission failures, preparation failures and
+duplicate-only no-ops are not counted.
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|

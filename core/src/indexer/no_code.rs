@@ -507,14 +507,17 @@ async fn apply_postgres_events(
     .await;
     let (committed, advance) = match staged {
         Ok(advance) => {
-            (transaction.commit().await.map_err(|error| pg_error_to_string(&error)), advance)
+            let committed = transaction.commit().await.map_err(|error| pg_error_to_string(&error));
+            db_metrics::record_atomic_commit(&committed);
+            (committed, advance)
         }
         Err(error) => {
             drop(transaction);
-            (Err(error), None)
+            let rejected = Err(error);
+            db_metrics::record_atomic_batch(&rejected);
+            (rejected, None)
         }
     };
-    db_metrics::record_atomic_batch(&committed);
     committed?;
     match (advance, cursor) {
         (Some(CursorAdvance::Advanced { updated_rows }), Some(cursor)) => debug!(
