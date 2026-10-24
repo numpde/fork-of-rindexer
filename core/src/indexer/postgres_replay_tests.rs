@@ -65,6 +65,18 @@ async fn client(url: &url::Url) -> Arc<PostgresClient> {
 
 impl Fixture {
     async fn new() -> Self {
+        Self::with_event(serde_json::to_value(params().event).unwrap(), "Contract").await
+    }
+
+    async fn new_trace() -> Self {
+        let mut definitions: Vec<serde_json::Value> =
+            serde_json::from_str(crate::indexer::native_transfer::NATIVE_TRANSFER_ABI).unwrap();
+        let mut fixture = Self::with_event(definitions.remove(0), "EvmTraces").await;
+        fixture.params.atomic_safe_concurrency = false;
+        fixture
+    }
+
+    async fn with_event(definition: serde_json::Value, contract: &str) -> Self {
         let (admin, container) = postgres_client().await;
         let mut url: url::Url = match container.as_ref() {
             Some(container) => format!(
@@ -82,16 +94,26 @@ impl Fixture {
         let client = client(&url).await;
         let directory = tempfile::tempdir().unwrap();
         let mut params = params();
-        let abi = serde_json::to_value(&params.event).unwrap();
+        params.event = serde_json::from_value(definition.clone()).unwrap();
+        params.event_info = crate::abi::EventInfo::new(
+            serde_json::from_value::<crate::abi::ABIItem>(definition.clone()).unwrap(),
+        )
+        .unwrap();
+        params.sql_column_names =
+            crate::database::postgres::generate::generate_column_names_only_with_base_properties(
+                &params.event_info.inputs,
+            );
+        params.contract_name = contract.to_string();
+        let abi = definition;
         std::fs::write(directory.path().join("abi.json"), serde_json::to_vec(&vec![abi]).unwrap())
             .unwrap();
         let manifest: crate::manifest::core::Manifest = serde_json::from_value(json!({
             "name": "Replay", "project_type": "no-code", "networks": [],
-            "contracts": [{"name": "Contract", "abi": "abi.json", "include_events": ["Value"],
+            "contracts": [{"name": contract, "abi": "abi.json", "include_events": [params.event_info.name],
                 "details": [{"network": "ethereum", "address": "0x0000000000000000000000000000000000000000"}],
                 "tables": [{"name": "totals", "global": true,
                     "columns": [{"name": "amount", "type": "uint256", "default": "0"}],
-                    "events": [{"event": "Value", "operations": [{"type": "upsert", "set": [{"column": "amount", "action": "add", "value": "$value"}]}]}]
+                    "events": [{"event": params.event_info.name, "operations": [{"type": "upsert", "set": [{"column": "amount", "action": "add", "value": "$value"}]}]}]
                 }]
             }]
         })).unwrap();
@@ -101,7 +123,8 @@ impl Fixture {
         params.indexer_name = manifest.name.clone();
         let schema =
             generate_indexer_contract_schema_name(&params.indexer_name, &params.contract_name);
-        params.sql_event_table_name = format!("{schema}.value");
+        params.sql_event_table_name =
+            format!("{schema}.{}", crate::helpers::camel_to_snake(&params.event_info.name));
         params.tables = Arc::new(
             manifest.contracts[0]
                 .tables
@@ -533,6 +556,98 @@ async fn postgres_unseen_history_behind_cursor_is_not_discarded() {
     drop(callback);
     fixture.finish().await;
     assert_eq!(position, (2, "3".to_string(), "1000".to_string()));
+}
+
+fn native_trace(
+    value: u64,
+    transaction: u8,
+    path: &[usize],
+) -> crate::event::callback_registry::TraceResult {
+    use alloy::{
+        primitives::{Address, Bytes, U256, U64},
+        rpc::types::trace::parity::{
+            Action, CallAction, CallType, LocalizedTransactionTrace, TransactionTrace,
+        },
+    };
+    let action = CallAction {
+        from: Address::repeat_byte(3),
+        to: Address::repeat_byte(4),
+        value: U256::from(value),
+        gas: 21_000,
+        input: Bytes::new(),
+        call_type: CallType::Call,
+    };
+    let trace = LocalizedTransactionTrace {
+        trace: TransactionTrace {
+            action: Action::Call(action.clone()),
+            result: None,
+            trace_address: path.to_vec(),
+            subtraces: 0,
+            error: None,
+        },
+        transaction_hash: Some(B256::repeat_byte(transaction)),
+        transaction_position: Some(0),
+        block_number: Some(2),
+        block_hash: Some(B256::repeat_byte(2)),
+    };
+    crate::event::callback_registry::TraceResult::new_debug_native_transfer(
+        &action,
+        &trace,
+        "ethereum",
+        1,
+        U64::from(2),
+        U64::from(2),
+    )
+}
+
+#[tokio::test]
+async fn postgres_native_transfer_replay_keeps_pg_effects_once_and_defers_cursor() {
+    let fixture = Fixture::new_trace().await;
+    let callback = no_code_callback(Arc::new(fixture.params.clone())).trace_callback;
+    let traces = vec![native_trace(1, 1, &[]), native_trace(2, 2, &[])];
+    callback(traces.clone()).await.unwrap();
+    callback(traces).await.unwrap();
+    let position = fixture.position().await;
+    drop(callback);
+    fixture.finish().await;
+    assert_eq!(position, (2, "3".to_string(), "0".to_string()));
+}
+
+#[tokio::test]
+async fn postgres_internal_transfers_in_one_transaction_keep_distinct_trace_paths() {
+    let fixture = Fixture::new_trace().await;
+    let callback = no_code_callback(Arc::new(fixture.params.clone())).trace_callback;
+    callback(vec![native_trace(1, 1, &[0]), native_trace(2, 1, &[1])]).await.unwrap();
+    callback(vec![native_trace(2, 1, &[1]), native_trace(3, 1, &[2])]).await.unwrap();
+    let position = fixture.position().await;
+    drop(callback);
+    fixture.finish().await;
+    assert_eq!(
+        position,
+        (3, "6".to_string(), "0".to_string()),
+        "synthetic log_index=0 cannot identify different internal calls"
+    );
+}
+
+#[tokio::test]
+async fn postgres_trace_with_zero_hash_rejects_the_whole_batch_before_effects() {
+    let fixture = Fixture::new_trace().await;
+    let callback = no_code_callback(Arc::new(fixture.params.clone())).trace_callback;
+    let mut invalid = native_trace(2, 1, &[1]);
+    if let crate::event::callback_registry::TraceResult::NativeTransfer { tx_information, .. } =
+        &mut invalid
+    {
+        tx_information.block_hash = B256::ZERO;
+    }
+    let result = callback(vec![native_trace(1, 1, &[0]), invalid]).await;
+    let position = fixture.position().await;
+    drop(callback);
+    fixture.finish().await;
+    assert!(
+        matches!(result, Err(crate::event::callback_registry::CallbackError::Permanent(_))),
+        "a zero-hash placeholder is not an admissible mined trace identity"
+    );
+    assert_eq!(position, (0, "0".to_string(), "0".to_string()));
 }
 
 #[tokio::test]

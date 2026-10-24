@@ -1055,6 +1055,52 @@ mod tests {
         assert!(result.is_ok(), "Consumer should succeed when a native transfer block is present");
     }
 
+    async fn assert_missing_native_metadata_is_an_error(field: &str) {
+        use alloy::rpc::types::BlockTransactions;
+        use futures::FutureExt;
+        let mut block =
+            make_block_with_native_transfer(42, Address::ZERO, Address::repeat_byte(1), U256::ONE);
+        let BlockTransactions::Full(transactions) = &mut block.transactions else {
+            panic!("full transaction fixture");
+        };
+        match field {
+            "block_number" => transactions[0].block_number = None,
+            "block_hash" => transactions[0].block_hash = None,
+            "transaction_index" => transactions[0].transaction_index = None,
+            _ => panic!("unknown fixture field"),
+        }
+        let provider = Arc::new(MockChainProvider::new(1).with_blocks(vec![block]));
+        let config = make_trace_config_async().await;
+        let outcome = std::panic::AssertUnwindSafe(native_transfer_block_consumer(
+            provider,
+            &[U64::from(42)],
+            "ethereum",
+            &config,
+        ))
+        .catch_unwind()
+        .await;
+        let error = outcome
+            .expect("incomplete RPC metadata must not panic the indexing task")
+            .expect_err("incomplete mined transaction metadata cannot be checkpointed");
+        assert!(error.to_string().contains(field), "diagnostic identifies the missing field");
+        assert_eq!(crate::indexer::task_tracker::active_indexing_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn missing_native_block_number_returns_error_without_panic() {
+        assert_missing_native_metadata_is_an_error("block_number").await;
+    }
+
+    #[tokio::test]
+    async fn missing_native_block_hash_returns_error_without_panic() {
+        assert_missing_native_metadata_is_an_error("block_hash").await;
+    }
+
+    #[tokio::test]
+    async fn missing_native_transaction_index_returns_error_without_panic() {
+        assert_missing_native_metadata_is_an_error("transaction_index").await;
+    }
+
     #[test]
     fn zksync_system_contracts_list() {
         // Verify the system contract addresses are valid and contain expected count
