@@ -10,4 +10,7 @@ pub mod sql_type_wrapper;
 mod signed_integer_tests;
 
 #[cfg(test)]
+mod signed_integer_array_tests;
+
+#[cfg(test)]
 mod unsigned_integer_tests;
