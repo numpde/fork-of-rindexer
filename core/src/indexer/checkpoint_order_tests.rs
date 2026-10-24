@@ -192,6 +192,89 @@ fn delayed_callback(
     })
 }
 
+#[test]
+fn cancelled_empty_dependency_checkpoint_releases_active_task() {
+    use super::{live_indexing_for_contract_event_dependencies, EventDependenciesIndexingConfig};
+    use alloy::{
+        network::{AnyHeader, AnyRpcBlock, AnyRpcHeader},
+        rpc::types::{Block, BlockTransactions},
+    };
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    let (release, held) = std::sync::mpsc::channel();
+    let (started, ready) = std::sync::mpsc::sync_channel(0);
+    // Keep Tokio's only blocking worker occupied so the real checkpoint file
+    // open must suspend. Cancellation then needs no timing or storage mock.
+    let worker = runtime.spawn_blocking(move || {
+        started.send(()).unwrap();
+        let _ = held.recv();
+    });
+    ready.recv_timeout(Duration::from_secs(5)).unwrap();
+    runtime.block_on(async {
+        let mut fixture = Fixture::new(Arc::new(|_| {
+            async { panic!("empty bloom must skip event handlers") }.boxed()
+        }))
+        .await;
+        let block = AnyRpcBlock::new(
+            Block::new(
+                AnyRpcHeader::from_sealed(
+                    AnyHeader { number: 2, ..Default::default() }.seal(B256::repeat_byte(2)),
+                ),
+                BlockTransactions::Full(vec![]),
+            )
+            .into(),
+        );
+        let provider = Arc::new(MockChainProvider::new(1).with_blocks(vec![block]));
+        let EventProcessingConfig::ContractEventProcessing(config) =
+            Arc::get_mut(&mut fixture.config).unwrap()
+        else {
+            panic!("ordinary event fixture");
+        };
+        let network = Arc::make_mut(&mut config.network_contract);
+        network.cached_provider = provider.clone();
+        network.block_clock = BlockClock::new(None, None, provider.clone());
+        let filter = fixture
+            .config
+            .to_event_filter()
+            .unwrap()
+            .set_from_block(U64::from(1))
+            .set_to_block(U64::from(1));
+        let mut indexing = Box::pin(live_indexing_for_contract_event_dependencies(
+            EventDependenciesIndexingConfig {
+                network: "ethereum".to_string(),
+                cached_provider: provider,
+                events: vec![(fixture.config.clone(), filter)],
+                reorg_coordinator: None,
+                trace_registry: None,
+            },
+        ));
+        let suspended = futures::poll!(indexing.as_mut());
+        let active_before_cancel = active_indexing_count();
+        drop(indexing);
+        let active_after_cancel = active_indexing_count();
+        release.send(()).unwrap();
+        worker.await.unwrap();
+        assert!(suspended.is_pending());
+        assert_eq!(
+            active_before_cancel, 1,
+            "cancel while the actual empty-range checkpoint is active"
+        );
+        assert_eq!(
+            active_after_cancel, 0,
+            "cancelled checkpoints must not hold graceful shutdown open"
+        );
+        assert_eq!(
+            fixture.cursor(),
+            "1",
+            "cancellation happened while opening the old cursor for reading"
+        );
+    });
+}
+
 async fn assert_later_checkpoint_waits(empty: bool) {
     let first_started = Arc::new(Notify::new());
     let release_first = Arc::new(Notify::new());
