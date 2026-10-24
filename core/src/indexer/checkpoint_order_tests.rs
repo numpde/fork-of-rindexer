@@ -171,6 +171,53 @@ impl Fixture {
     }
 }
 
+#[tokio::test]
+async fn buffered_reorg_batch_cannot_run_callbacks_or_checkpoint() {
+    assert_buffered_reorg_batch_is_rejected(false).await;
+}
+
+#[tokio::test]
+async fn buffered_empty_reorg_batch_cannot_checkpoint() {
+    assert_buffered_reorg_batch_is_rejected(true).await;
+}
+
+async fn assert_buffered_reorg_batch_is_rejected(empty: bool) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use futures::StreamExt;
+    use crate::indexer::reorg::{
+        BlockChainWindow, ReorgBlockHashPersistence, ReorgContext, ReorgCoordinator,
+    };
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let callback_calls = calls.clone();
+    let mut fixture = Fixture::new(Arc::new(move |_| {
+        callback_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Ok(()) })
+    })).await;
+    let mut stream = crate::indexer::fetch_logs::fetch_logs_stream(
+        fixture.config.clone(), true, None, None,
+    );
+    let mut batch = timeout(Duration::from_secs(5), stream.next()).await
+        .expect("fetch completes").expect("fetched batch").expect("valid batch");
+    assert!(!batch.logs.is_empty(), "exercise actual fetched logs");
+    if empty { batch.logs.clear(); }
+    // Hold the fetched batch outside dispatch until rollback is complete.
+    let mut coordinator = ReorgCoordinator::new(
+        "ethereum".to_string(), BlockChainWindow::try_new(20).unwrap(),
+        Arc::new(ReorgBlockHashPersistence::new(None, None)),
+        fixture.config.network_contract().cached_provider.clone(), vec![], vec![], vec![],
+    ).unwrap();
+    let task = coordinator.try_create_reorg_task_for_block_range(2, 10).unwrap();
+    coordinator.handle_reorg(task, &ReorgContext {
+        postgres: None, clickhouse: None, registry: None, trace_registry: None,
+    }).await.unwrap();
+    handle_logs_result(fixture.config.clone(), fixture.permits.clone(),
+        &mut fixture.checkpoints, Ok(batch)).await.expect("discard stale batch")
+        .await.expect("dispatch completes");
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "orphaned work must never reach effects");
+    assert_eq!(fixture.cursor(), "1", "orphaned work cannot checkpoint");
+}
+
 fn delayed_callback(
     first_started: Arc<Notify>,
     release_first: Arc<Notify>,
