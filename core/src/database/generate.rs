@@ -360,6 +360,7 @@ pub fn generate_tables_for_indexer_sql(
     let mut sql = "CREATE SCHEMA IF NOT EXISTS rindexer_internal;".to_string();
     sql.push_str(&generate_reorg_block_hashes_table_sql());
     sql.push_str(&generate_derived_op_log_table_sql());
+    sql.push_str(crate::database::postgres::event_applications::schema_sql());
 
     for contract in &indexer.contracts {
         let contract_name = contract.before_modify_name_if_filter_readonly();
@@ -545,10 +546,15 @@ pub fn compact_table_name_if_needed(table_name: String) -> String {
 }
 
 pub fn drop_tables_for_indexer_sql(project_path: &Path, indexer: &Indexer) -> Code {
-    let mut sql = format!(
+    // Receipt metadata can be absent on databases created before replay-safe
+    // writes. Initialize the internal schema before this explicit destructive
+    // reset so namespace cleanup is valid for both old and new databases.
+    let mut sql = "CREATE SCHEMA IF NOT EXISTS rindexer_internal;".to_string();
+    sql.push_str(crate::database::postgres::event_applications::schema_sql());
+    sql.push_str(&format!(
         "DROP TABLE IF EXISTS rindexer_internal.{}_last_known_indexes_dropping_sql CASCADE;",
         camel_to_snake(&indexer.name)
-    );
+    ));
     sql.push_str(format!("DROP TABLE IF EXISTS rindexer_internal.{}_last_known_relationship_dropping_sql CASCADE;", camel_to_snake(&indexer.name)).as_str());
 
     sql.push_str("DROP TABLE IF EXISTS rindexer_internal.latest_block;");
@@ -557,6 +563,10 @@ pub fn drop_tables_for_indexer_sql(project_path: &Path, indexer: &Indexer) -> Co
         let contract_name = contract.before_modify_name_if_filter_readonly();
         let schema_name = generate_indexer_contract_schema_name(&indexer.name, &contract_name);
         sql.push_str(format!("DROP SCHEMA IF EXISTS {schema_name} CASCADE;").as_str());
+        // Keep the ownership mapping because compact cursor namespaces cannot
+        // be reversed, and the ABI may have changed since receipts were written.
+        let receipt_schema = schema_name.replace('\'', "''");
+        sql.push_str(&format!("DELETE FROM rindexer_internal.event_application_streams WHERE split_part(raw_table, '.', 1) = '{receipt_schema}';"));
 
         // drop last synced blocks for contracts
         let abi_items = ABIItem::read_abi_items(project_path, contract);

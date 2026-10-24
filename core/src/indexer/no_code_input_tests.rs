@@ -224,6 +224,13 @@ pub(super) async fn postgres_client(
         }
         Arc::new(result.expect("fixture client"))
     };
+    postgres
+        .batch_execute(&format!(
+            "CREATE SCHEMA IF NOT EXISTS rindexer_internal; {}",
+            crate::database::postgres::event_applications::schema_sql()
+        ))
+        .await
+        .expect("prepare receipt metadata");
     (postgres, container)
 }
 

@@ -668,6 +668,26 @@ impl PostgresClient {
         all_affected_tx_hashes.sort();
         all_affected_tx_hashes.dedup();
 
+        // This public rollback API also serves databases predating event receipts.
+        // When present, release only the affected stream/range in the very same
+        // transaction as raw deletion, derived reversal and cursor rewind.
+        let has_receipts: bool = transaction
+            .query_one(
+                "SELECT to_regclass('rindexer_internal.event_applications') IS NOT NULL",
+                &[],
+            )
+            .await?
+            .get(0);
+        if has_receipts {
+            for namespace in checkpoint_tables {
+                transaction.execute(
+                    "DELETE FROM rindexer_internal.event_applications
+                     WHERE namespace = $1 AND network = $2 AND block_number >= $3 AND block_number <= $4",
+                    &[namespace, &network, &fork_point_decimal, &detection_point_decimal],
+                ).await?;
+            }
+        }
+
         // 2. Delete stale entries from rindexer_internal.reorg_block_hashes
         let delete_reorg_hashes_query = "DELETE FROM rindexer_internal.reorg_block_hashes \
              WHERE network = $1 AND block_number >= $2 AND block_number <= $3";

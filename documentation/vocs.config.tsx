@@ -240,6 +240,10 @@ export default defineConfig({
           text: "Terminal Indexing Failures",
           link: "/docs/migrations/terminal-event-failures",
         },
+        {
+          text: "PostgreSQL Event Replay",
+          link: "/docs/migrations/postgres-event-replay",
+        },
       ],
     },
     {

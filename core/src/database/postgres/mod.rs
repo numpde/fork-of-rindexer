@@ -1,5 +1,6 @@
 pub mod batch_operations;
 pub mod client;
+pub(crate) mod event_applications;
 pub mod generate;
 pub mod indexes;
 pub mod migrations;

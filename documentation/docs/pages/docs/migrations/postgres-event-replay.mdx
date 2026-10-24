@@ -1,0 +1,83 @@
+# PostgreSQL event replay receipts
+
+Serialized no-code contract-event indexing can now retry a PostgreSQL COMMIT with
+an unknown outcome without duplicating its raw events or applying derived
+operations again. This includes a connection failure after PostgreSQL commits but
+before the client receives confirmation.
+
+## Supported path
+
+This guarantee currently applies when PostgreSQL stores raw contract events and
+is the only configured sink: no ClickHouse, CSV, streams or chat clients. Effective
+callback concurrency must be one, either through `index_event_in_order` or
+`config.callback_concurrency` (whose default remains one). Factory discovery,
+native-transfer/block traces, custom Rust callbacks, and the other no-code
+configuration paths retain their previous replay behavior. Use one writer process;
+this change does not coordinate cursor publication between independent processes.
+
+A receipt identifies the event stream namespace, network, block hash, transaction
+hash and log index. The receipt, selected raw rows, derived-table operations and
+cursor commit in one transaction. Only newly claimed events enter aggregation,
+so regrouping an overlapping batch does not reapply old additions. A transaction
+failure rolls back its claims too. A cursor already ahead of an unseen event does
+not suppress that event.
+
+The supported reorg rollback deletes affected receipts in the same transaction as
+raw deletion, derived reversal and cursor rewind. Canonical events can then be
+applied again. The existing explicit `drop_each_run` reset removes receipt history
+for the schemas it drops. It remains destructive and should not be enabled as an
+automatic upgrade workaround.
+Tables in separately managed schemas still require coordinated cleanup; resetting
+the contract schema alone does not establish that shared derived data was rebuilt.
+
+## Existing data and configuration changes
+
+Stop all writers and back up the database before upgrading. An existing raw table
+with data and no initialized receipt history now causes a permanent stream failure
+when entering the supported path. Review the error log and health response. New
+receipt tables are created automatically, but old raw rows are not automatically
+treated as proof that their derived effects completed correctly.
+
+The supported recovery is a reviewed rebuild into a clean database from trusted
+logs, including raw events, derived tables and progress. Check any earlier unsigned
+integer migration requirements as part of that rebuild. There is no automatic
+receipt-backfill or historical-corruption repair command. Do not initialize receipt
+metadata manually merely to bypass the guard. If you retain or import existing data,
+you must independently reconcile every affected derived result and establish a
+consistent replay boundary; that migration is not automated here.
+
+Once a stream has receipt history, switching it to an untracked PostgreSQL path
+also fails permanently before writing. Keep its supported configuration or perform
+a reviewed migration. This prevents adding another sink or increasing concurrency
+from silently mixing tracked and untracked writes, then making later retries
+ambiguous. Other event streams can continue.
+
+Restore raw rows, derived rows, cursor and receipt metadata from the same consistent
+backup point. Manually dropping or editing just one of them is unsupported. Keep
+direct SQL writers and custom callbacks from writing into these managed tables.
+Changes that require recomputing historical derived operations require a coordinated
+rebuild of the associated receipt history too.
+
+## Storage and runtime cost
+
+The internal tables are `rindexer_internal.event_application_streams` and
+`rindexer_internal.event_applications`. The first maps namespaces to their raw
+table for lifecycle cleanup; the second stores one durable receipt per applied
+event, with identity and block-range indexes. Storage grows with indexed events.
+There is no automatic retention or pruning policy; deleting receipts alone can
+permit repeated effects.
+
+Preparing derived operations may perform RPC reads while holding the transaction's
+connection and receipt locks. A preparation failure rolls the transaction back.
+This tradeoff keeps event selection ahead of aggregation without changing
+operation order or public table-operation APIs. It does not make independent
+storage systems or downstream publications atomic.
+On this path, the existing `INDEXED` log counts newly applied events. A replay with
+no new events emits no `INDEXED` line. Input-oriented engine metrics still count
+callback inputs and are not proof of distinct database effects.
+
+Contributors can run `make tests/postgres-replay/docker`. Its real PostgreSQL wire
+proxy withholds a COMMIT response only after the server commits; the test reads
+the database independently before retrying. Native upstream execution is
+`cargo nextest run -p rindexer --lib -E 'test(/postgres_replay_tests::/)'`, with Docker
+available for Testcontainers.

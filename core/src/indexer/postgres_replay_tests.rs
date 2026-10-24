@@ -37,6 +37,7 @@ struct Fixture {
     params: NoCodeCallbackParams,
     database: String,
     url: url::Url,
+    indexer: crate::indexer::Indexer,
     _directory: tempfile::TempDir,
     _container: Option<testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>>,
 }
@@ -94,8 +95,8 @@ impl Fixture {
                 }]
             }]
         })).unwrap();
-        let ddl = generate_tables_for_indexer_sql(directory.path(), &manifest.to_indexer(), false)
-            .unwrap();
+        let indexer = manifest.to_indexer();
+        let ddl = generate_tables_for_indexer_sql(directory.path(), &indexer, false).unwrap();
         client.batch_execute(ddl.as_str()).await.unwrap();
         params.indexer_name = manifest.name.clone();
         let schema =
@@ -112,7 +113,16 @@ impl Fixture {
                 .collect(),
         );
         params.postgres = Some(client.clone());
-        Self { admin, client, params, database, url, _directory: directory, _container: container }
+        Self {
+            admin,
+            client,
+            params,
+            database,
+            url,
+            indexer,
+            _directory: directory,
+            _container: container,
+        }
     }
 
     fn events(&self, values: &[u64]) -> Vec<EventResult> {
@@ -325,6 +335,63 @@ async fn postgres_concurrent_replays_apply_effects_once() {
     fixture.finish().await;
     first.unwrap();
     second.unwrap();
+    assert_eq!(position, (2, "3".to_string(), "2".to_string()));
+}
+
+#[tokio::test]
+async fn postgres_copy_replay_can_filter_down_to_the_insert_path() {
+    let fixture = Fixture::new().await;
+    let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+    callback(fixture.events(&(1..=150).collect::<Vec<_>>())).await.unwrap();
+    callback(fixture.events(&(75..=175).collect::<Vec<_>>())).await.unwrap();
+    callback(fixture.events(&(1..=175).collect::<Vec<_>>())).await.unwrap();
+    let position = fixture.position().await;
+    drop(callback);
+    fixture.finish().await;
+    assert_eq!(position, (175, "15400".to_string(), "2".to_string()));
+}
+
+#[tokio::test]
+async fn postgres_explicit_reset_clears_receipts_before_rebuilding_history() {
+    let fixture = Fixture::new().await;
+    let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+    callback(fixture.events(&[1, 2])).await.unwrap();
+    // Reset must use stored ownership, not assume the old event is still in a
+    // readable ABI when its schema and application history are removed.
+    let abi = fixture._directory.path().join("abi.json");
+    let saved = fixture._directory.path().join("saved-abi.json");
+    std::fs::rename(&abi, &saved).unwrap();
+    let drop_sql = crate::database::generate::drop_tables_for_indexer_sql(
+        fixture._directory.path(),
+        &fixture.indexer,
+    );
+    fixture.client.batch_execute(drop_sql.as_str()).await.unwrap();
+    std::fs::rename(saved, abi).unwrap();
+    let create_sql =
+        generate_tables_for_indexer_sql(fixture._directory.path(), &fixture.indexer, false)
+            .unwrap();
+    fixture.client.batch_execute(create_sql.as_str()).await.unwrap();
+    callback(fixture.events(&[1, 2])).await.unwrap();
+    let position = fixture.position().await;
+    drop(callback);
+    fixture.finish().await;
+    assert_eq!(position, (2, "3".to_string(), "2".to_string()));
+}
+
+#[tokio::test]
+async fn postgres_configuration_cannot_switch_receipted_stream_to_untracked_writes() {
+    let fixture = Fixture::new().await;
+    let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+    callback(fixture.events(&[1, 2])).await.unwrap();
+    drop(callback);
+    let mut untracked = fixture.params.clone();
+    untracked.atomic_safe_concurrency = false;
+    let callback = no_code_callback(Arc::new(untracked)).event_callback;
+    let result = callback(fixture.events(&[1, 2])).await;
+    let position = fixture.position().await;
+    drop(callback);
+    fixture.finish().await;
+    assert!(matches!(result, Err(crate::event::callback_registry::CallbackError::Permanent(_))));
     assert_eq!(position, (2, "3".to_string(), "2".to_string()));
 }
 

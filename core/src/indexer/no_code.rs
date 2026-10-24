@@ -707,6 +707,7 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
             // requires a SINGLE writer process and effective callback concurrency 1
             // (the default; see trigger_event in process.rs).
             let atomic_pg_cursor = params.store_raw_events
+                && matches!(&results, CallbackResult::Event(_))
                 && params.postgres.is_some()
                 && params.clickhouse.is_none()
                 && params.csv.is_none()
@@ -723,37 +724,42 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
                 // exactly-once needs serialized batch commits (see field docs).
                 && params.atomic_safe_concurrency;
 
-            // ORDERING CONTRACT (two arms):
-            //   ATOMIC arm (postgres sole raw sink, non-factory, serialized
-            //   commits): table operations are PREPARED first (RPC prefetch,
-            //   iterate fan-out, value resolution; no database access), then
-            //   ONE shutdown check, then ONE Postgres transaction covers, in
-            //   order: every custom-table statement, its reorg journal row
-            //   (under a savepoint, best-effort), the raw event rows and the
-            //   last_synced_block cursor. No checkpoint and no shutdown check
-            //   sits inside the transaction: once BEGIN happened the batch
-            //   either commits whole or rolls back whole. A failure anywhere
-            //   before COMMIT (crash, SIGTERM, deadlock, pool timeout, missing
-            //   cursor row) leaves nothing behind, so trigger_event's
-            //   whole-batch retry is exactly-once. Documented residual: a
-            //   COMMIT whose acknowledgement is lost on the wire (the server
-            //   committed, the client saw an error and retries) is
-            //   at-least-once for that window only.
-            //   LEGACY arm (CH/CSV alongside PG, factory discovery events,
-            //   concurrency > 1, or no PG): the ORIGINAL ordering, raw sinks
-            //   first and table ops after, so a transient raw-sink failure
-            //   retries BEFORE table ops ran. Insert-type table ops are
-            //   append-only (no dedup) and arithmetic upserts are not
-            //   idempotent, so re-running them on every callback retry would
-            //   duplicate/double-apply. Cursor advance stays with the async
-            //   task after the callback succeeds (at-least-once, pre-existing
-            //   semantics).
-            // Streams/chat run after either arm and deliberately never propagate
-            // errors (see the stream error arm below).
+            // Receipt claims, selected derived effects, raw rows and cursor share
+            // one transaction. Filter before preparing table operations so an
+            // overlapping replay cannot contribute old values to an aggregate.
+            // Preparation may make RPC calls while holding this connection; its
+            // failure drops the transaction and releases the uncommitted claims.
+            // Other sink/configuration paths retain their existing semantics.
             let run_table_ops = !params.tables.is_empty() && !table_events_data.is_empty();
 
             if atomic_pg_cursor {
-                // Prepare (RPC, fan-out, value resolution); nothing is written yet.
+                if !is_running() {
+                    return Err("Shutdown requested".into());
+                }
+                let postgres = params.postgres.as_ref().expect("atomic eligibility requires PostgreSQL");
+                let schema = generate_indexer_contract_schema_name(&params.indexer_name, &params.contract_name);
+                let cursor = BulkCursorUpdate {
+                    internal_table_name: generate_internal_event_table_name(&schema, &params.event_info.name),
+                    network: network.clone(), to_block: to_block.to(),
+                };
+                // The transaction drops before its pooled connection on every exit.
+                let mut conn = postgres.raw_connection().await.map_err(|error| error.to_string())?;
+                let tx = conn.transaction().await.map_err(|error| pg_error_to_string(&error))?;
+                let CallbackResult::Event(events) = &results else {
+                    unreachable!("atomic eligibility requires contract events");
+                };
+                let selected = crate::database::postgres::event_applications::claim(
+                    &tx, &cursor.internal_table_name, &params.sql_event_table_name, events,
+                ).await?;
+                if !selected.iter().any(|selected| *selected) {
+                    return Ok(());
+                }
+                sql_bulk_data = sql_bulk_data.into_iter().zip(&selected)
+                    .filter_map(|(row, selected)| selected.then_some(row)).collect();
+                indexed_count = sql_bulk_data.len();
+                table_events_data = table_events_data.into_iter().zip(&selected)
+                    .filter_map(|(event, selected)| selected.then_some(event)).collect();
+
                 let prepared = if run_table_ops {
                     match prepare_table_operations(
                         &params.tables,
@@ -789,35 +795,11 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
                 let write_raw_rows = params.store_raw_events && !sql_bulk_data.is_empty();
 
                 if !prepared.ops.is_empty() || write_raw_rows {
-                    // The ONLY shutdown check after prepare; none after BEGIN.
+                    // Claims remain uncommitted: shutdown here drops them before
+                    // any derived or raw writes start.
                     if !is_running() {
                         return Err("Shutdown requested".into());
                     }
-
-                    // Never expect()/unwrap() here: a panic skips
-                    // indexing_event_processed() and hangs shutdown.
-                    let Some(postgres) = params.postgres.as_ref() else {
-                        return Err("atomic arm requires a Postgres client".into());
-                    };
-
-                    let schema = generate_indexer_contract_schema_name(
-                        &params.indexer_name,
-                        &params.contract_name,
-                    );
-                    let cursor = BulkCursorUpdate {
-                        internal_table_name: generate_internal_event_table_name(
-                            &schema,
-                            &params.event_info.name,
-                        ),
-                        network: network.clone(),
-                        to_block: to_block.to(),
-                    };
-
-                    // `conn` is declared before `tx`: the transaction drops first
-                    // (enqueuing ROLLBACK) and only then does bb8 get the
-                    // connection back.
-                    let mut conn = postgres.raw_connection().await.map_err(|e| e.to_string())?;
-                    let tx = conn.transaction().await.map_err(|e| pg_error_to_string(&e))?;
 
                     let staged: Result<Option<CursorAdvance>, String> = async {
                         if let Err(e) = apply_table_operations(
@@ -894,6 +876,13 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
                     }
                 }
             } else {
+                if params.store_raw_events {
+                    if let Some(postgres) = &params.postgres {
+                        let schema = generate_indexer_contract_schema_name(&params.indexer_name, &params.contract_name);
+                        let namespace = generate_internal_event_table_name(&schema, &params.event_info.name);
+                        crate::database::postgres::event_applications::require_untracked_stream(postgres, &namespace).await?;
+                    }
+                }
                 // LEGACY arm — original ordering + original semantics.
                 if params.store_raw_events {
                     if let Some(postgres) = &params.postgres {
