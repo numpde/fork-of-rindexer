@@ -34,9 +34,9 @@ use crate::{
     provider::mock::MockChainProvider,
 };
 
-struct Fixture {
+pub(crate) struct Fixture {
     directory: TempDir,
-    config: Arc<EventProcessingConfig>,
+    pub(crate) config: Arc<EventProcessingConfig>,
     permits: Arc<Semaphore>,
     checkpoints: CallbackCheckpoints,
 }
@@ -57,7 +57,7 @@ impl Fixture {
         .await
     }
 
-    async fn with_logs(callback: EventCallbackType, logs: Vec<Log>) -> Self {
+    pub(crate) async fn with_logs(callback: EventCallbackType, logs: Vec<Log>) -> Self {
         let directory = tempfile::tempdir().expect("checkpoint directory");
         let provider = Arc::new(MockChainProvider::new(1).with_block_number(10).with_logs(logs));
         let network = NetworkContract {

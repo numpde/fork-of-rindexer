@@ -2855,6 +2855,77 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn delayed_parallel_worker_keeps_the_generation_of_its_range_plan() {
+        use crate::indexer::{
+            process::checkpoint_order_tests::Fixture,
+            reorg::{BlockChainWindow, ReorgBlockHashPersistence},
+        };
+        let fixture = Fixture::with_logs(
+            Arc::new(|_| Box::pin(async { Ok(()) })),
+            vec![Log { block_number: Some(2), ..Default::default() }],
+        )
+        .await;
+        // The range was planned before rollback, but its worker was not scheduled yet.
+        let planned_generation = crate::indexer::reorg::reorg_generation("ethereum");
+        let state = WorkerState {
+            sequence_id: 0,
+            filter: RindexerEventFilter::empty_for_test()
+                .set_from_block(U64::from(1))
+                .set_to_block(U64::from(10)),
+            max_block_range_limitation: None,
+            original_max_limit: None,
+        };
+        let provider = Arc::new(MockChainProvider::new(1).with_blocks(vec![tip_block(
+            1,
+            hash_of(1),
+            Bloom::ZERO,
+        )]));
+        let mut coordinator = ReorgCoordinator::new(
+            "ethereum".to_string(),
+            BlockChainWindow::try_new(20).unwrap(),
+            Arc::new(ReorgBlockHashPersistence::new(None, None)),
+            provider,
+            vec![],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let task = coordinator.try_create_reorg_task_for_block_range(1, 1).unwrap();
+        coordinator
+            .handle_reorg(
+                task,
+                &ReorgContext {
+                    postgres: None,
+                    clickhouse: None,
+                    registry: None,
+                    trace_registry: None,
+                },
+            )
+            .await
+            .unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        parallel_worker(
+            fixture.config.clone(),
+            state,
+            tx,
+            CancellationToken::new(),
+            Arc::new(AdaptiveConcurrency::new(1, 1, 1)),
+            Arc::new(AtomicUsize::new(1)),
+            Arc::new(tokio::sync::Notify::new()),
+        )
+        .await;
+        let batch = rx.recv().await.unwrap();
+        assert!(!batch.results.is_empty());
+        for result in batch.results {
+            assert_eq!(
+                result.unwrap().reorg_generation,
+                planned_generation,
+                "a delayed worker must not relabel an obsolete range plan with the new generation"
+            );
+        }
+    }
+
     type TipAnswer = (Duration, Result<Vec<Log>, String>);
 
     /// Scripted unfiltered answers per block for the shared fetcher. An exhausted queue repeats
