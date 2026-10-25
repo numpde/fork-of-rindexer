@@ -116,10 +116,10 @@ case "$1" in
     ;;
   nested-arrays)
     cargo nextest run --frozen -p rindexer --lib --no-run \
-      -E 'test(/^database::nested_array_tests::/) & not test(/::postgres_/)'
+      -E '(test(/^database::nested_array_tests::/) & not test(/::postgres_/)) | test(/^database::sql_type_wrapper::tests::test_.*tuple/)'
     exec timeout --signal=TERM --kill-after=20s 900s cargo nextest run --frozen \
       -p rindexer --lib --no-fail-fast --no-capture \
-      -E 'test(/^database::nested_array_tests::/) & not test(/::postgres_/)'
+      -E '(test(/^database::nested_array_tests::/) & not test(/::postgres_/)) | test(/^database::sql_type_wrapper::tests::test_.*tuple/)'
     ;;
   nested-arrays-compile)
     exec cargo nextest run --frozen -p rindexer --lib --no-run \
