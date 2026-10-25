@@ -78,6 +78,7 @@ pub use futures::FutureExt;
 pub use indexer::no_code::resolve_table_column_types;
 pub use lazy_static::lazy_static;
 pub use reqwest::header::HeaderMap;
+pub use serde_json;
 pub use start::{
     start_rindexer, start_rindexer_no_code, IndexerNoCodeDetails, IndexingDetails, StartDetails,
     StartNoCodeDetails,

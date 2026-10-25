@@ -513,3 +513,8 @@ tests/array-shapes/postgres: tests/posture ## Read back fixed and direct nested 
 	$(compose) run --rm --no-deps -T offline array-shapes-compile
 	$(compose) up -d --no-build --pull never --wait --wait-timeout 90 postgres
 	$(compose) run --rm --no-deps -T postgres-tests array-shapes-postgres
+
+.PHONY: codegen/arrays/check
+codegen/arrays/check: tests/posture ## Compile generated Rust handlers for fixed and nested ABI arrays in a disposable example
+	@$(call offline_runner,$$dependency_image)
+	$(compose) run --rm --no-deps -T offline array-bindings

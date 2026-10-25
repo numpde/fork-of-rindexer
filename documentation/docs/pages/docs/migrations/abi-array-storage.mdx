@@ -42,3 +42,9 @@ changing column types alone does not repair history. See
 [PostgreSQL event replay](/docs/migrations/postgres-event-replay) for receipt and
 rebuild boundaries. Keep indexing stopped until schema and history are consistent.
 The upgrade does not migrate existing columns or repair previous data automatically.
+
+For Rust projects, regenerate typings with `rindexer codegen typings`. Regenerate
+array storage handlers with `rindexer codegen indexer` after preserving your custom
+handler logic; review and reapply that logic before restarting. Generated handlers
+now convert fixed arrays into vectors and nested primitive arrays into JSON values.
+No extra dependency is needed in generated projects.

@@ -4,7 +4,9 @@ use serde_json::Value;
 
 use super::{GENERATED_ALLOW_ATTRS, GENERATED_FILE_HEADER};
 use crate::abi::AbiProperty;
-use crate::helpers::{is_irregular_width_solidity_integer_type, is_solidity_static_bytes_type};
+use crate::helpers::{
+    is_irregular_width_solidity_integer_type, is_solidity_static_bytes_type, solidity_type_parts,
+};
 use crate::{
     abi::{
         ABIInput, ABIItem, CreateCsvFileForEvent, EventInfo, GenerateAbiPropertiesType,
@@ -690,6 +692,24 @@ pub fn generate_event_input_path(property: &AbiProperty) -> (String, bool) {
     (full_path, is_array)
 }
 
+fn array_json_expression(path: &str, base_type: &str, dimensions: usize) -> String {
+    if dimensions > 0 {
+        let inner = array_json_expression("item", base_type, dimensions - 1);
+        return format!(
+            "rindexer::serde_json::Value::Array({path}.iter().map(|item| {inner}).collect())"
+        );
+    }
+    match base_type {
+        "bool" => format!("rindexer::serde_json::Value::Bool(*{path})"),
+        "string" => format!("rindexer::serde_json::Value::String({path}.clone())"),
+        "address" => format!("rindexer::serde_json::Value::String(format!(\"{{{path}:?}}\"))"),
+        t if t.starts_with("bytes") => {
+            format!("rindexer::serde_json::Value::String(format!(\"{{{path}:#x}}\"))")
+        }
+        _ => format!("rindexer::serde_json::Value::String({path}.to_string())"),
+    }
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum GenerateEventHandlersError {
     #[error("{0}")]
@@ -757,11 +777,13 @@ use super::super::super::typings::{indexer_name_formatted}::events::{handler_reg
             for property in &abi_name_properties {
                 let (path, is_array) = generate_event_input_path(property);
 
-                let formatted_path = match is_array {
-                    true => {
-                        format!(r#"{path}.map(|v| v.to_string()).collect::<Vec<_>>().join(",")"#)
-                    }
-                    false => format!("{path}.to_string()"),
+                let (base_type, dimensions) = solidity_type_parts(&property.abi_type);
+                let formatted_path = if dimensions > 0 && base_type != "tuple" {
+                    format!("{}.to_string()", array_json_expression(&path, base_type, dimensions))
+                } else if is_array {
+                    format!(r#"{path}.map(|v| v.to_string()).collect::<Vec<_>>().join(",")"#)
+                } else {
+                    format!("{path}.to_string()")
                 };
 
                 csv_data.push_str(&format!(r#"{formatted_path}, "#));
@@ -848,6 +870,21 @@ use super::super::super::typings::{indexer_name_formatted}::events::{handler_reg
                 let wrapper = property.ethereum_sql_type_wrapper.as_ref().unwrap_or_else(|| {
                     panic!("No EthereumSqlTypeWrapper found for: {:?}", property.abi_type)
                 });
+
+                let (base_type, dimensions) = solidity_type_parts(&property.abi_type);
+                if dimensions > 0 && base_type != "tuple" {
+                    if dimensions > 1 {
+                        data.push_str(&format!(
+                            "\nEthereumSqlTypeWrapper::JSONB({}),",
+                            array_json_expression(&path, base_type, dimensions)
+                        ));
+                    } else {
+                        let scalar_wrapper = crate::database::sql_type_wrapper::solidity_type_to_ethereum_sql_type_wrapper(base_type);
+                        let element = formatter("item", base_type, &scalar_wrapper);
+                        data.push_str(&format!("\nEthereumSqlTypeWrapper::{}({path}.iter().cloned().map(|item| {element}).collect()),", wrapper.raw_name()));
+                    }
+                    continue;
+                }
 
                 let formatted_path = if is_array {
                     format!(

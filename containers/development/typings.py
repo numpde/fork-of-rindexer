@@ -174,9 +174,42 @@ def check_traces(checkout):
                     "--", "-D", "warnings"], check=True, stdout=sys.stderr)
 
 
+def check_arrays(checkout):
+    project = checkout / "examples/rindexer_rust_playground"
+    manifest = project / "rindexer.yaml"
+    original = manifest.read_text()
+    fixture = """contracts:
+  - name: ArrayShapes
+    abi: ./abis/array-shapes.json
+    details:
+      - network: ethereum
+        address: "0x0000000000000000000000000000000000000001"
+        start_block: 1
+    include_events:
+      - Values
+"""
+    manifest.write_text(original.replace("contracts:\n", fixture, 1))
+    fields = [
+        ("counts", "uint16[2]"), ("tags", "bytes32[2]"),
+        ("groups", "uint256[][]"), ("signed", "int24[2]"),
+        ("messages", "string[][2]"), ("data", "bytes4[][]"),
+        ("flags", "bool[2][]"), ("owners", "address[][]"),
+    ]
+    (project / "abis/array-shapes.json").write_text(json.dumps([{
+        "type": "event", "name": "Values", "anonymous": False,
+        "inputs": [{"name": name, "type": kind, "indexed": False} for name, kind in fields],
+    }]))
+    binary = build_cli(checkout)
+    for output in ("typings", "indexer"):
+        subprocess.run([str(binary), "codegen", "--path", str(project), output],
+                       check=True, stdout=sys.stderr)
+    subprocess.run(["cargo", "clippy", "--frozen", "-p", "rindexer_rust_playground",
+                    "--all-targets", "--", "-D", "warnings"], check=True, stdout=sys.stderr)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["roots", "generate", "check", "update", "check-traces"])
+    parser.add_argument("action", choices=["roots", "generate", "check", "update", "check-traces", "check-arrays"])
     parser.add_argument("--root", required=True, type=Path)
     parser.add_argument("--archive", type=Path)
     arguments = parser.parse_args()
@@ -185,6 +218,9 @@ def main():
         if arguments.action == "roots":
             for root in output_roots(checkout):
                 print(root)
+            return 0
+        if arguments.action == "check-arrays":
+            check_arrays(checkout)
             return 0
         if arguments.action == "generate":
             generate(checkout)

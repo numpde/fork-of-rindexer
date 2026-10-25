@@ -87,6 +87,7 @@ case "$1" in
     exec timeout --signal=TERM --kill-after=20s 900s cargo nextest run --frozen \
       -p rindexer --lib --test-threads 1 --no-fail-fast --no-capture -E 'test(/native_transfer_status_tests::/)'
     ;;
+  array-bindings) exec python3 -B containers/development/typings.py check-arrays --root /work ;;
   trace-bindings)
     exec python3 -B containers/development/typings.py check-traces --root /work ;;
   codegen-typings)
