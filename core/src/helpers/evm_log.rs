@@ -136,9 +136,9 @@ pub fn is_relevant_block(
     true
 }
 
-/// Take either the halved block range, or 2 blocks from the current. This is to prevent possible
-/// stalling risk and ensure we always make progress.
+/// Shrink an inclusive request without adding blocks. A single-block request
+/// cannot shrink; its caller must back off or fail rather than skip that block.
 pub fn halved_block_number(to_block: U64, from_block: U64) -> U64 {
     let halved_range = (to_block - from_block) / U64::from(2);
-    (from_block + halved_range).max(from_block + U64::from(2))
+    from_block + halved_range
 }

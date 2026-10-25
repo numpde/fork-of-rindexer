@@ -455,6 +455,9 @@ async fn fetch_historic_logs_stream<P: ChainProvider>(
                         reorg: None,
                     }));
                 } else {
+                    if from_block == to_block {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
                     return Some(ProcessHistoricLogsStreamResult {
                         next: current_filter
                             .set_from_block(from_block)
@@ -798,7 +801,7 @@ async fn parallel_worker(
     // Bail out if the same sub-range fails this many times in a row. Prevents
     // a stuck single/tiny range from holding the reorder buffer open forever
     // when the provider keeps returning an unclassified error that
-    // `halved_block_number` can't shrink any further (minimum range is 2).
+    // `halved_block_number` can't shrink a single-block request any further.
     const MAX_STUCK_ITERATIONS: usize = 10;
     let mut stuck_iterations: usize = 0;
     let mut last_range: Option<(U64, U64)> = None;
@@ -1876,8 +1879,34 @@ struct RetryWithBlockRangeResult {
     max_block_range: Option<U64>,
 }
 
-/// Attempts to retry with a new block range based on the error message.
+/// Interpret provider retry hints without skipping unfinished blocks or adding
+/// blocks beyond the failed request. A single-block failure needs backoff.
 async fn retry_with_block_range(
+    info_log_name: &str,
+    error: &ProviderError,
+    from_block: U64,
+    to_block: U64,
+    max_block_range_limitation: Option<U64>,
+) -> Option<RetryWithBlockRangeResult> {
+    if from_block == to_block {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    suggested_retry_block_range(
+        info_log_name,
+        error,
+        from_block,
+        to_block,
+        max_block_range_limitation,
+    )
+    .await
+    .map(|hint| RetryWithBlockRangeResult {
+        from: from_block,
+        to: hint.to.clamp(from_block, to_block),
+        max_block_range: hint.max_block_range,
+    })
+}
+
+async fn suggested_retry_block_range(
     info_log_name: &str,
     error: &ProviderError,
     from_block: U64,
@@ -1976,7 +2005,7 @@ async fn retry_with_block_range(
 
         return Some(RetryWithBlockRangeResult {
             from: from_block,
-            to: from_block + suggested_range,
+            to: from_block.saturating_add(suggested_range),
             max_block_range: Some(suggested_range),
         });
     }
@@ -1994,7 +2023,7 @@ async fn retry_with_block_range(
 
                     return Some(RetryWithBlockRangeResult {
                         from: from_block,
-                        to: from_block + suggested_range,
+                        to: from_block.saturating_add(suggested_range),
                         max_block_range: Some(suggested_range),
                     });
                 }
@@ -2011,7 +2040,7 @@ async fn retry_with_block_range(
 
         return Some(RetryWithBlockRangeResult {
             from: from_block,
-            to: from_block + suggested_range,
+            to: from_block.saturating_add(suggested_range),
             max_block_range: Some(suggested_range),
         });
     }
@@ -2043,7 +2072,7 @@ async fn retry_with_block_range(
         let diff = to_block - from_block;
 
         let mut block_range = FallbackBlockRange::from_diff(diff);
-        let mut next_to_block = from_block + block_range.value();
+        let mut next_to_block = from_block.saturating_add(block_range.value());
 
         warn!(
             "{} Computed a fallback block range {:?}. Provider did not provide information in error: {:?}",
@@ -2052,7 +2081,7 @@ async fn retry_with_block_range(
 
         if next_to_block == to_block {
             block_range = block_range.lower();
-            next_to_block = from_block + block_range.value();
+            next_to_block = from_block.saturating_add(block_range.value());
         }
 
         if next_to_block < from_block {
@@ -2076,7 +2105,7 @@ async fn retry_with_block_range(
 
         return Some(RetryWithBlockRangeResult {
             from: from_block,
-            to: from_block + suggested_range,
+            to: from_block.saturating_add(suggested_range),
             max_block_range: Some(suggested_range),
         });
     }
@@ -3675,7 +3704,7 @@ mod tests {
         let result = retry_with_block_range("test", &error, U64::from(0), U64::from(999), None)
             .await
             .expect("should return a result");
-        assert_eq!(result.from, U64::from(0x100));
+        assert_eq!(result.from, U64::ZERO);
         assert_eq!(result.to, U64::from(0x200));
         assert_eq!(result.max_block_range, None);
     }
