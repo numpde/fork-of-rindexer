@@ -1562,3 +1562,48 @@ async fn postgres_removed_log_recovery_retries_on_matching_headers() {
     drop(coordinator);
     fixture.finish().await;
 }
+
+#[tokio::test]
+async fn postgres_sequence_positions_choose_the_later_block_in_combined_and_separate_batches() {
+    for tx_index in [1000, 1001] {
+        for separate in [false, true] {
+            let mut fixture = Fixture::new().await;
+            let mut tables = fixture.params.tables.as_ref().clone();
+            tables[0].table.events[0].operations[0].set[0].action =
+                crate::manifest::contract::SetAction::Set;
+            fixture.params.tables = Arc::new(tables);
+            let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+            let mut events = fixture.events(&[11, 22]);
+            for (event, (block, tx)) in events.iter_mut().zip([(100, tx_index), (101, 0)]) {
+                event.log.block_number = Some(block);
+                event.log.transaction_index = Some(tx);
+                event.log.log_index = Some(0);
+                event.tx_information.block_number = block;
+                event.tx_information.transaction_index = tx;
+                event.tx_information.log_index = alloy::primitives::U256::ZERO;
+                event.found_in_request.from_block = alloy::primitives::U64::from(block);
+                event.found_in_request.to_block = alloy::primitives::U64::from(block);
+            }
+            if separate {
+                callback(vec![events[0].clone()]).await.unwrap();
+                callback(vec![events[1].clone()]).await.unwrap();
+            } else {
+                callback(events).await.unwrap();
+            }
+            assert_eq!(
+                fixture.position().await,
+                (2, "22".to_string(), "101".to_string()),
+                "tx_index={tx_index}, separate={separate}"
+            );
+            let receipts: i64 = fixture
+                .client
+                .query_one("SELECT count(*) FROM rindexer_internal.event_applications", &[])
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(receipts, 2);
+            drop(callback);
+            fixture.finish().await;
+        }
+    }
+}

@@ -523,3 +523,10 @@ codegen/arrays/check: tests/posture ## Compile generated Rust handlers for fixed
 tests/callback-recovery/docker: tests/posture ## Verify admitted callback retries retire before reorg rollback waits for writers
 	@$(call offline_runner,$$dependency_image)
 	$(compose) run --rm --no-deps -T offline callback-recovery
+
+.PHONY: tests/sequence-ordering/postgres
+tests/sequence-ordering/postgres: tests/posture ## Verify custom-table ordering across high transaction indices and block boundaries
+	@$(call offline_runner,$$dependency_image)
+	$(compose) run --rm --no-deps -T offline sequence-ordering-compile
+	$(compose) up -d --no-build --pull never --wait --wait-timeout 90 postgres
+	$(compose) run --rm --no-deps -T postgres-tests sequence-ordering

@@ -1819,12 +1819,10 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_sequence_id_slot_overflow() {
-        // tx_index >= 1000 overflows into the block number's space.
-        // This documents the known limitation of the encoding.
-        let normal = compute_sequence_id(101, 0, 0); // 10_100_000_000
-        let overflow = compute_sequence_id(100, 1000, 0); // 10_100_000_000
-        assert_eq!(normal, overflow, "tx_index=1000 aliases with next block");
+    fn test_compute_sequence_id_crosses_transaction_1000_without_colliding() {
+        for tx in [1000, 1001] {
+            assert!(compute_sequence_id(100, tx, 0) < compute_sequence_id(101, 0, 0));
+        }
     }
 
     // =========================================================================

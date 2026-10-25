@@ -35,6 +35,13 @@ if ! test -f "$RINDEXER_GRAPHQL_PREBUILT" || ! test -f /build/graphql/input.sha2
   printf '%s\n' "$key" > /build/graphql/input.sha256
 fi
 case "$1" in
+  sequence-ordering-compile)
+    exec cargo nextest run --frozen -p rindexer --lib --no-run -E 'test(/postgres_sequence_positions/) | test(/test_compute_sequence_id/)'
+    ;;
+  sequence-ordering)
+    : "${RINDEXER_TEST_POSTGRES_URL:?missing explicit PostgreSQL fixture}"
+    exec timeout --signal=TERM --kill-after=20s 900s cargo nextest run --frozen -p rindexer --lib --no-fail-fast --no-capture -E 'test(/postgres_sequence_positions/) | test(/test_compute_sequence_id/)'
+    ;;
   callback-recovery)
     cargo nextest run --frozen -p rindexer --lib --no-run -E 'test(/checkpoint_order_tests::/) | test(/^event::callback_registry::tests::/) | test(/^indexer::reorg::/)'
     exec timeout --signal=TERM --kill-after=20s 900s cargo nextest run --frozen -p rindexer --lib --no-fail-fast --no-capture -E 'test(/checkpoint_order_tests::/) | test(/^event::callback_registry::tests::/) | test(/^indexer::reorg::/)'
