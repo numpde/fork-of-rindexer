@@ -237,6 +237,10 @@ export default defineConfig({
           link: "/docs/migrations/unsigned-integer-storage",
         },
         {
+          text: "Sequence Ordering Migration",
+          link: "/docs/migrations/sequence-ordering",
+        },
+        {
           text: "ABI Array Storage",
           link: "/docs/migrations/abi-array-storage",
         },

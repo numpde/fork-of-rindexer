@@ -1581,8 +1581,10 @@ async fn postgres_sequence_positions_choose_the_later_block_in_combined_and_sepa
                 event.tx_information.block_number = block;
                 event.tx_information.transaction_index = tx;
                 event.tx_information.log_index = alloy::primitives::U256::ZERO;
-                event.found_in_request.from_block = alloy::primitives::U64::from(block);
-                event.found_in_request.to_block = alloy::primitives::U64::from(block);
+                event.found_in_request.from_block =
+                    alloy::primitives::U64::from(if separate { block } else { 100 });
+                event.found_in_request.to_block =
+                    alloy::primitives::U64::from(if separate { block } else { 101 });
             }
             if separate {
                 callback(vec![events[0].clone()]).await.unwrap();
@@ -1605,5 +1607,30 @@ async fn postgres_sequence_positions_choose_the_later_block_in_combined_and_sepa
             drop(callback);
             fixture.finish().await;
         }
+    }
+}
+
+#[tokio::test]
+async fn postgres_sequence_positions_reject_indices_outside_the_packed_bounds_before_writes() {
+    for transaction in [true, false] {
+        let fixture = Fixture::new().await;
+        let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+        let mut events = fixture.events(&[1]);
+        let large = u64::from(u32::MAX) + 1;
+        if transaction {
+            events[0].log.transaction_index = Some(large);
+            events[0].tx_information.transaction_index = large;
+        } else {
+            events[0].log.log_index = Some(large);
+            events[0].tx_information.log_index = alloy::primitives::U256::from(large);
+        }
+        let before = fixture.position().await;
+        assert!(matches!(
+            callback(events).await,
+            Err(crate::event::callback_registry::CallbackError::Permanent(_))
+        ));
+        assert_eq!(fixture.position().await, before);
+        drop(callback);
+        fixture.finish().await;
     }
 }

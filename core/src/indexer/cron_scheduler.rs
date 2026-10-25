@@ -1486,7 +1486,7 @@ async fn execute_cron_operations(
             // For cron with multiple addresses, include addr_idx to ensure unique sequence_id
             let sequence_id = crate::manifest::contract::compute_sequence_id(
                 latest_block,
-                addr_idx as u64, // Use address index for uniqueness
+                u32::try_from(addr_idx).map_err(|_| format!("Cannot order cron operations for table {:?}: address index {addr_idx} exceeds {}", task.table.name, u32::MAX))?,
                 0,
             );
 

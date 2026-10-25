@@ -678,6 +678,9 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
                 let log_index = tx.log_index;
                 let transaction_index = tx.transaction_index;
                 let block_number = tx.block_number;
+                if !params.tables.is_empty() && (transaction_index > u64::from(u32::MAX) || log_index > alloy::primitives::U256::from(u32::MAX)) {
+                    return Err(CallbackError::Permanent(format!("Cannot order custom-table event on network {:?}, block {}: transaction index {} and log index {} must each be at most {}; this callback attempt made no raw or derived writes", tx.network, block_number, transaction_index, log_index, u32::MAX)));
+                }
                 let block_timestamp = tx.block_timestamp;
                 let block_hash = tx.block_hash;
                 let network = tx.network.clone();

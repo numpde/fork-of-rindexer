@@ -253,7 +253,7 @@ pub struct ContractEvent {
 /// These columns are automatically added to all custom tables and managed by rindexer.
 pub mod injected_columns {
     /// Unique sequence ID computed from block_number, tx_index, and log_index.
-    /// Formula: block_number * 100_000_000 + tx_index * 100_000 + log_index
+    /// Packed order: (block_number << 64) | (tx_index << 32) | log_index.
     /// Used for deterministic ordering and deduplication in ReplacingMergeTree.
     pub const RINDEXER_SEQUENCE_ID: &str = "rindexer_sequence_id";
 
@@ -277,16 +277,11 @@ pub mod injected_columns {
     pub const CONTRACT_ADDRESS: &str = "rindexer_contract_address";
 }
 
-/// Computes a unique sequence ID from block number, transaction index, and log index.
-/// This provides deterministic ordering for events within and across blocks.
-///
-/// Formula: block_number * 100_000_000 + tx_index * 100_000 + log_index
-///
-/// This allows for:
-/// - Up to 100,000 transactions per block
-/// - Up to 100,000 logs per transaction
-pub fn compute_sequence_id(block_number: u64, tx_index: u64, log_index: u64) -> u128 {
-    (block_number as u128) * 100_000_000 + (tx_index as u128) * 100_000 + log_index as u128
+/// Packs an event position in chronological order: 64 block bits, then 32
+/// transaction-index bits, then 32 log-index bits. Index bounds are enforced by
+/// the argument types; engine metadata is checked before conversion.
+pub fn compute_sequence_id(block_number: u64, tx_index: u32, log_index: u32) -> u128 {
+    ((block_number as u128) << 64) | ((tx_index as u128) << 32) | log_index as u128
 }
 
 /// Defines a custom table for aggregated indexing.
@@ -1766,16 +1761,16 @@ mod tests {
 
     #[test]
     fn test_compute_sequence_id_basic() {
-        // block * 100_000_000 + tx * 100_000 + log
-        assert_eq!(compute_sequence_id(1, 0, 0), 100_000_000);
-        assert_eq!(compute_sequence_id(0, 1, 0), 100_000);
+        // Each position occupies a disjoint bit range.
+        assert_eq!(compute_sequence_id(1, 0, 0), 1u128 << 64);
+        assert_eq!(compute_sequence_id(0, 1, 0), 1u128 << 32);
         assert_eq!(compute_sequence_id(0, 0, 1), 1);
     }
 
     #[test]
     fn test_compute_sequence_id_combined() {
-        // block=2, tx=3, log=4 → 2*100_000_000 + 3*100_000 + 4
-        assert_eq!(compute_sequence_id(2, 3, 4), 200_300_004);
+        // block=2, tx=3, log=4 occupy their respective slots.
+        assert_eq!(compute_sequence_id(2, 3, 4), (2u128 << 64) | (3u128 << 32) | 4);
     }
 
     #[test]
@@ -1787,7 +1782,14 @@ mod tests {
     fn test_compute_sequence_id_large_block() {
         // Use a realistic large block number (20_000_000) to verify no overflow
         let id = compute_sequence_id(20_000_000, 0, 0);
-        assert_eq!(id, 20_000_000u128 * 100_000_000);
+        assert_eq!(id, 20_000_000u128 << 64);
+    }
+
+    #[test]
+    fn test_compute_sequence_id_full_bounds() {
+        assert_eq!(compute_sequence_id(u64::MAX, u32::MAX, u32::MAX), u128::MAX);
+        assert!(compute_sequence_id(100, u32::MAX, u32::MAX) < compute_sequence_id(101, 0, 0));
+        assert!(compute_sequence_id(100, 3, u32::MAX) < compute_sequence_id(100, 4, 0));
     }
 
     #[test]

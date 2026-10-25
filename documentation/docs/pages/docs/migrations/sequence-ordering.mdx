@@ -1,0 +1,50 @@
+# Sequence ordering migration
+
+Custom-table `rindexer_sequence_id` values now order events by block number,
+transaction index, then log index using disjoint bit ranges:
+
+```text
+(block_number << 64) | (transaction_index << 32) | log_index
+```
+
+Block numbers use 64 bits. Transaction and log indices each use 32 bits and must
+be between zero and 4,294,967,295 inclusive. No-code custom-table callbacks reject
+larger indices as permanent failures before writing the batch. The Rust
+`compute_sequence_id` function accepts `u32` indices so callers must perform checked
+conversions from larger types. Cron address ordinals use the same checked bound.
+
+The complete position fits in `u128`, including the maximum supported values.
+PostgreSQL `NUMERIC` and ClickHouse `UInt128` column types are unchanged.
+
+The previous decimal formula allowed a transaction index of 1,000 to collide with
+the next block, and larger indices to make an earlier block sort after a later one.
+As a result, state-setting upserts could silently keep the earlier event in both
+combined and separate callback batches. Application receipts could still record
+both events as applied.
+
+## Before upgrading existing projects
+
+Do not compare stored old IDs with newly packed IDs. This is a change to the
+meaning of the column even though its database type has not changed. The upgrade
+does not automatically migrate sequence values or reconstruct affected state.
+
+Stop every writer to affected derived tables, including cron tasks and other
+indexers sharing those tables, and back up the database and any downstream outputs.
+Identify every derived table containing `rindexer_sequence_id` and any rollback
+journals or snapshots that retain those values. Use the same encoding throughout
+an affected table and its recovery history before allowing writes or rollback.
+
+A reviewed rebuild from canonical events in `(block_number, transaction_index,
+log_index)` order is the safest general repair. Rebuild the affected derived state
+and sequence-bearing journals together, and reconcile raw history, application
+receipts and progress as required by your replay plan. Retained receipts can suppress
+reapplication; simply replaying with unchanged receipts does not repair a wrong
+winner. See [PostgreSQL event replay](/docs/migrations/postgres-event-replay).
+
+A custom migration must recover each position from trustworthy source metadata.
+Do not decode the old sequence value alone: its transaction and log slots can
+alias, and already rejected state changes cannot be recovered by relabelling the
+surviving row. Review historical correctness even if a table's current values look
+plausible. Resume indexing only after state and recovery history are consistent.
+
+Fresh databases need no data migration. The YAML fields and defaults are unchanged.

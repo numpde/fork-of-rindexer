@@ -9,7 +9,7 @@
 //! Every custom table automatically gets these metadata columns:
 //!
 //! - `rindexer_sequence_id` (NUMERIC) - Unique ID for deterministic ordering
-//!   computed as: `block_number * 100_000_000 + tx_index * 100_000 + log_index`
+//!   computed as: `(block_number << 64) | (tx_index << 32) | log_index` (32-bit indices)
 //! - `rindexer_block_number` (BIGINT NOT NULL) - The block number of the event
 //! - `rindexer_block_timestamp` (TIMESTAMPTZ NOT NULL) - The block timestamp of the event
 //!   **Only added when `timestamp: true` is set on the table.**
@@ -3696,8 +3696,8 @@ pub(crate) async fn prepare_table_operations<'t>(
                         // Auto-injected metadata columns
                         let sequence_id = compute_sequence_id(
                             tx_metadata.block_number,
-                            tx_metadata.tx_index,
-                            tx_metadata.log_index.to::<u64>(),
+                            u32::try_from(tx_metadata.tx_index).map_err(|_| format!("Cannot order table operation at block {}: transaction index {} exceeds the supported maximum {}", tx_metadata.block_number, tx_metadata.tx_index, u32::MAX))?,
+                            u32::try_from(tx_metadata.log_index).map_err(|_| format!("Cannot order table operation at block {}: log index {} exceeds the supported maximum {}", tx_metadata.block_number, tx_metadata.log_index, u32::MAX))?,
                         );
                         columns.insert(
                             injected_columns::RINDEXER_SEQUENCE_ID.to_string(),
