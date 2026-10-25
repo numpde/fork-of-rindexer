@@ -423,6 +423,9 @@ impl ReorgCoordinator {
         let mut earliest_fork: Option<u64> = None;
         while !self.pending_recovery.tasks.is_empty() {
             if self.pending_recovery.writer_guard.is_none() {
+                // Stop retries before waiting for their read guards. Active attempts
+                // retain the guard until they return, including transaction cleanup.
+                super::retire_callbacks(&self.network);
                 self.pending_recovery.writer_guard =
                     Some(event_writer_barrier(&self.network).write_owned().await);
             }

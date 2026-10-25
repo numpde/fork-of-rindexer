@@ -664,6 +664,14 @@ async fn trigger_event<T>(
 where
     T: Clone,
 {
+    let recovery =
+        failure_scope.map(|(_, network)| crate::indexer::reorg::callback_recovery_token(network));
+    let retired = || {
+        CallbackError::Retryable(
+            "Callback retired because network recovery invalidated its block generation"
+                .to_string(),
+        )
+    };
     let mut attempts = 0;
     let mut delay = Duration::from_millis(100);
 
@@ -671,6 +679,9 @@ where
     debug!("{} - Pushed {} events", len, info_log_name());
 
     loop {
+        if recovery.as_ref().is_some_and(|token| token.is_cancelled()) {
+            return Err(retired());
+        }
         if !is_running() {
             info!("Detected shutdown, stopping event trigger");
             return Err("Detected shutdown, stopping event trigger".into());
@@ -689,6 +700,11 @@ where
             },
             None => callback.await,
         };
+        // An attempt may have committed effects. Finish it before releasing the
+        // writer guard; recovery will reverse them before admitting replacement work.
+        if recovery.as_ref().is_some_and(|token| token.is_cancelled()) {
+            return Err(retired());
+        }
         match result {
             Ok(_) => {
                 debug!(
@@ -720,7 +736,14 @@ where
 
                 delay = (delay * 2).min(Duration::from_secs(15));
 
-                sleep(delay).await;
+                if let Some(token) = &recovery {
+                    tokio::select! {
+                        _ = sleep(delay) => {},
+                        _ = token.cancelled() => return Err(retired()),
+                    }
+                } else {
+                    sleep(delay).await;
+                }
             }
         }
     }

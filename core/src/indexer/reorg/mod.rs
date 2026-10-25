@@ -43,6 +43,7 @@ struct StreamRecovery {
 #[derive(Default)]
 struct NetworkRecovery {
     generation: u64,
+    callbacks: tokio_util::sync::CancellationToken,
     subscribers: Vec<Weak<StdMutex<StreamRecovery>>>,
 }
 static NETWORK_RECOVERY: LazyLock<StdMutex<HashMap<String, NetworkRecovery>>> =
@@ -110,6 +111,20 @@ pub fn reorg_generation(network: &str) -> u64 {
         .map_or(0, |state| state.generation)
 }
 
+pub(crate) fn callback_recovery_token(network: &str) -> tokio_util::sync::CancellationToken {
+    NETWORK_RECOVERY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(network.to_string())
+        .or_default()
+        .callbacks
+        .clone()
+}
+
+pub(crate) fn retire_callbacks(network: &str) {
+    callback_recovery_token(network).cancel();
+}
+
 pub(crate) fn subscribe_reorgs(network: &str) -> ReorgSubscription {
     let position = Arc::new(StdMutex::new(StreamRecovery::default()));
     let mut recovery = NETWORK_RECOVERY.lock().unwrap_or_else(|e| e.into_inner());
@@ -123,6 +138,7 @@ fn publish_rewind(network: &str, fork_point: u64) {
     let mut recovery = NETWORK_RECOVERY.lock().unwrap_or_else(|e| e.into_inner());
     let state = recovery.entry(network.to_string()).or_default();
     state.generation = state.generation.checked_add(1).expect("reorg generation exhausted");
+    state.callbacks = tokio_util::sync::CancellationToken::new();
     state.subscribers.retain(|entry| {
         let Some(pending) = entry.upgrade() else { return false };
         let mut position = pending.lock().unwrap_or_else(|e| e.into_inner());
