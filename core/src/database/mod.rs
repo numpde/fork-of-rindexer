@@ -13,6 +13,9 @@ mod nested_array_tests;
 mod indexed_topic_hash_tests;
 
 #[cfg(test)]
+mod fixed_bytes_tests;
+
+#[cfg(test)]
 mod signed_integer_tests;
 
 #[cfg(test)]

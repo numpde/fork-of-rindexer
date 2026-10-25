@@ -431,3 +431,15 @@ tests/indexed-topic-hashes/postgres: tests/posture ## Read back indexed array/tu
 	$(compose) run --rm --no-deps -T offline indexed-topic-hashes-compile
 	$(compose) up -d --no-build --pull never --wait --wait-timeout 90 postgres
 	$(compose) run --rm --no-deps -T postgres-tests indexed-topic-hashes-postgres
+
+.PHONY: tests/fixed-bytes/docker tests/fixed-bytes/postgres
+
+tests/fixed-bytes/docker: tests/posture ## Check fixed-byte logical lengths and trailing zeros offline
+	@$(call offline_runner,$$dependency_image)
+	$(compose) run --rm --no-deps -T offline fixed-bytes
+
+tests/fixed-bytes/postgres: tests/posture ## Read back fixed-byte values through PostgreSQL INSERT and COPY
+	@$(call offline_runner,$$dependency_image)
+	$(compose) run --rm --no-deps -T offline fixed-bytes-compile
+	$(compose) up -d --no-build --pull never --wait --wait-timeout 90 postgres
+	$(compose) run --rm --no-deps -T postgres-tests fixed-bytes-postgres
