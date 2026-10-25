@@ -485,3 +485,14 @@ tests/view-call-reorg/docker: tests/posture ## Check historical calls, late RPC 
 	$(compose) run --rm --no-deps -T offline view-call-reorg-compile
 	$(compose) up -d --no-build --pull never --wait --wait-timeout 90 postgres
 	$(compose) run --rm --no-deps -T postgres-tests view-call-reorg
+
+.PHONY: tests/native-transfer-recovery/docker
+tests/native-transfer-recovery/docker: tests/posture ## Check queued native work, replacement-prefix checkpoints and restart recovery
+	@$(call offline_runner,$$dependency_image)
+	if ! docker image inspect "$$ANVIL_IMAGE" >/dev/null; then
+	  echo 'Run make tests/native-transfer-status/image first.' >&2; exit 2
+	fi
+	$(compose) run --rm --no-deps -T offline native-transfer-recovery-compile
+	compose_profile_args=(--profile native-transfers)
+	$(compose) up -d --no-build --pull never --wait --wait-timeout 90 postgres anvil
+	$(compose) run --rm --no-deps -T -e RINDEXER_TEST_ANVIL_URL=http://anvil:8545 postgres-tests native-transfer-recovery

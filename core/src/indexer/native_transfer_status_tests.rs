@@ -308,3 +308,200 @@ async fn assert_receipt_failures_leave_range_unfinished(
     drop(config);
     fixture.finish().await;
 }
+
+#[tokio::test]
+async fn postgres_native_queue_recovery_preserves_replacement_prefix_on_anvil() {
+    use crate::indexer::{
+        native_transfer::native_transfer_block_processor,
+        reorg::{
+            task::{
+                DerivedColumnRollback, DerivedTableInfo, DerivedTableRollbackOp,
+                DerivedTableRollbackPlan, EventTableInfo,
+            },
+            BlockChainWindow, ReorgBlockHashPersistence, ReorgContext, ReorgCoordinator,
+        },
+    };
+    use crate::{
+        database::generate::generate_indexer_contract_schema_name,
+        database::postgres::generate::generate_internal_event_table_name,
+        manifest::contract::{ColumnType, SetAction},
+    };
+    let fixture = Fixture::new_trace().await;
+    let (url, _anvil) = anvil_url().await;
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(10)).build().unwrap();
+    rpc(&client, &url, "anvil_reset", json!([])).await;
+    rpc(&client, &url, "evm_setAutomine", json!([true])).await;
+    let sender = rpc(&client, &url, "eth_accounts", json!([])).await[0].clone();
+    let deployment = rpc(
+        &client,
+        &url,
+        "eth_sendTransaction",
+        json!([{"from":sender, "data":"0x6001600c60003960016000f300", "gas":"0x1e8480"}]),
+    )
+    .await;
+    let recipient = receipt(&client, &url, &deployment).await["contractAddress"].clone();
+    rpc(&client, &url, "anvil_mine", json!(["0x60"])).await;
+    assert_eq!(rpc(&client, &url, "eth_blockNumber", json!([])).await, "0x61");
+    let snapshot = rpc(&client, &url, "evm_snapshot", json!([])).await;
+    rpc(&client, &url, "evm_setAutomine", json!([false])).await;
+    for number in 98..=110 {
+        let hash = rpc(
+            &client,
+            &url,
+            "eth_sendTransaction",
+            json!([{"from":sender,"to":recipient,"value":"0xa","data":"0x","gas":"0x186a0"}]),
+        )
+        .await;
+        rpc(&client, &url, "evm_mine", json!([])).await;
+        assert_eq!(receipt(&client, &url, &hash).await["blockNumber"], format!("0x{number:x}"));
+    }
+    let provider =
+        create_client(&url, 31337, None, None, None, Default::default(), None, None).await.unwrap();
+    let (mut config, _) = processing_config(&fixture, 110).await;
+    Arc::get_mut(&mut config).unwrap().start_block = U64::from(98);
+    native_transfer_block_consumer(
+        provider.clone(),
+        &[U64::from(98), U64::from(99), U64::from(100)],
+        "ethereum",
+        &config,
+    )
+    .await
+    .unwrap();
+    assert_eq!(fixture.position().await, (3, "30".to_string(), "100".to_string()));
+    let old_headers = provider
+        .get_block_by_number_batch(&(97..=110).map(U64::from).collect::<Vec<_>>(), false)
+        .await
+        .unwrap();
+    // Real FIFO requests already planned before rollback. Delay replacement delivery.
+    let (requests, queued) = tokio::sync::mpsc::channel(32);
+    for number in 101..=110 {
+        requests.send(U64::from(number)).await.unwrap();
+    }
+    assert!(rpc(&client, &url, "evm_revert", json!([snapshot])).await.as_bool().unwrap());
+    rpc(&client, &url, "evm_setAutomine", json!([false])).await;
+    for number in 98..=110 {
+        let hash = rpc(
+            &client,
+            &url,
+            "eth_sendTransaction",
+            json!([{"from":sender,"to":recipient,"value":"0x14","data":"0x","gas":"0x186a0"}]),
+        )
+        .await;
+        rpc(&client, &url, "evm_mine", json!([])).await;
+        assert_eq!(receipt(&client, &url, &hash).await["blockNumber"], format!("0x{number:x}"));
+    }
+    let mut window = BlockChainWindow::try_new(32).unwrap();
+    for block in old_headers {
+        window.insert(block.header.number, block.header.hash, block.header.parent_hash);
+    }
+    let schema = generate_indexer_contract_schema_name(
+        &fixture.params.indexer_name,
+        &fixture.params.contract_name,
+    );
+    let checkpoint = generate_internal_event_table_name(&schema, EVENT_NAME);
+    let totals = fixture.params.tables[0].full_table_name.clone();
+    let mut plan = DerivedTableRollbackPlan::default();
+    plan.try_add_operation(
+        totals.clone(),
+        0,
+        vec![],
+        [("value".to_string(), ColumnType::Uint256)].into(),
+        [("amount".to_string(), ColumnType::Uint256)].into(),
+    )
+    .unwrap();
+    let mut coordinator = ReorgCoordinator::new(
+        "ethereum".to_string(),
+        window,
+        Arc::new(ReorgBlockHashPersistence::new(Some(fixture.client.clone()), None)),
+        provider.clone(),
+        vec![EventTableInfo::try_new(
+            schema,
+            "native_transfer".to_string(),
+            checkpoint,
+            fixture.params.indexer_name.clone(),
+            fixture.params.contract_name.clone(),
+            EVENT_NAME.to_string(),
+        )
+        .unwrap()],
+        vec![DerivedTableInfo::try_new(
+            totals,
+            false,
+            vec![DerivedTableRollbackOp::try_new(
+                fixture.params.sql_event_table_name.clone(),
+                vec![],
+                vec![DerivedColumnRollback::try_new(
+                    "amount".to_string(),
+                    "value".to_string(),
+                    SetAction::Add,
+                )
+                .unwrap()],
+                None,
+            )
+            .unwrap()],
+            vec![],
+        )
+        .unwrap()],
+        vec![],
+    )
+    .unwrap()
+    .with_rollback_plan(plan);
+    let task = coordinator.try_create_reorg_task_for_block_range(98, 110).unwrap();
+    coordinator
+        .handle_reorg(
+            task,
+            &ReorgContext {
+                postgres: Some(&fixture.client),
+                clickhouse: None,
+                registry: None,
+                trace_registry: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(fixture.position().await, (0, "0".to_string(), "97".to_string()));
+    let processor = tokio::spawn(native_transfer_block_processor(
+        "ethereum".to_string(),
+        provider.clone(),
+        config.clone(),
+        queued,
+    ));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while requests.capacity() != 32 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    // Draining ten requests requires completing the first five-item batch in the old pipeline.
+    // No replacement prefix has been scheduled, so no cursor beyond 97 is justified.
+    assert_eq!(
+        fixture.position().await,
+        (0, "0".to_string(), "97".to_string()),
+        "queued later blocks must not certify missing replacement history"
+    );
+    processor.abort();
+    assert!(processor.await.unwrap_err().is_cancelled());
+    drop(requests);
+    drop(config);
+    // Restart from the durable checkpoint with fresh processing state and a fresh queue.
+    let saved: u64 = fixture.position().await.2.parse().unwrap();
+    let (mut restarted, _) = processing_config(&fixture, 110).await;
+    Arc::get_mut(&mut restarted).unwrap().start_block = U64::from(saved + 1);
+    let (requests, queue) = tokio::sync::mpsc::channel(32);
+    for number in saved + 1..=110 {
+        requests.send(U64::from(number)).await.unwrap();
+    }
+    drop(requests);
+    native_transfer_block_processor("ethereum".to_string(), provider, restarted.clone(), queue)
+        .await
+        .unwrap();
+    assert_eq!(fixture.position().await, (13, "260".to_string(), "110".to_string()));
+    let row = fixture.client.query_one(&format!("SELECT count(DISTINCT block_number), min(block_number)::text, max(block_number)::text FROM {}", fixture.params.sql_event_table_name), &[]).await.unwrap();
+    assert_eq!(row.get::<_, i64>(0), 13);
+    assert_eq!(row.get::<_, String>(1), "98");
+    assert_eq!(row.get::<_, String>(2), "110");
+    rpc(&client, &url, "evm_setAutomine", json!([true])).await;
+    drop(restarted);
+    drop(coordinator);
+    fixture.finish().await;
+}
