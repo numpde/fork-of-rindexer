@@ -7,7 +7,7 @@ import unittest
 
 def validate(config):
     services = config['services']
-    if set(services) != {'offline', 'postgres-tests', 'postgres'}:
+    if set(services) != {'offline', 'postgres-tests', 'postgres', 'anvil'}:
         raise ValueError('unexpected service topology')
     for name, service in services.items():
         if not service.get('read_only') or service.get('privileged'):
@@ -57,11 +57,15 @@ def validate(config):
         raise ValueError('offline compiler has network access')
     if set(config['networks']) != {'fixtures'} or not config['networks']['fixtures'].get('internal'):
         raise ValueError('fixtures have external egress')
-    for name in ('postgres-tests', 'postgres'):
+    for name in ('postgres-tests', 'postgres', 'anvil'):
         if set(services[name].get('networks', {})) != {'fixtures'}:
             raise ValueError('fixture service has an unexpected network')
     if '@sha256:' not in services['postgres']['image']:
         raise ValueError('PostgreSQL image is not digest-pinned')
+    if '@sha256:' not in services['anvil']['image']:
+        raise ValueError('Anvil image is not digest-pinned')
+    if services['anvil'].get('profiles') != ['native-transfers']:
+        raise ValueError('Anvil must remain an opt-in fixture')
     if set(config['volumes']) != {'build'} or not config['volumes']['build'].get('external'):
         raise ValueError('unexpected persistent volume lifecycle')
 
@@ -95,5 +99,11 @@ class ContainerPostureTests(unittest.TestCase):
     def test_fixture_egress_is_rejected(self):
         config = copy.deepcopy(self.config)
         config['networks']['fixtures']['internal'] = False
+        with self.assertRaises(ValueError):
+            validate(config)
+
+    def test_anvil_cannot_start_as_an_ordinary_fixture(self):
+        config = copy.deepcopy(self.config)
+        config['services']['anvil'].pop('profiles')
         with self.assertRaises(ValueError):
             validate(config)

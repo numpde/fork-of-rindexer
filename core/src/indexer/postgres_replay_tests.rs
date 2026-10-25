@@ -34,6 +34,9 @@ use crate::{
 #[path = "factory_replay_tests.rs"]
 mod factory_replay_tests;
 
+#[path = "native_transfer_status_tests.rs"]
+mod native_transfer_status_tests;
+
 #[tokio::test]
 async fn postgres_nested_tuple_callback_stores_rows_and_delivers_webhook_json() {
     use crate::{database::nested_tuple_tests::event_fixture, streams::StreamsClients};

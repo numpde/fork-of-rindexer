@@ -16,7 +16,7 @@ SHELL := /bin/bash
 # Rendering, execution and teardown always address the same file and project.
 compose = docker compose --env-file containers/development/images.env \
           --project-name "$$compose_project" --project-directory "$$checkout_root" \
-          -f compose/development.yml
+          -f compose/development.yml "$${compose_profile_args[@]}"
 
 # Establish one invocation's trusted image pins, temporary inputs and cleanup.
 # This block does not acquire images or start services. Set the teardown flag
@@ -35,6 +35,8 @@ for image in "$$RUST_IMAGE" "$$NODE_IMAGE" "$$POSTGRES_IMAGE"; do
 done
 scratch_dir=$$(mktemp -d)
 compose_project="rindexer-dev-$$(id -u)-$$$$"
+compose_profile_args=()
+unset COMPOSE_PROFILES
 compose_cleanup_required=0
 cleanup() {
   local exit_status=$$?
@@ -74,6 +76,13 @@ require_regular_checkout_file() {
     parent=$$(dirname "$$parent")
   done
 }
+# Native Testcontainers and Compose share the test fixture's immutable image.
+require_regular_checkout_file core/src/indexer/fixtures/anvil-image.txt
+export ANVIL_IMAGE=$$(cat core/src/indexer/fixtures/anvil-image.txt)
+if ! [[ "$$ANVIL_IMAGE" =~ ^ghcr.io/foundry-rs/foundry@sha256:[a-f0-9]{64}$$ ]]; then
+  echo 'The Anvil fixture image must use its reviewed repository and immutable digest.' >&2
+  exit 2
+fi
 toolchain_fingerprint=$$( \
   sha256sum containers/development/Dockerfile containers/development/images.env rust-toolchain.toml | \
     sha256sum | cut -d' ' -f1)
@@ -289,6 +298,8 @@ tests/posture: ## Check rendered Compose mounts, permissions, resources, and net
 	$(require_toolchain_image)
 	export RINDEXER_RUNNER_IMAGE="$$toolchain_image" RINDEXER_SOURCE_TAR="$$scratch_dir/source.tar" RINDEXER_BUILD_VOLUME=rindexer-posture-unused
 	: > "$$RINDEXER_SOURCE_TAR"
+	# Include the optional chain fixture in policy checks; config starts no services.
+	compose_profile_args=(--profile native-transfers)
 	$(compose) config --format json > "$$scratch_dir/compose.json"
 	chmod 0444 "$$scratch_dir/compose.json"
 	docker run --rm --pull never --platform linux/amd64 --network none --read-only \
@@ -451,3 +462,19 @@ tests/nested-tuples/docker: tests/posture ## Check nested tuple JSON and the Pos
 	$(compose) run --rm --no-deps -T offline nested-tuples-compile
 	$(compose) up -d --no-build --pull never --wait --wait-timeout 90 postgres
 	$(compose) run --rm --no-deps -T postgres-tests nested-tuples
+
+.PHONY: tests/native-transfer-status/image tests/native-transfer-status/docker
+
+tests/native-transfer-status/image: ## Acquire the pinned Anvil fixture image (network)
+	@$(container_invocation)
+	docker pull --platform linux/amd64 "$$ANVIL_IMAGE"
+
+tests/native-transfer-status/docker: tests/posture ## Check native credits against accepting/reverting contracts on a disposable chain
+	@$(call offline_runner,$$dependency_image)
+	if ! docker image inspect "$$ANVIL_IMAGE" >/dev/null; then
+	  echo 'Run make tests/native-transfer-status/image first.' >&2; exit 2
+	fi
+	$(compose) run --rm --no-deps -T offline native-transfer-status-compile
+	compose_profile_args=(--profile native-transfers)
+	$(compose) up -d --no-build --pull never --wait --wait-timeout 90 postgres anvil
+	$(compose) run --rm --no-deps -T -e RINDEXER_TEST_ANVIL_URL=http://anvil:8545 postgres-tests native-transfer-status

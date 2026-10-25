@@ -43,12 +43,22 @@ case "$1" in
       -E '(test(/^indexer::reorg::/) | test(/^indexer::fetch_logs::tests::all_live_streams_refetch_after_shared_rollback$/) | (test(/^indexer::native_transfer::tests::/) & test(/reorg/)))'
     ;;
   postgres-replay-compile)
-    exec cargo nextest run --frozen -p rindexer --lib --no-run -E 'test(/postgres_replay_tests::/)'
+    exec cargo nextest run --frozen -p rindexer --lib --no-run -E 'test(/postgres_replay_tests::/) & not test(/_on_anvil$/)'
     ;;
   postgres-replay)
     : "${RINDEXER_TEST_POSTGRES_URL:?missing explicit PostgreSQL fixture}"
     exec timeout --signal=TERM --kill-after=20s 900s cargo nextest run --frozen \
-      -p rindexer --lib --no-fail-fast --no-capture -E 'test(/postgres_replay_tests::/)'
+      -p rindexer --lib --no-fail-fast --no-capture -E 'test(/postgres_replay_tests::/) & not test(/_on_anvil$/)'
+    ;;
+  native-transfer-status-compile)
+    exec cargo nextest run --frozen -p rindexer --lib --no-run \
+      -E 'test(/native_transfer_status_tests::/)'
+    ;;
+  native-transfer-status)
+    : "${RINDEXER_TEST_POSTGRES_URL:?missing explicit PostgreSQL fixture}"
+    : "${RINDEXER_TEST_ANVIL_URL:?missing explicit Anvil fixture}"
+    exec timeout --signal=TERM --kill-after=20s 900s cargo nextest run --frozen \
+      -p rindexer --lib --no-fail-fast --no-capture -E 'test(/native_transfer_status_tests::/)'
     ;;
   trace-bindings)
     exec python3 -B containers/development/typings.py check-traces --root /work ;;

@@ -33,6 +33,30 @@ x-runner: &runner
   entrypoint: [bash, /input/run.sh]
 
 services:
+  anvil:
+    image: ${ANVIL_IMAGE:?missing pinned Anvil fixture image}
+    profiles: [native-transfers]
+    pull_policy: never
+    platform: linux/amd64
+    user: '65532:65532'
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: 1
+    environment:
+      HOME: /tmp
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,mode=1777,size=64m
+    entrypoint: [/usr/local/bin/anvil]
+    command: [--host, 0.0.0.0, --chain-id, '31337', --silent]
+    networks: [fixtures]
+    healthcheck:
+      test: [CMD, /usr/local/bin/cast, rpc, --rpc-url, 'http://127.0.0.1:8545', eth_chainId]
+      interval: 2s
+      timeout: 2s
+      retries: 30
   offline:
     <<: *runner
     network_mode: none
