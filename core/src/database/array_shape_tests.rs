@@ -71,6 +71,42 @@ fn nested_values() -> Vec<(&'static str, DynSolValue, Value)> {
             json!([[["1", U256::MAX.to_string()], []], []]),
         ),
         ("uint256[][]", DynSolValue::Array(vec![]), json!([])),
+        (
+            "bool[2][]",
+            DynSolValue::Array(vec![DynSolValue::FixedArray(vec![
+                DynSolValue::Bool(true),
+                DynSolValue::Bool(false),
+            ])]),
+            json!([[true, false]]),
+        ),
+        (
+            "bytes4[][]",
+            DynSolValue::Array(vec![DynSolValue::Array(vec![DynSolValue::FixedBytes(
+                B256::repeat_byte(0x11),
+                4,
+            )])]),
+            json!([["0x11111111"]]),
+        ),
+        (
+            "string[][]",
+            DynSolValue::Array(vec![DynSolValue::Array(vec![DynSolValue::String(
+                "hello".to_string(),
+            )])]),
+            json!([["hello"]]),
+        ),
+        (
+            "int256[][]",
+            DynSolValue::Array(vec![DynSolValue::Array(vec![DynSolValue::Int(
+                alloy::primitives::I256::MIN,
+                256,
+            )])]),
+            json!([[alloy::primitives::I256::MIN.to_string()]]),
+        ),
+        (
+            "address[][]",
+            DynSolValue::Array(vec![DynSolValue::Array(vec![DynSolValue::Address(Address::ZERO)])]),
+            json!([["0x0000000000000000000000000000000000000000"]]),
+        ),
     ]
 }
 

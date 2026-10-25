@@ -1,3 +1,4 @@
+use crate::helpers::solidity_type_parts;
 use std::path::Path;
 use tracing::{error, info};
 
@@ -371,8 +372,11 @@ pub fn drop_tables_for_indexer_clickhouse(project_path: &Path, indexer: &Indexer
 
 #[allow(clippy::manual_strip)]
 pub fn solidity_type_to_clickhouse_type(abi_type: &str) -> String {
-    let is_array = abi_type.ends_with("[]");
-    let base_type = abi_type.trim_end_matches("[]");
+    let (base_type, dimensions) = solidity_type_parts(abi_type);
+    let is_array = dimensions > 0;
+    if dimensions > 1 && base_type != "tuple" {
+        return "String".to_string();
+    }
 
     let sql_type = match base_type {
         "address" => "FixedString(42)",

@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use crate::helpers::parse_solidity_integer_type;
+use crate::helpers::{parse_solidity_integer_type, solidity_type_parts};
 use crate::{abi::ABIInput, event::callback_registry::TxInformation, types::core::LogParam};
 #[allow(deprecated)]
 use alloy::{
@@ -622,8 +622,10 @@ impl EthereumSqlTypeWrapper {
                 values.iter().map(|v| format!("'{v}'")).collect::<Vec<_>>().join(", ")
             ),
 
+            EthereumSqlTypeWrapper::JSONB(value) => format!("'{}'", ch_escape(&value.to_string())),
+
             // Remaining PG-only types
-            EthereumSqlTypeWrapper::Uuid(_) | EthereumSqlTypeWrapper::JSONB(_) => {
+            EthereumSqlTypeWrapper::Uuid(_) => {
                 panic!(
                     "Unsupported '{}' EthereumSqlTypeWrapper variant for ClickHouse serialization",
                     self.raw_name()
@@ -1234,8 +1236,11 @@ impl ToSql for EthereumSqlTypeWrapper {
 pub fn solidity_type_to_ethereum_sql_type_wrapper(
     abi_type: &str,
 ) -> Option<EthereumSqlTypeWrapper> {
-    let is_array = abi_type.ends_with("[]");
-    let base_type = abi_type.trim_end_matches("[]");
+    let (base_type, dimensions) = solidity_type_parts(abi_type);
+    let is_array = dimensions > 0;
+    if dimensions > 1 || (base_type == "tuple" && is_array) {
+        return Some(EthereumSqlTypeWrapper::JSONB(json!([])));
+    }
 
     match base_type {
         "string" => Some(if is_array {
@@ -1621,7 +1626,8 @@ fn map_log_token_to_ethereum_wrapper(
             vec![EthereumSqlTypeWrapper::Bytes(Bytes::from(bytes.clone()))]
         }
         DynSolValue::FixedArray(tokens) | DynSolValue::Array(tokens) => {
-            if abi_input.type_.starts_with("tuple[") {
+            let (base_type, dimensions) = solidity_type_parts(&abi_input.type_);
+            if dimensions > 1 || base_type == "tuple" {
                 return vec![EthereumSqlTypeWrapper::JSONB(abi_value_to_json(abi_input, token))];
             }
 
@@ -1865,7 +1871,7 @@ fn map_log_token_to_ethereum_wrapper(
                             vec![EthereumSqlTypeWrapper::VecString(vec)]
                         }
                         DynSolValue::FixedArray(_) | DynSolValue::Array(_) => {
-                            unreachable!("Nested arrays are not supported by the EVM")
+                            vec![EthereumSqlTypeWrapper::JSONB(abi_value_to_json(abi_input, token))]
                         }
                         DynSolValue::Tuple(_) | DynSolValue::CustomStruct { .. } => {
                             vec![EthereumSqlTypeWrapper::JSONB(abi_value_to_json(abi_input, token))]
@@ -2481,9 +2487,9 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Unsupported")]
-    fn test_ch_jsonb_panics() {
-        EthereumSqlTypeWrapper::JSONB(json!({"k": "v"})).to_clickhouse_value();
+    fn test_ch_jsonb_preserves_escaped_json_text() {
+        let wrapper = EthereumSqlTypeWrapper::JSONB(json!({"k": r"quote' and slash\"}));
+        assert_eq!(wrapper.to_clickhouse_value(), r#"'{"k":"quote\' and slash\\\\"}'"#);
     }
 
     #[test]

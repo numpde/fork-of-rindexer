@@ -1,0 +1,44 @@
+# ABI array storage
+
+Non-indexed fixed-size primitive arrays now use the same storage representation as
+one-dimensional dynamic arrays. For example, `uint16[2]` uses PostgreSQL `INTEGER[]`
+and ClickHouse `Array(UInt16)`; `bytes32[2]` uses PostgreSQL `BYTEA[]` and ClickHouse
+`Array(String)`. Fixed lengths remain part of the ABI used to decode events.
+
+Direct arrays with two or more dimensions use PostgreSQL `JSONB` and ClickHouse
+`String` containing JSON. This includes mixed shapes such as `uint256[][2]`.
+JSON preserves ragged arrays, empty inner arrays, empty outer arrays, and nesting.
+Integers are decimal strings to preserve their full precision, byte values and
+addresses are hexadecimal strings, and booleans remain JSON booleans.
+
+For example, `uint256[][]` containing `[[1, 2], []]` is stored as:
+
+```json
+[["1", "2"], []]
+```
+
+Query ClickHouse nested-array columns with JSON functions; these columns are JSON
+text rather than native nested `Array` columns. One-dimensional dynamic arrays
+retain their existing types, encoding, and empty-array behavior. Indexed arrays
+continue to store only the 32-byte topic digest. Tuple-array storage is unchanged;
+ClickHouse tuple arrays remain unsupported.
+
+## Existing projects
+
+Existing fixed-array event columns may have been created as scalar columns. Their
+schema must be corrected before the upgraded encoder writes to them. Existing
+direct nested-array columns must use `JSONB` in PostgreSQL or `String` in ClickHouse,
+including when `disable_create_tables: true` leaves schema management to you.
+
+Stop writers and back up affected data before changing schemas. Identify affected
+columns from the original ABI, including arrays inside flattened scalar tuples.
+Do not cast an old scalar column into a singleton array and assume the event is
+repaired: the missing array elements cannot be recovered from that scalar value.
+
+Use a reviewed rebuild from trusted logs into correctly generated schemas, or a
+reviewed reconciliation covering raw events, application receipts, progress, and
+all derived tables and downstream outputs. Retained receipts can suppress replay;
+changing column types alone does not repair history. See
+[PostgreSQL event replay](/docs/migrations/postgres-event-replay) for receipt and
+rebuild boundaries. Keep indexing stopped until schema and history are consistent.
+The upgrade does not migrate existing columns or repair previous data automatically.

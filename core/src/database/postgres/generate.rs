@@ -1,5 +1,5 @@
 use crate::database::generate::compact_table_name_if_needed;
-use crate::helpers::parse_solidity_integer_type;
+use crate::helpers::{parse_solidity_integer_type, solidity_type_parts};
 use crate::{
     abi::{ABIInput, GenerateAbiPropertiesType},
     helpers::camel_to_snake,
@@ -105,12 +105,12 @@ pub struct GenerateInternalFactoryEventTableNameParams {
 
 #[allow(clippy::manual_strip)]
 pub fn solidity_type_to_db_type(abi_type: &str) -> String {
-    let is_array = abi_type.ends_with("[]");
-    let base_type = abi_type.trim_end_matches("[]");
+    let (base_type, dimensions) = solidity_type_parts(abi_type);
+    let is_array = dimensions > 0;
 
     // Handle tuple arrays as JSONB (both dynamic tuple[] and fixed-size tuple[N])
     // Arrays of tuples cannot be flattened into columns since array length varies
-    if abi_type.starts_with("tuple[") {
+    if dimensions > 1 || (base_type == "tuple" && is_array) {
         return "JSONB".to_string();
     }
 

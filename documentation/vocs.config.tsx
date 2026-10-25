@@ -237,6 +237,10 @@ export default defineConfig({
           link: "/docs/migrations/unsigned-integer-storage",
         },
         {
+          text: "ABI Array Storage",
+          link: "/docs/migrations/abi-array-storage",
+        },
+        {
           text: "PostgreSQL signed integer storage",
           link: "/docs/migrations/signed-integer-storage",
         },

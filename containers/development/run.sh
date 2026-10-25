@@ -152,8 +152,8 @@ case "$1" in
       -E '(test(/unsigned_integer/) | test(/^manifest::contract::tests::test_pg_type_/)) & not test(/::postgres_/)'
     ;;
   array-shapes)
-    cargo nextest run --frozen -p rindexer --lib --no-run -E 'test(/array_shape_tests::/) & not test(/::postgres_/)'
-    exec timeout --signal=TERM --kill-after=20s 900s cargo nextest run --frozen -p rindexer --lib --no-fail-fast --no-capture -E 'test(/array_shape_tests::/) & not test(/::postgres_/)'
+    cargo nextest run --frozen -p rindexer --lib --no-run -E '(test(/array_shape_tests::/) & not test(/::postgres_/)) | test(/^database::sql_type_wrapper::tests::/) | test(/^helpers::solidity::tests::/) | test(/^abi::tests::/) | test(/^generator::events_bindings::tests::/)'
+    exec timeout --signal=TERM --kill-after=20s 900s cargo nextest run --frozen -p rindexer --lib --no-fail-fast --no-capture -E '(test(/array_shape_tests::/) & not test(/::postgres_/)) | test(/^database::sql_type_wrapper::tests::/) | test(/^helpers::solidity::tests::/) | test(/^abi::tests::/) | test(/^generator::events_bindings::tests::/)'
     ;;
   array-shapes-compile)
     exec cargo nextest run --frozen -p rindexer --lib --no-run -E 'test(/array_shape_tests::postgres_/)'

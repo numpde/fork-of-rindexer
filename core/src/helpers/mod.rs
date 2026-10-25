@@ -7,6 +7,7 @@ pub use array::chunk_hashset;
 pub use evm_log::{
     halved_block_number, is_relevant_block, map_log_params_to_raw_values, parse_log, parse_topic,
 };
+pub(crate) use solidity::solidity_type_parts;
 pub use solidity::{
     is_irregular_width_solidity_integer_type, is_solidity_static_bytes_type,
     parse_solidity_integer_type,

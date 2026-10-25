@@ -1,9 +1,17 @@
+// ABI validation owns suffix syntax and fixed lengths. Storage needs the scalar
+// type and number of dimensions; fixed and dynamic dimensions use the same mapping.
+pub(crate) fn solidity_type_parts(solidity_type: &str) -> (&str, usize) {
+    let mut parts = solidity_type.split('[');
+    let base = parts.next().unwrap_or(solidity_type);
+    (base, parts.count())
+}
+
 /// Extracts the integer type and its size (bit width) from a Solidity type string.
 /// Supports array variants (e.g., `uint256[]`, `int128[3]`).
 /// Panics if the type is not a valid Solidity integer type.
 pub fn parse_solidity_integer_type(solidity_type: &str) -> (&str, usize) {
     // Strip array suffix (e.g., "[]" or "[N]") if present
-    let base_type = solidity_type.split('[').next().unwrap_or(solidity_type);
+    let base_type = solidity_type_parts(solidity_type).0;
     match base_type {
         t if t.starts_with("int") => ("int", t[3..].parse().expect("Invalid intN type")),
         t if t.starts_with("uint") => ("uint", t[4..].parse().expect("Invalid uintN type")),
