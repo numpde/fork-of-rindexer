@@ -501,3 +501,15 @@ tests/native-transfer-recovery/docker: tests/posture ## Check queued native work
 tests/view-call-decoding/docker: tests/posture ## Check large view-call tuples and explicit return types through RPC and caches
 	@$(call offline_runner,$$dependency_image)
 	$(compose) run --rm --no-deps -T offline view-call-decoding
+
+.PHONY: tests/array-shapes/docker tests/array-shapes/postgres
+
+tests/array-shapes/docker: tests/posture ## Check fixed and direct nested ABI array schemas and values offline
+	@$(call offline_runner,$$dependency_image)
+	$(compose) run --rm --no-deps -T offline array-shapes
+
+tests/array-shapes/postgres: tests/posture ## Read back fixed and direct nested ABI arrays through PostgreSQL INSERT and COPY
+	@$(call offline_runner,$$dependency_image)
+	$(compose) run --rm --no-deps -T offline array-shapes-compile
+	$(compose) up -d --no-build --pull never --wait --wait-timeout 90 postgres
+	$(compose) run --rm --no-deps -T postgres-tests array-shapes-postgres

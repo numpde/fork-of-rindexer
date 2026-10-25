@@ -151,6 +151,17 @@ case "$1" in
       -p rindexer --lib --no-fail-fast --no-capture \
       -E '(test(/unsigned_integer/) | test(/^manifest::contract::tests::test_pg_type_/)) & not test(/::postgres_/)'
     ;;
+  array-shapes)
+    cargo nextest run --frozen -p rindexer --lib --no-run -E 'test(/array_shape_tests::/) & not test(/::postgres_/)'
+    exec timeout --signal=TERM --kill-after=20s 900s cargo nextest run --frozen -p rindexer --lib --no-fail-fast --no-capture -E 'test(/array_shape_tests::/) & not test(/::postgres_/)'
+    ;;
+  array-shapes-compile)
+    exec cargo nextest run --frozen -p rindexer --lib --no-run -E 'test(/array_shape_tests::postgres_/)'
+    ;;
+  array-shapes-postgres)
+    : "${RINDEXER_TEST_POSTGRES_URL:?missing explicit PostgreSQL fixture}"
+    exec timeout --signal=TERM --kill-after=20s 900s cargo nextest run --frozen -p rindexer --lib --no-fail-fast --no-capture -E 'test(/array_shape_tests::postgres_/)'
+    ;;
   nested-arrays)
     cargo nextest run --frozen -p rindexer --lib --no-run \
       -E '(test(/^database::nested_array_tests::/) & not test(/::postgres_/)) | test(/^database::sql_type_wrapper::tests::test_.*tuple/)'
