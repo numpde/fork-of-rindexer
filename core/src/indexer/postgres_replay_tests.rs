@@ -1295,18 +1295,16 @@ async fn postgres_same_height_recovery_preserves_the_original_header_until_commi
         original_text
     );
     assert_eq!(notification.take_rewind(), None);
-    // A second observation must still find A in RAM and produce a retry task.
-    let retry = coordinator
-        .on_new_block(100, replacement, parent)
-        .await
-        .unwrap()
-        .expect("failed recovery must retain the old in-memory header");
+    assert!(
+        coordinator.on_new_block(100, replacement, parent).await.is_err(),
+        "ordinary headers must not overwrite unrecovered history"
+    );
     fixture
         .client
         .batch_execute(&format!("ALTER TABLE {schema}.value_saved RENAME TO value"))
         .await
         .unwrap();
-    coordinator.handle_reorg(retry, &ctx).await.unwrap();
+    coordinator.retry_pending_reorg(&ctx).await.unwrap();
     assert_eq!(
         fixture.client.query_one(query, &[]).await.unwrap().get::<_, String>(0),
         format!("{replacement:#x}")
@@ -1399,6 +1397,45 @@ async fn postgres_removed_log_recovery_retries_on_matching_headers() {
         .batch_execute(&format!("ALTER TABLE {schema}.value_saved RENAME TO value"))
         .await
         .unwrap();
+    // Cancel an actual retry while its DELETE waits on a PostgreSQL table lock.
+    // The consumed request and its already-acquired writer guard must survive.
+    let (lock_client, connection) =
+        tokio_postgres::connect(fixture.url.as_str(), tokio_postgres::NoTls).await.unwrap();
+    let connection_task = tokio::spawn(connection);
+    lock_client
+        .batch_execute(&format!("BEGIN; LOCK TABLE {schema}.value IN ACCESS EXCLUSIVE MODE"))
+        .await
+        .unwrap();
+    let mut retry = Box::pin(crate::indexer::reorg::detect_and_handle_reorg(
+        &mut coordinator,
+        100,
+        original,
+        parent,
+        "cancelled recovery test",
+        &ctx,
+    ));
+    let waiting = async {
+        loop {
+            let blocked: i64 = fixture.client.query_one(
+                "SELECT count(*) FROM pg_locks WHERE relation = $1::text::regclass AND NOT granted",
+                &[&format!("{schema}.value")],
+            ).await.unwrap().get(0);
+            if blocked > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    };
+    tokio::select! {
+        result = &mut retry => panic!("rollback unexpectedly completed while the table was locked: {result:?}"),
+        result = tokio::time::timeout(Duration::from_secs(10), waiting) => result.expect("rollback must reach the locked table"),
+    }
+    drop(retry);
+    let barrier = crate::indexer::reorg::event_writer_barrier("ethereum");
+    assert!(barrier.try_read().is_err(), "cancellation must keep unrecovered writers blocked");
+    lock_client.batch_execute("COMMIT").await.unwrap();
+    drop(lock_client);
+    connection_task.await.unwrap().unwrap();
     let recovered = crate::indexer::reorg::detect_and_handle_reorg(
         &mut coordinator,
         100,
@@ -1417,6 +1454,11 @@ async fn postgres_removed_log_recovery_retries_on_matching_headers() {
         format!("{replacement:#x}")
     );
     assert_eq!(notification.take_rewind(), Some(100));
+    let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+    callback(fixture.events(&[1, 2])).await.unwrap();
+    assert_eq!(fixture.position().await, (2, "3".to_string(), "2".to_string()));
+    drop(callback);
+    drop(_writer);
     drop(coordinator);
     fixture.finish().await;
 }

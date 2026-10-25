@@ -240,6 +240,11 @@ pub async fn detect_and_handle_reorg(
     log_prefix: &str,
     ctx: &ReorgContext<'_>,
 ) -> anyhow::Result<Option<u64>> {
+    if let Some(fork_point) = coordinator.retry_pending_reorg(ctx).await.with_context(|| {
+        format!("{log_prefix} - Pending reorg recovery failed before block {block_number}")
+    })? {
+        return Ok(Some(fork_point));
+    }
     let Some(reorg_task) =
         coordinator.on_new_block(block_number, block_hash, parent_hash).await.with_context(
             || format!("{} - Reorg detection failed on block {}", log_prefix, block_number),

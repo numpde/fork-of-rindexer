@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -12,13 +13,24 @@ use crate::provider::ChainProvider;
 use crate::streams::StreamsClients;
 
 use super::persistence::ReorgBlockHashPersistence;
-use super::task::{DerivedTableInfo, DerivedTableRollbackPlan, EventTableInfo, ReorgTask};
+use super::task::{
+    DerivedTableInfo, DerivedTableRollbackPlan, EventTableInfo, ReorgTask, ReorgTaskResult,
+};
 use super::window::{BlockChainWindow, ParentValidation};
 use super::{event_writer_barrier, ReorgContext};
 
 /// Number of blocks between periodic flushes of the in-memory block window to the database.
 /// Balances write frequency against data-loss risk on crash.
 const FLUSH_INTERVAL: u64 = 50;
+
+/// The request outlives its caller, including cancellation during SQL/RPC awaits.
+/// Keep the acquired barrier here too: a failed attempt must not admit writers.
+#[derive(Default)]
+struct PendingRecovery {
+    tasks: VecDeque<ReorgTask>,
+    notifications: VecDeque<(ReorgTask, ReorgTaskResult)>,
+    writer_guard: Option<OwnedRwLockWriteGuard<()>>,
+}
 
 pub struct ReorgCoordinator {
     network: String,
@@ -28,8 +40,7 @@ pub struct ReorgCoordinator {
     event_tables: Vec<EventTableInfo>,
     derived_tables: Vec<DerivedTableInfo>,
     rollback_plan: DerivedTableRollbackPlan,
-    /// Retained after a failed rollback so no event writer can race ahead of its retry.
-    rollback_writer_guard: Option<OwnedRwLockWriteGuard<()>>,
+    pending_recovery: PendingRecovery,
     /// All `StreamsClients` configured for this network across every indexing
     /// pipeline (contract events + native transfers). When a reorg is handled
     /// we fan the retraction notification across all of them so consumers
@@ -60,7 +71,7 @@ impl ReorgCoordinator {
             event_tables,
             derived_tables,
             rollback_plan: DerivedTableRollbackPlan::default(),
-            rollback_writer_guard: None,
+            pending_recovery: PendingRecovery::default(),
             streams_clients,
             blocks_since_flush: 0,
         })
@@ -79,6 +90,8 @@ impl ReorgCoordinator {
         block_hash: B256,
         parent_hash: B256,
     ) -> anyhow::Result<Option<ReorgTask>> {
+        anyhow::ensure!(self.pending_recovery.tasks.is_empty() && self.pending_recovery.notifications.is_empty(),
+            "Cannot accept block {block_number} on network {} before retrying pending reorg recovery", self.network);
         // A one-block fork can preserve its parent and tip height. Compare the
         // observed block itself before treating a matching parent as progress.
         if let Some((stored_hash, _)) = self.window.get(block_number) {
@@ -396,29 +409,62 @@ impl ReorgCoordinator {
         reorg_task: ReorgTask,
         ctx: &ReorgContext<'_>,
     ) -> anyhow::Result<()> {
-        let writer_guard = match self.rollback_writer_guard.take() {
-            Some(guard) => guard,
-            None => event_writer_barrier(&self.network).write_owned().await,
-        };
-        let result = match reorg_task
-            .execute_with_rollback_plan(
-                &mut self.window,
-                ctx.postgres,
-                ctx.clickhouse,
-                self.provider.as_ref(),
-                &self.rollback_plan,
-            )
-            .await
-        {
-            Ok(result) => result,
-            Err(error) => {
-                self.rollback_writer_guard = Some(writer_guard);
-                return Err(error);
-            }
-        };
-        super::publish_rewind(&self.network, reorg_task.fork_point);
-        drop(writer_guard);
+        self.pending_recovery.tasks.push_back(reorg_task);
+        self.retry_pending_reorg(ctx).await?;
+        Ok(())
+    }
 
+    /// Retry consumed notifications before accepting another header. Requests
+    /// arriving during an outage queue behind the failed one rather than replace it.
+    pub(crate) async fn retry_pending_reorg(
+        &mut self,
+        ctx: &ReorgContext<'_>,
+    ) -> anyhow::Result<Option<u64>> {
+        let mut earliest_fork: Option<u64> = None;
+        while !self.pending_recovery.tasks.is_empty() {
+            if self.pending_recovery.writer_guard.is_none() {
+                self.pending_recovery.writer_guard =
+                    Some(event_writer_barrier(&self.network).write_owned().await);
+            }
+            let reorg_task = self.pending_recovery.tasks.front().expect("pending recovery");
+            let result = reorg_task
+                .execute_with_rollback_plan(
+                    &mut self.window,
+                    ctx.postgres,
+                    ctx.clickhouse,
+                    self.provider.as_ref(),
+                    &self.rollback_plan,
+                )
+                .await?;
+            // No await separates commit, invalidation and removal of the request.
+            // Cancellation before commit retains both the request and the guard.
+            super::publish_rewind(&self.network, reorg_task.fork_point);
+            earliest_fork = Some(
+                earliest_fork
+                    .map_or(reorg_task.fork_point, |previous| previous.min(reorg_task.fork_point)),
+            );
+            let reorg_task = self.pending_recovery.tasks.pop_front().expect("completed recovery");
+            self.pending_recovery.notifications.push_back((reorg_task, result));
+        }
+        // Callbacks may themselves need the barrier. Drain every queued rollback
+        // before releasing it, then deliver notifications without holding it.
+        self.pending_recovery.writer_guard = None;
+        while let Some((task, result)) = self.pending_recovery.notifications.front() {
+            earliest_fork = Some(
+                earliest_fork.map_or(task.fork_point, |previous| previous.min(task.fork_point)),
+            );
+            self.notify_reorg(task, result, ctx).await;
+            self.pending_recovery.notifications.pop_front();
+        }
+        Ok(earliest_fork)
+    }
+
+    async fn notify_reorg(
+        &self,
+        reorg_task: &ReorgTask,
+        result: &ReorgTaskResult,
+        ctx: &ReorgContext<'_>,
+    ) {
         let affected_tx_hashes: Vec<B256> =
             result.affected_tx_hashes.iter().filter_map(|h| B256::from_str(h).ok()).collect();
 
@@ -502,8 +548,6 @@ impl ReorgCoordinator {
                 );
             }
         }
-
-        Ok(())
     }
 
     /// Persist the new block to DB and periodically prune old entries.
@@ -573,7 +617,7 @@ mod tests {
             event_tables: vec![],
             derived_tables: vec![],
             rollback_plan: DerivedTableRollbackPlan::default(),
-            rollback_writer_guard: None,
+            pending_recovery: PendingRecovery::default(),
             streams_clients: vec![],
             blocks_since_flush: 0,
         }
@@ -768,6 +812,10 @@ mod tests {
         const NETWORK: &str = "writer-barrier-test";
         let mut coordinator = make_coordinator(BlockChainWindow::try_new(100).unwrap());
         coordinator.network = NETWORK.to_string();
+        coordinator.provider = Some(Arc::new(
+            crate::provider::mock::MockChainProvider::new(1)
+                .with_block_fetch_error("temporary RPC outage"),
+        ));
         let ctx =
             ReorgContext { postgres: None, clickhouse: None, registry: None, trace_registry: None };
         let task = |network: &str| ReorgTask {
@@ -781,17 +829,39 @@ mod tests {
 
         let barrier = event_writer_barrier(NETWORK);
         let writer = barrier.clone().read_owned().await;
-        let mut rollback = Box::pin(coordinator.handle_reorg(task("invalid network"), &ctx));
+        let mut rollback = Box::pin(coordinator.handle_reorg(task(NETWORK), &ctx));
         assert!(futures::poll!(&mut rollback).is_pending(), "rollback must drain active writers");
         drop(writer);
-        rollback.await.expect_err("invalid network must fail rollback");
+        rollback.await.expect_err("RPC failure must retain recovery");
         assert!(barrier.try_read().is_err(), "failed rollback must keep event writers blocked");
 
-        coordinator
-            .handle_reorg(task(NETWORK), &ctx)
-            .await
-            .expect("retry should release the writer barrier");
+        // A distinct signal must survive behind the failed operation as well.
+        let mut earlier = task(NETWORK);
+        earlier.fork_point = 9;
+        assert!(coordinator.handle_reorg(earlier, &ctx).await.is_err());
+        assert_eq!(coordinator.pending_recovery.tasks.len(), 2);
+        coordinator.provider = None;
+        assert_eq!(coordinator.retry_pending_reorg(&ctx).await.unwrap(), Some(9));
+        assert!(coordinator.pending_recovery.tasks.is_empty());
         assert!(barrier.try_read().is_ok(), "successful retry must release event writers");
+    }
+
+    #[tokio::test]
+    async fn cancelled_recovery_retains_the_consumed_request() {
+        const NETWORK: &str = "cancelled-rollback-test";
+        let mut coordinator = make_coordinator(BlockChainWindow::try_new(100).unwrap());
+        coordinator.network = NETWORK.to_string();
+        let ctx =
+            ReorgContext { postgres: None, clickhouse: None, registry: None, trace_registry: None };
+        let barrier = event_writer_barrier(NETWORK);
+        let writer = barrier.clone().read_owned().await;
+        let task = coordinator.try_create_reorg_task_for_block_range(10, 11).unwrap();
+        let mut recovery = Box::pin(coordinator.handle_reorg(task, &ctx));
+        assert!(futures::poll!(&mut recovery).is_pending());
+        drop(recovery);
+        drop(writer);
+        assert_eq!(coordinator.retry_pending_reorg(&ctx).await.unwrap(), Some(10));
+        assert!(barrier.try_read().is_ok());
     }
 
     #[tokio::test]
@@ -1018,7 +1088,7 @@ mod tests {
                 },
             ],
             rollback_plan: DerivedTableRollbackPlan::default(),
-            rollback_writer_guard: None,
+            pending_recovery: PendingRecovery::default(),
             streams_clients: vec![],
             blocks_since_flush: 0,
         };
@@ -1049,7 +1119,7 @@ mod tests {
                 journal_columns: vec![],
             }],
             rollback_plan: DerivedTableRollbackPlan::default(),
-            rollback_writer_guard: None,
+            pending_recovery: PendingRecovery::default(),
             streams_clients: vec![],
             blocks_since_flush: 0,
         };
@@ -1079,7 +1149,7 @@ mod tests {
             .unwrap()],
             derived_tables: vec![],
             rollback_plan: DerivedTableRollbackPlan::default(),
-            rollback_writer_guard: None,
+            pending_recovery: PendingRecovery::default(),
             streams_clients: vec![],
             blocks_since_flush: 0,
         };
@@ -1113,7 +1183,7 @@ mod tests {
             event_tables: vec![],
             derived_tables: vec![],
             rollback_plan: DerivedTableRollbackPlan::default(),
-            rollback_writer_guard: None,
+            pending_recovery: PendingRecovery::default(),
             streams_clients,
             blocks_since_flush: 0,
         }
