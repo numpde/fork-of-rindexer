@@ -92,6 +92,16 @@ impl AbiProperty {
 }
 
 impl ABIInput {
+    /// Indexed arrays and tuples expose only their topic digest. Their original
+    /// Solidity type still defines the event signature, never the stored value.
+    pub(crate) fn storage_type(&self) -> &str {
+        if self.indexed == Some(true) && (self.type_ == "tuple" || self.type_.contains('[')) {
+            "bytes32"
+        } else {
+            &self.type_
+        }
+    }
+
     pub fn format_param_type(&self) -> Result<String, ParamTypeError> {
         match self.type_.as_str() {
             "tuple" => {
@@ -116,14 +126,11 @@ impl ABIInput {
         inputs
             .iter()
             .flat_map(|input| {
-                // For tuple arrays (both dynamic tuple[] and fixed-size tuple[N]),
-                // don't flatten - store as JSONB since array length varies
-                let is_tuple_array = input.type_.starts_with("tuple[");
-
-                // Regular tuples with components get flattened into columns via recursion
-                // Tuple arrays skip this and are treated as leaf nodes for JSONB storage
+                let storage_type = input.storage_type();
+                // Only non-indexed scalar tuples flatten into component columns.
+                // Tuple arrays remain JSONB leaves; indexed complex fields are hash leaves.
                 if let Some(components) = &input.components {
-                    if !is_tuple_array {
+                    if storage_type == "tuple" {
                         let new_path = path.clone().map_or_else(
                             || vec![AbiNamePropertiesPath::new(&input.name, &input.type_)],
                             |mut p| {
@@ -140,7 +147,7 @@ impl ABIInput {
                     }
                 }
 
-                // Leaf node (primitive type, or tuple[] which is stored as JSONB)
+                // One stored value: a primitive, topic hash, or tuple-array JSONB.
                 {
                     let prefix = path.as_ref().map(|p| {
                         p.iter()
@@ -155,10 +162,10 @@ impl ABIInput {
                                 "\"{}{}\" {}",
                                 prefix.map_or_else(|| "".to_string(), |p| format!("{p}_")),
                                 camel_to_snake(&input.name),
-                                solidity_type_to_db_type(&input.type_)
+                                solidity_type_to_db_type(storage_type)
                             );
 
-                            vec![AbiProperty::new(value, &input.name, &input.type_, path.clone())]
+                            vec![AbiProperty::new(value, &input.name, storage_type, path.clone())]
                         }
                         GenerateAbiPropertiesType::PostgresColumnsNamesOnly
                         | GenerateAbiPropertiesType::CsvHeaderNames => {
@@ -168,7 +175,7 @@ impl ABIInput {
                                 camel_to_snake(&input.name),
                             );
 
-                            vec![AbiProperty::new(value, &input.name, &input.type_, path.clone())]
+                            vec![AbiProperty::new(value, &input.name, storage_type, path.clone())]
                         }
                         GenerateAbiPropertiesType::Object => {
                             let value = format!(
@@ -177,17 +184,17 @@ impl ABIInput {
                                 camel_to_snake(&input.name),
                             );
 
-                            vec![AbiProperty::new(value, &input.name, &input.type_, path.clone())]
+                            vec![AbiProperty::new(value, &input.name, storage_type, path.clone())]
                         }
                         GenerateAbiPropertiesType::ClickhouseWithDataTypes => {
                             let value = format!(
                                 "\"{}{}\" {}",
                                 prefix.map_or_else(|| "".to_string(), |p| format!("{}_", p)),
                                 camel_to_snake(&input.name),
-                                solidity_type_to_clickhouse_type(&input.type_)
+                                solidity_type_to_clickhouse_type(storage_type)
                             );
 
-                            vec![AbiProperty::new(value, &input.name, &input.type_, path.clone())]
+                            vec![AbiProperty::new(value, &input.name, storage_type, path.clone())]
                         }
                     }
                 }

@@ -1899,7 +1899,7 @@ fn count_components(components: &[ABIInput]) -> usize {
     components
         .iter()
         .map(|component| {
-            if component.type_ == "tuple" {
+            if component.storage_type() == "tuple" {
                 let nested_components =
                     component.components.as_ref().expect("Tuple should have components defined");
                 1 + count_components(nested_components)
@@ -1926,7 +1926,7 @@ pub fn map_ethereum_wrapper_to_json(
             continue;
         }
         if let Some(wrapper) = wrappers.get(current_wrapper_index) {
-            if abi_input.type_ == "tuple" {
+            if abi_input.storage_type() == "tuple" {
                 let components =
                     abi_input.components.as_ref().expect("Tuple should have components defined");
                 let total_properties = count_components(components);

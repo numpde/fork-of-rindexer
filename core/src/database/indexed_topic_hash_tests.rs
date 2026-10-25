@@ -62,6 +62,16 @@ fn indexed_complex_fields_have_one_bytea_hash_column() {
         let (inputs, wrapper, _) = decoded(kind);
         assert_eq!(generate_columns_with_data_types(&inputs), vec!["\"payload\" BYTEA"], "{kind}");
         assert_eq!(wrapper.to_type(), Type::BYTEA, "{kind}");
+        let clickhouse = ABIInput::generate_abi_name_properties(
+            &inputs,
+            &crate::abi::GenerateAbiPropertiesType::ClickhouseWithDataTypes,
+            None,
+        );
+        assert_eq!(
+            clickhouse.iter().map(|property| property.value.as_str()).collect::<Vec<_>>(),
+            vec!["\"payload\" String"],
+            "{kind}"
+        );
     }
 }
 
@@ -131,4 +141,14 @@ async fn postgres_indexed_hashes_insert() {
 #[tokio::test]
 async fn postgres_indexed_hashes_copy() {
     roundtrip(true).await;
+}
+
+#[test]
+fn unindexed_tuple_members_still_flatten_into_their_original_columns() {
+    let (mut inputs, _, _) = decoded("tuple");
+    inputs[0].indexed = Some(false);
+    assert_eq!(
+        generate_columns_with_data_types(&inputs),
+        vec!["\"payload_x\" VARCHAR(78)", "\"payload_y\" VARCHAR(78)",]
+    );
 }

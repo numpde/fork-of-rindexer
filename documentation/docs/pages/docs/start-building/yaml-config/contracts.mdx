@@ -827,3 +827,22 @@ to index the data. You can read more about it [here](/docs/start-building/stream
 ## chat
 
 You can configure chat to send messages You can read more about it [here](/docs/start-building/chatbots).
+
+### Storage of indexed arrays and tuples
+
+An indexed Solidity array or tuple is available in an event topic only as a
+32-byte Keccak digest. rindexer stores that digest in one PostgreSQL `BYTEA`
+column named after the input. It does not reconstruct array elements or tuple
+members. ClickHouse uses its existing byte-value `String` representation.
+Stream and chat JSON use lowercase hex without `0x`, as for other byte fields.
+Indexed `string` fields retain their `0x`-prefixed hex string; indexed `bytes`
+fields retain their byte representation.
+
+When upgrading a project with indexed arrays or tuples, stop its writers and
+rebuild the affected raw tables, derived results, application receipts and
+checkpoints from trusted chain history in a fresh database. The old array or
+flattened-member columns do not contain values from which the topic digest can
+be recovered by a SQL cast. Update downstream SQL and payload readers to consume
+the single digest field. Custom-table keys or values receiving it must use
+`bytes32`. For Rust projects, run `rindexer codegen typings` before restarting.
+The event ABI and signature still describe the original Solidity types.
