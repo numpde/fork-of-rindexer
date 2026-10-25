@@ -1897,14 +1897,14 @@ impl From<&Address> for EthereumSqlTypeWrapper {
     }
 }
 
-fn count_components(components: &[ABIInput]) -> usize {
+fn flattened_wrapper_count(components: &[ABIInput]) -> usize {
     components
         .iter()
         .map(|component| {
             if component.storage_type() == "tuple" {
                 let nested_components =
                     component.components.as_ref().expect("Tuple should have components defined");
-                1 + count_components(nested_components)
+                flattened_wrapper_count(nested_components)
             } else {
                 1
             }
@@ -1931,23 +1931,20 @@ pub fn map_ethereum_wrapper_to_json(
             if abi_input.storage_type() == "tuple" {
                 let components =
                     abi_input.components.as_ref().expect("Tuple should have components defined");
-                let total_properties = count_components(components);
-                // Extract the correct slice of wrappers for this tuple.
-                // We need wrappers[current_index..current_index + count], not wrappers[current_index..count]
-                // because current_index is the starting position, and total_properties is the number of components.
-                // For example: if we're at index 3 and need 12 components, we want indices 3-14 (12 items),
-                // not indices 3-11 (9 items).
+                let tuple_wrapper_count = flattened_wrapper_count(components);
+                // A scalar tuple owns its flattened leaf wrappers, not a
+                // separate slot for each nested tuple container.
                 let tuple_value = map_ethereum_wrapper_to_json(
                     components,
-                    &wrappers[current_wrapper_index..current_wrapper_index + total_properties],
+                    &wrappers[current_wrapper_index..current_wrapper_index + tuple_wrapper_count],
                     transaction_information,
                     true,
                 );
                 result.insert(abi_input.name.clone(), tuple_value);
-                for i in current_wrapper_index..current_wrapper_index + total_properties {
+                for i in current_wrapper_index..current_wrapper_index + tuple_wrapper_count {
                     wrappers_index_processed.push(i);
                 }
-                current_wrapper_index += total_properties;
+                current_wrapper_index += tuple_wrapper_count;
             } else {
                 let value = match wrapper {
                     EthereumSqlTypeWrapper::U64(u)
