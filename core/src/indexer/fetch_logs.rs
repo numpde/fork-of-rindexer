@@ -3512,6 +3512,160 @@ mod tests {
         assert!(provider.ranges().is_empty());
     }
 
+    async fn final_historic_retry_stays_within_end_block(timestamps: bool, parallel: bool) {
+        let provider = RecordingLiveProvider::recording(
+            MockChainProvider::new(1)
+                .with_logs(vec![make_log_at_block(100), make_log_at_block(102)]),
+        );
+        let provider =
+            if timestamps { provider } else { provider.with_transient_first_logs_error() };
+        let failing_clock = BlockClock::new(
+            None,
+            None,
+            Arc::new(
+                MockChainProvider::new(1).with_block_fetch_error("temporary timestamp failure"),
+            ),
+        );
+        let mut header = make_block(100);
+        header.header.inner.timestamp = 1234;
+        let good_clock = BlockClock::new(
+            None,
+            None,
+            Arc::new(MockChainProvider::new(1).with_blocks(vec![header, make_block(102)])),
+        );
+        let filter = RindexerEventFilter::empty_for_test()
+            .set_from_block(U64::from(100))
+            .set_to_block(U64::from(100));
+        let (tx, mut rx) = mpsc::channel(4);
+        let retry = if parallel {
+            let (batch, next, _) = fetch_logs_once(
+                timestamps,
+                &failing_clock,
+                &provider,
+                filter,
+                None,
+                U64::from(100),
+                "test",
+                0,
+            )
+            .await;
+            assert!(batch.is_none());
+            next.unwrap().next
+        } else {
+            fetch_historic_logs_stream(
+                timestamps,
+                failing_clock,
+                &provider,
+                &tx,
+                &B256::ZERO,
+                filter,
+                None,
+                U64::from(100),
+                "test",
+                0,
+            )
+            .await
+            .unwrap()
+            .next
+        };
+        assert!(rx.try_recv().is_err(), "failed attempts must not allocate checkpoint work");
+        let batch = if parallel {
+            fetch_logs_once(
+                timestamps,
+                &good_clock,
+                &provider,
+                retry,
+                None,
+                U64::from(100),
+                "test",
+                0,
+            )
+            .await
+            .0
+            .unwrap()
+        } else {
+            fetch_historic_logs_stream(
+                timestamps,
+                good_clock,
+                &provider,
+                &tx,
+                &B256::ZERO,
+                retry,
+                None,
+                U64::from(100),
+                "test",
+                0,
+            )
+            .await;
+            rx.recv().await.unwrap().unwrap()
+        };
+        assert_eq!(provider.ranges(), vec![(100, 100), (100, 100)]);
+        assert_eq!(
+            batch.to_block,
+            U64::from(100),
+            "dispatch/checkpoint range must respect end_block"
+        );
+        assert_eq!(batch.logs.len(), 1);
+        assert_eq!(batch.logs[0].block_number, Some(100));
+    }
+
+    #[tokio::test]
+    async fn sequential_final_log_retry_respects_end_block() {
+        final_historic_retry_stays_within_end_block(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn sequential_final_timestamp_retry_respects_end_block() {
+        final_historic_retry_stays_within_end_block(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn parallel_final_log_retry_respects_end_block() {
+        final_historic_retry_stays_within_end_block(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn parallel_final_timestamp_retry_respects_end_block() {
+        final_historic_retry_stays_within_end_block(true, true).await;
+    }
+
+    #[test]
+    fn halving_never_expands_tiny_or_maximum_ranges() {
+        for (from, to) in
+            [(100, 100), (100, 101), (100, 102), (u64::MAX - 1, u64::MAX), (u64::MAX, u64::MAX)]
+        {
+            let retry = halved_block_number(U64::from(to), U64::from(from));
+            assert!(retry >= U64::from(from) && retry <= U64::from(to));
+            if from < to {
+                assert!(retry < U64::from(to));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_retry_hints_cannot_skip_or_expand_unfinished_range() {
+        for hint in [
+            "this block range should work: [0x65, 0x66]",
+            "try with this block range [0x65, 0x66]",
+            "block range is too wide",
+            "limited to a 10,000 block range",
+            "block range too large",
+            "unknown error",
+        ] {
+            let result = retry_with_block_range(
+                "test",
+                &ProviderError::CustomError(hint.into()),
+                U64::from(100),
+                U64::from(101),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.from, U64::from(100), "{hint}");
+            assert!(result.to >= result.from && result.to <= U64::from(101), "{hint}");
+        }
+    }
+
     // --- retry_with_block_range tests ---
 
     #[tokio::test]
