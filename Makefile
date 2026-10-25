@@ -407,3 +407,15 @@ tests/signed-integers/postgres: tests/posture ## Read back signed integer scalar
 	$(compose) run --rm --no-deps -T offline signed-integers-compile
 	$(compose) up -d --no-build --pull never --wait --wait-timeout 90 postgres
 	$(compose) run --rm --no-deps -T postgres-tests signed-integers-postgres
+
+.PHONY: tests/nested-arrays/docker tests/nested-arrays/postgres
+
+tests/nested-arrays/docker: tests/posture ## Check nested tuple-array JSON after ABI decoding offline
+	@$(call offline_runner,$$dependency_image)
+	$(compose) run --rm --no-deps -T offline nested-arrays
+
+tests/nested-arrays/postgres: tests/posture ## Read back nested tuple-array JSON through PostgreSQL INSERT and COPY
+	@$(call offline_runner,$$dependency_image)
+	$(compose) run --rm --no-deps -T offline nested-arrays-compile
+	$(compose) up -d --no-build --pull never --wait --wait-timeout 90 postgres
+	$(compose) run --rm --no-deps -T postgres-tests nested-arrays-postgres
