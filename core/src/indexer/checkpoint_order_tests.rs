@@ -150,11 +150,15 @@ impl Fixture {
     }
 
     async fn dispatch(&mut self, block: u64, empty: bool) -> JoinHandle<()> {
+        self.dispatch_block(block, empty, B256::repeat_byte(block as u8)).await
+    }
+
+    async fn dispatch_block(&mut self, block: u64, empty: bool, hash: B256) -> JoinHandle<()> {
         let logs = if empty {
             vec![]
         } else {
             vec![Log {
-                block_hash: Some(B256::repeat_byte(block as u8)),
+                block_hash: Some(hash),
                 block_number: Some(block),
                 transaction_hash: Some(B256::repeat_byte(block as u8)),
                 transaction_index: Some(0),
@@ -688,4 +692,78 @@ async fn terminal_callback_cancels_pending_callbacks_and_blocks_empty_tail() {
     assert!(blocked.is_err(), "empty tails must not restart a permanently failed stream");
     assert_eq!(fixture.cursor(), "1");
     assert_eq!(active_indexing_count(), 0);
+}
+
+#[tokio::test]
+async fn reorg_retires_retrying_callback_before_waiting_for_its_writer_guard() {
+    use crate::indexer::reorg::{
+        BlockChainWindow, ReorgBlockHashPersistence, ReorgContext, ReorgCoordinator,
+    };
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let replacement = Arc::new(AtomicBool::new(false));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let callback: EventCallbackType = {
+        let (entered, release, replacement, attempts) =
+            (entered.clone(), release.clone(), replacement.clone(), attempts.clone());
+        Arc::new(move |events| {
+            let (entered, release, replacement, attempts) =
+                (entered.clone(), release.clone(), replacement.clone(), attempts.clone());
+            Box::pin(async move {
+                if replacement.load(Ordering::SeqCst) {
+                    assert_eq!(events[0].tx_information.block_hash, B256::repeat_byte(22));
+                    return Ok(());
+                }
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    entered.notify_one();
+                    release.notified().await;
+                }
+                Err("required enrichment no longer matches the old block hash".into())
+            })
+        })
+    };
+    let mut fixture = Fixture::new(callback).await;
+    let old = fixture.dispatch(2, false).await;
+    timeout(Duration::from_secs(2), entered.notified()).await.unwrap();
+    let mut coordinator = ReorgCoordinator::new(
+        "ethereum".to_string(),
+        BlockChainWindow::try_new(20).unwrap(),
+        Arc::new(ReorgBlockHashPersistence::new(None, None)),
+        fixture.config.network_contract().cached_provider.clone(),
+        vec![],
+        vec![],
+        vec![],
+    )
+    .unwrap();
+    let mut task = coordinator.try_create_reorg_task_for_block_range(2, 2).unwrap();
+    task.canonical_blocks = vec![(2, B256::repeat_byte(22), B256::repeat_byte(1))];
+    let ctx =
+        ReorgContext { postgres: None, clickhouse: None, registry: None, trace_registry: None };
+    let mut recovery = Box::pin(coordinator.handle_reorg(task, &ctx));
+    assert!(
+        futures::poll!(&mut recovery).is_pending(),
+        "active attempt must finish before rollback"
+    );
+    release.notify_one();
+    timeout(Duration::from_secs(2), &mut recovery)
+        .await
+        .expect("obsolete retries must release the barrier without aborting the callback")
+        .unwrap();
+    drop(recovery);
+    timeout(Duration::from_secs(2), old).await.unwrap().unwrap();
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.cursor(), "1", "retired work cannot checkpoint");
+    replacement.store(true, Ordering::SeqCst);
+    timeout(Duration::from_secs(2), fixture.dispatch_block(2, false, B256::repeat_byte(22)).await)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fixture.cursor(), "2", "replacement work completes");
+    assert!(fixture
+        .config
+        .registry()
+        .failure_state()
+        .reason(fixture.config.id(), "ethereum")
+        .is_none());
 }
