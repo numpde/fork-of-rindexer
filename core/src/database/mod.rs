@@ -16,6 +16,9 @@ mod indexed_topic_hash_tests;
 mod fixed_bytes_tests;
 
 #[cfg(test)]
+pub(crate) mod nested_tuple_tests;
+
+#[cfg(test)]
 mod signed_integer_tests;
 
 #[cfg(test)]

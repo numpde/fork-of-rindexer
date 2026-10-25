@@ -35,6 +35,100 @@ use crate::{
 mod factory_replay_tests;
 
 #[tokio::test]
+async fn postgres_nested_tuple_callback_stores_rows_and_delivers_webhook_json() {
+    use crate::{database::nested_tuple_tests::event_fixture, streams::StreamsClients};
+    use axum::{routing::post, Json, Router};
+
+    for siblings in [false, true] {
+        let (definition, encoded, expected) = event_fixture(siblings);
+        let mut fixture = Fixture::with_event(definition, "Contract").await;
+        fixture.params.tables = Arc::new(vec![]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, mut received) = tokio::sync::mpsc::channel(1);
+        let app = Router::new().route(
+            "/",
+            post(move |Json(payload): Json<serde_json::Value>| {
+                let sender = sender.clone();
+                async move {
+                    sender.send(payload).await.unwrap();
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        fixture.params.streams_clients = Arc::new(Some(
+            StreamsClients::new(
+                serde_json::from_value(
+                    json!({"webhooks": [{"endpoint": format!("http://{address}/"),
+            "shared_secret": "disposable-test-fixture", "networks": ["ethereum"],
+            "events": [{"event_name": "Nested"}]}]}),
+                )
+                .unwrap(),
+            )
+            .await,
+        ));
+        let mut events = fixture.events(&[1]);
+        events[0].log.inner.data = alloy::primitives::LogData::new_unchecked(
+            vec![fixture.params.event.selector()],
+            encoded.into(),
+        );
+        let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+        tokio::time::timeout(Duration::from_secs(10), callback(events)).await.unwrap().unwrap();
+        let delivered =
+            tokio::time::timeout(Duration::from_secs(10), received.recv()).await.unwrap().unwrap();
+        assert_eq!(delivered["event_data"][0]["value"], expected["value"]);
+        if siblings {
+            assert_eq!(delivered["event_data"][0]["after"], expected["after"]);
+        } else {
+            assert!(delivered["event_data"][0].get("after").is_none());
+        }
+        let row = fixture
+            .client
+            .query_one(
+                &format!("SELECT value_inner_x FROM {}", fixture.params.sql_event_table_name),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(row.get::<_, String>(0), "7");
+        if siblings {
+            let row = fixture
+                .client
+                .query_one(
+                    &format!(
+                        "SELECT value_label, \"after\" FROM {}",
+                        fixture.params.sql_event_table_name
+                    ),
+                    &[],
+                )
+                .await
+                .unwrap();
+            assert_eq!(row.get::<_, String>(0), "kept");
+            assert_eq!(row.get::<_, String>(1), "9");
+        }
+        let receipts: i64 = fixture
+            .client
+            .query_one("SELECT count(*) FROM rindexer_internal.event_applications", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(receipts, 1);
+        let schema =
+            generate_indexer_contract_schema_name(&fixture.params.indexer_name, "Contract");
+        let checkpoint = generate_internal_event_table_name(&schema, "Nested");
+        let cursor: String = fixture.client.query_one(&format!("SELECT last_synced_block::text FROM rindexer_internal.{checkpoint} WHERE network = 'ethereum'"), &[]).await.unwrap().get(0);
+        // Streams complete after PG writes, so the callback must defer its cursor.
+        assert_eq!(cursor, "0");
+        drop(callback);
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+        fixture.finish().await;
+    }
+}
+
+#[tokio::test]
 async fn postgres_reorg_never_advances_a_lagging_stream_checkpoint() {
     let fixture = Fixture::new().await;
     let mut lagging = fixture.indexer.clone();

@@ -443,3 +443,11 @@ tests/fixed-bytes/postgres: tests/posture ## Read back fixed-byte values through
 	$(compose) run --rm --no-deps -T offline fixed-bytes-compile
 	$(compose) up -d --no-build --pull never --wait --wait-timeout 90 postgres
 	$(compose) run --rm --no-deps -T postgres-tests fixed-bytes-postgres
+
+.PHONY: tests/nested-tuples/docker
+
+tests/nested-tuples/docker: tests/posture ## Check nested tuple JSON and the PostgreSQL/webhook callback together
+	@$(call offline_runner,$$dependency_image)
+	$(compose) run --rm --no-deps -T offline nested-tuples-compile
+	$(compose) up -d --no-build --pull never --wait --wait-timeout 90 postgres
+	$(compose) run --rm --no-deps -T postgres-tests nested-tuples

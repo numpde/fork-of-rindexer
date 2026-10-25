@@ -165,6 +165,16 @@ case "$1" in
       -p rindexer --lib --no-fail-fast --no-capture \
       -E 'test(/^database::fixed_bytes_tests::postgres_/)'
     ;;
+  nested-tuples-compile)
+    exec cargo nextest run --frozen -p rindexer --lib --no-run \
+      -E 'test(/^database::nested_tuple_tests::/) | test(/postgres_replay_tests::postgres_nested_tuple/)'
+    ;;
+  nested-tuples)
+    : "${RINDEXER_TEST_POSTGRES_URL:?missing explicit PostgreSQL fixture}"
+    exec timeout --signal=TERM --kill-after=20s 900s cargo nextest run --frozen \
+      -p rindexer --lib --no-fail-fast --no-capture \
+      -E 'test(/^database::nested_tuple_tests::/) | test(/postgres_replay_tests::postgres_nested_tuple/)'
+    ;;
   signed-integers)
     cargo nextest run --frozen -p rindexer --lib --no-run \
       -E 'test(/^database::signed_integer(_array)?_tests::/) & not test(/::postgres_/)'
