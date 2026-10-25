@@ -111,6 +111,10 @@ impl HistoricalRpc {
         *self.state.return_data.lock().await = Some(bytes);
     }
 
+    pub(crate) fn reject_hash_calls(&self, reject: bool) {
+        self.state.reject_hash.store(reject, Ordering::SeqCst);
+    }
+
     pub(crate) fn replace(&self) {
         self.state.replacement.store(true, Ordering::SeqCst);
     }

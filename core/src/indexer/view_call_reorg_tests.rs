@@ -130,3 +130,83 @@ async fn postgres_reorg_replaces_cached_view_state_without_restart() {
     rpc.stop().await;
     fixture.finish().await;
 }
+
+async fn required_call_failure_is_atomic(partial: bool) {
+    let mut fixture = Fixture::new().await;
+    let rpc = HistoricalRpc::start().await;
+    rpc.reject_hash_calls(true);
+    let mut tables = fixture.params.tables.as_ref().clone();
+    tables[0].table.events[0].operations[0].set[0].value = Some(format!(
+        "$call($rindexer_contract_address, \"required{}()\")",
+        if partial { "Partial" } else { "Only" }
+    ));
+    if partial {
+        fixture
+            .client
+            .batch_execute(&format!(
+                "ALTER TABLE {} ADD COLUMN source NUMERIC DEFAULT 0",
+                tables[0].full_table_name
+            ))
+            .await
+            .unwrap();
+        tables[0].table.columns.push(
+            serde_json::from_value(json!({"name":"source","type":"uint256","default":"0"}))
+                .unwrap(),
+        );
+        tables[0].table.events[0].operations[0].set.push(
+            serde_json::from_value(json!({"column":"source","action":"set","value":"$value"}))
+                .unwrap(),
+        );
+    }
+    fixture.params.tables = Arc::new(tables);
+    fixture.params.providers = Arc::new(
+        [(
+            "ethereum".to_string(),
+            create_client(&rpc.url, 1, None, None, None, Default::default(), None, None)
+                .await
+                .unwrap() as Arc<dyn crate::provider::ChainProvider>,
+        )]
+        .into(),
+    );
+    let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+    let events = fixture.events(&[1]);
+    let before = fixture.position().await;
+    let result = callback(events.clone()).await;
+    assert!(
+        matches!(result, Err(crate::event::callback_registry::CallbackError::Retryable(_))),
+        "required RPC failure must remain retryable: {result:?}"
+    );
+    assert_eq!(fixture.position().await, before, "raw, derived and cursor effects must not commit");
+    let receipts: i64 = fixture
+        .client
+        .query_one("SELECT count(*) FROM rindexer_internal.event_applications", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(receipts, 0);
+    rpc.reject_hash_calls(false);
+    callback(events.clone()).await.unwrap();
+    callback(events).await.unwrap();
+    let after = fixture.position().await;
+    assert_eq!(after.0, 1);
+    assert_eq!(after.1, "10");
+    let receipts: i64 = fixture
+        .client
+        .query_one("SELECT count(*) FROM rindexer_internal.event_applications", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(receipts, 1);
+    drop(callback);
+    rpc.stop().await;
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_required_call_cannot_be_committed_as_an_empty_operation() {
+    required_call_failure_is_atomic(false).await;
+}
+#[tokio::test]
+async fn postgres_required_call_cannot_be_replaced_by_a_column_default() {
+    required_call_failure_is_atomic(true).await;
+}
