@@ -77,6 +77,14 @@ case "$1" in
     exec timeout --signal=TERM --kill-after=20s 900s cargo nextest run --frozen \
       -p rindexer --lib --no-fail-fast --no-capture -E 'test(/postgres_replay_tests::/) & not test(/_on_anvil$/)'
     ;;
+  native-startup-compile)
+    exec cargo nextest run --frozen -p rindexer --lib --no-run -E 'test(/postgres_native_startup_/) | test(/native_channel_can_start_at_genesis/)'
+    ;;
+  native-startup)
+    : "${RINDEXER_TEST_POSTGRES_URL:?missing explicit PostgreSQL fixture}"
+    : "${RINDEXER_TEST_ANVIL_URL:?missing explicit Anvil fixture}"
+    exec timeout --signal=TERM --kill-after=20s 900s cargo nextest run --frozen -p rindexer --lib --test-threads 1 --no-fail-fast --no-capture -E 'test(/postgres_native_startup_/) | test(/native_channel_can_start_at_genesis/)'
+    ;;
   native-transfer-recovery-compile)
     exec cargo nextest run --frozen -p rindexer --lib --no-run \
       -E 'test(/native_transfer_status_tests::postgres_native_queue/)'

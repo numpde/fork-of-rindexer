@@ -192,7 +192,7 @@ async fn get_start_end_block(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn start_indexing_traces(
+pub(crate) async fn start_indexing_traces(
     manifest: &Manifest,
     project_path: &Path,
     postgres: Option<Arc<PostgresClient>>,

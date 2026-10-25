@@ -523,3 +523,112 @@ async fn postgres_native_queue_recovery_preserves_replacement_prefix_on_anvil() 
     drop(coordinator);
     fixture.finish().await;
 }
+
+async fn native_startup_includes_first_required_block(restart: bool) {
+    use crate::event::contract_setup::NetworkTrace;
+    let fixture = Fixture::new_trace().await;
+    let (url, _anvil) = anvil_url().await;
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(10)).build().unwrap();
+    rpc(&client, &url, "anvil_reset", json!([])).await;
+    rpc(&client, &url, "evm_setAutomine", json!([true])).await;
+    let sender = rpc(&client, &url, "eth_accounts", json!([])).await[0].clone();
+    let deployment = rpc(
+        &client,
+        &url,
+        "eth_sendTransaction",
+        json!([{"from":sender,"data":"0x6001600c60003960016000f300","gas":"0x1e8480"}]),
+    )
+    .await;
+    let recipient = receipt(&client, &url, &deployment).await["contractAddress"].clone();
+    let before = if restart { 99u64 } else { 97u64 };
+    rpc(&client, &url, "anvil_mine", json!([format!("0x{:x}", before - 1)])).await;
+    if restart {
+        let hash = rpc(
+            &client,
+            &url,
+            "eth_sendTransaction",
+            json!([{"from":sender,"to":recipient,"value":"0xa","gas":"0x186a0"}]),
+        )
+        .await;
+        assert_eq!(receipt(&client, &url, &hash).await["blockNumber"], "0x64");
+    }
+    let first = if restart { 101u64 } else { 98u64 };
+    for block in first..=first + 1 {
+        let hash = rpc(
+            &client,
+            &url,
+            "eth_sendTransaction",
+            json!([{"from":sender,"to":recipient,"value":"0x14","gas":"0x186a0"}]),
+        )
+        .await;
+        assert_eq!(receipt(&client, &url, &hash).await["blockNumber"], format!("0x{block:x}"));
+    }
+    // Keep the finite range below the tip so publisher completion is independent
+    // of waiting for a future head after the configured endpoint.
+    rpc(&client, &url, "anvil_mine", json!(["0x1"])).await;
+    let provider =
+        create_client(&url, 31337, None, None, None, Default::default(), None, None).await.unwrap();
+    if restart {
+        let (config, _) = processing_config(&fixture, 100).await;
+        native_transfer_block_consumer(provider.clone(), &[U64::from(100)], "ethereum", &config)
+            .await
+            .unwrap();
+        assert_eq!(fixture.position().await, (1, "10".to_string(), "100".to_string()));
+    }
+    let (config, _) = processing_config(&fixture, first + 1).await;
+    let mut registration = config.registry.events[0].clone();
+    registration.trace_information.details = vec![NetworkTrace {
+        id: registration.id.clone(),
+        network: "ethereum".to_string(),
+        cached_provider: provider,
+        start_block: Some(U64::from(98)),
+        end_block: Some(U64::from(first + 1)),
+        method: TraceProcessingMethod::TraceBlock,
+    }];
+    let mut registry = TraceCallbackRegistry::new();
+    registry.register_event(registration);
+    let manifest: crate::manifest::core::Manifest = serde_json::from_value(json!({"name":"Replay","project_type":"no-code","networks":[],"contracts":[],
+        "native_transfers":{"enabled":true,"networks":[{"network":"ethereum","start_block":98,"end_block":first + 1}]}})).unwrap();
+    let handles = crate::indexer::start::start_indexing_traces(
+        &manifest,
+        fixture._directory.path(),
+        Some(fixture.client.clone()),
+        None,
+        &fixture.indexer,
+        registry.complete(),
+        CancellationToken::new(),
+        config.progress.clone(),
+        &Default::default(),
+        true,
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        for handle in handles {
+            handle.await.unwrap().unwrap();
+        }
+    })
+    .await
+    .expect("finite native startup completes");
+    assert_eq!(
+        fixture.position().await,
+        (
+            if restart { 3 } else { 2 },
+            if restart { "50" } else { "40" }.to_string(),
+            (first + 1).to_string()
+        ),
+        "startup must include block {first}"
+    );
+    let receipts:i64 = fixture.client.query_one("SELECT count(*) FROM rindexer_internal.event_applications WHERE block_number >= $1::text::numeric",&[&first.to_string()]).await.unwrap().get(0);
+    assert_eq!(receipts, 2, "both required blocks have application receipts");
+    drop(config);
+    fixture.finish().await;
+}
+#[tokio::test]
+async fn postgres_native_startup_includes_configured_first_block_on_anvil() {
+    native_startup_includes_first_required_block(false).await;
+}
+#[tokio::test]
+async fn postgres_native_startup_resumes_at_first_unfinished_block_on_anvil() {
+    native_startup_includes_first_required_block(true).await;
+}

@@ -1878,3 +1878,10 @@ mod tests {
         assert_eq!(outcome, NativeTransferReorgOutcome::NoCoordinator);
     }
 }
+
+#[cfg(test)]
+#[tokio::test]
+async fn native_channel_can_start_at_genesis() {
+    let (sender, _) = native_block_channel("native-genesis", U64::ZERO, 1);
+    assert_eq!(sender.recovery.first_unfinished(), Some(0));
+}

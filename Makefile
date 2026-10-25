@@ -530,3 +530,11 @@ tests/sequence-ordering/postgres: tests/posture ## Verify custom-table ordering 
 	$(compose) run --rm --no-deps -T offline sequence-ordering-compile
 	$(compose) up -d --no-build --pull never --wait --wait-timeout 90 postgres
 	$(compose) run --rm --no-deps -T postgres-tests sequence-ordering
+
+.PHONY: tests/native-startup/docker
+tests/native-startup/docker: tests/posture ## Verify the first required native block through production startup on PostgreSQL and Anvil
+	@$(call offline_runner,$$dependency_image)
+	$(compose) run --rm --no-deps -T offline native-startup-compile
+	compose_profile_args=(--profile native-transfers)
+	$(compose) up -d --no-build --pull never --wait --wait-timeout 90 postgres anvil
+	$(compose) run --rm --no-deps -T -e RINDEXER_TEST_ANVIL_URL=http://anvil:8545 postgres-tests native-startup
