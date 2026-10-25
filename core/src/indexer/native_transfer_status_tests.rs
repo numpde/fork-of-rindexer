@@ -1,7 +1,16 @@
 //! Native transfer credits require successful execution in the processed block.
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
-use alloy::primitives::U64;
+use alloy::{
+    network::{AnyRpcBlock, AnyTransactionReceipt},
+    primitives::{B256, U64},
+};
 use serde_json::{json, Value};
 use testcontainers::{core::WaitFor, runners::AsyncRunner, ContainerAsync, GenericImage, ImageExt};
 use tokio_util::sync::CancellationToken;
@@ -18,7 +27,7 @@ use crate::{
         progress::IndexingEventsProgressState,
     },
     manifest::native_transfer::TraceProcessingMethod,
-    provider::create_client,
+    provider::{create_client, mock::MockChainProvider, ChainProvider},
 };
 
 async fn anvil_url() -> (String, Option<ContainerAsync<GenericImage>>) {
@@ -76,7 +85,13 @@ async fn receipt(client: &reqwest::Client, url: &str, hash: &Value) -> Value {
     .unwrap()
 }
 
-async fn config(fixture: &Fixture, block: u64) -> Arc<TraceProcessingConfig> {
+async fn processing_config(
+    fixture: &Fixture,
+    block: u64,
+) -> (Arc<TraceProcessingConfig>, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let callback = no_code_callback(Arc::new(fixture.params.clone())).trace_callback;
     let mut registry = TraceCallbackRegistry::new();
     registry.register_event(TraceCallbackRegistryInformation {
         id: "native-status".to_string(),
@@ -88,11 +103,14 @@ async fn config(fixture: &Fixture, block: u64) -> Arc<TraceProcessingConfig> {
             details: vec![],
             reorg_safe_distance: None,
         },
-        callback: no_code_callback(Arc::new(fixture.params.clone())).trace_callback,
+        callback: Arc::new(move |traces| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            callback(traces)
+        }),
         tables: fixture.params.tables.clone(),
         streams_clients: fixture.params.streams_clients.clone(),
     });
-    Arc::new(TraceProcessingConfig {
+    let config = Arc::new(TraceProcessingConfig {
         id: "native-status".to_string(),
         chain_id: 31337,
         project_path: fixture._directory.path().to_path_buf(),
@@ -109,7 +127,8 @@ async fn config(fixture: &Fixture, block: u64) -> Arc<TraceProcessingConfig> {
         method: TraceProcessingMethod::TraceBlock,
         stream_last_synced_block_file_path: None,
         cancel_token: CancellationToken::new(),
-    })
+    });
+    (config, calls)
 }
 
 #[tokio::test]
@@ -155,8 +174,8 @@ async fn postgres_native_transfer_execution_status_on_anvil() {
             .unwrap();
     let provider =
         create_client(&url, 31337, None, None, None, Default::default(), None, None).await.unwrap();
-    let config = config(&fixture, block).await;
-    native_transfer_block_consumer(provider, &[U64::from(block)], "ethereum", &config)
+    let (config, calls) = processing_config(&fixture, block).await;
+    native_transfer_block_consumer(provider.clone(), &[U64::from(block)], "ethereum", &config)
         .await
         .unwrap();
     assert_eq!(
@@ -171,6 +190,121 @@ async fn postgres_native_transfer_execution_status_on_anvil() {
         .unwrap()
         .get(0);
     assert_eq!(stored_hash, hashes[0].as_str().unwrap());
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "block callback and successful transfer callback");
+    let receipts: i64 = fixture
+        .client
+        .query_one("SELECT count(*) FROM rindexer_internal.event_applications", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(receipts, 1, "the reverted attempt must not claim an application receipt");
+
+    let blocks = provider.get_block_by_number_batch(&[U64::from(block)], true).await.unwrap();
+    assert_receipt_failures_leave_range_unfinished(blocks, accepted, reverted, block).await;
+    drop(config);
+    fixture.finish().await;
+}
+
+async fn assert_receipt_failures_leave_range_unfinished(
+    blocks: Vec<AnyRpcBlock>,
+    accepted: Value,
+    reverted: Value,
+    block: u64,
+) {
+    let fixture = Fixture::new_trace().await;
+    let (config, calls) = processing_config(&fixture, block).await;
+    let mut cases = vec![
+        ("missing receipt".to_string(), vec![accepted.clone()]),
+        ("duplicate receipt".to_string(), vec![accepted.clone(), accepted.clone()]),
+        ("no receipts".to_string(), vec![]),
+    ];
+    for index in 0..2 {
+        for (field, value) in [
+            ("blockHash", json!(B256::repeat_byte(0xaa))),
+            ("blockNumber", json!("0xffff")),
+            ("transactionIndex", json!("0xff")),
+            ("transactionHash", json!(B256::repeat_byte(0xbb))),
+            ("from", json!(alloy::primitives::Address::repeat_byte(0xcc))),
+            ("to", json!(alloy::primitives::Address::repeat_byte(0xdd))),
+            ("blockHash", Value::Null),
+            ("blockNumber", Value::Null),
+            ("transactionIndex", Value::Null),
+        ] {
+            let mut receipts = vec![accepted.clone(), reverted.clone()];
+            receipts[index][field] = value;
+            cases.push((format!("receipt {index}, {field}"), receipts));
+        }
+    }
+    let mut legacy = accepted.clone();
+    legacy.as_object_mut().unwrap().remove("status");
+    legacy["type"] = json!("0x0");
+    legacy["root"] = json!(B256::repeat_byte(0xee));
+    cases.push(("state-root-only receipt".to_string(), vec![legacy, reverted.clone()]));
+    for (case, receipts) in cases {
+        let receipts: Vec<AnyTransactionReceipt> =
+            receipts.into_iter().map(|receipt| serde_json::from_value(receipt).unwrap()).collect();
+        let provider = Arc::new(
+            MockChainProvider::new(31337)
+                .with_blocks(blocks.clone())
+                .with_receipt_response(receipts),
+        );
+        let result =
+            native_transfer_block_consumer(provider, &[U64::from(block)], "ethereum", &config)
+                .await;
+        let error = result.expect_err(&format!("{case} cannot authorize range completion"));
+        assert!(matches!(&error, crate::indexer::process::ProcessEventError::ProviderCallError(_)));
+        let diagnostic = error.to_string();
+        assert!(
+            diagnostic.starts_with("Could not complete provider operation:"),
+            "{case}: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("ethereum")
+                && diagnostic.contains("transaction")
+                && diagnostic.contains("range cannot be checkpointed"),
+            "{case}: {diagnostic}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "{case} must fail before either callback");
+        assert_eq!(fixture.position().await, (0, "0".to_string(), "0".to_string()), "{case}");
+    }
+    for field in ["block_hash", "block_number", "transaction_index"] {
+        let mut wrong = blocks.clone();
+        let alloy::rpc::types::BlockTransactions::Full(transactions) = &mut wrong[0].transactions
+        else {
+            panic!("full Anvil block")
+        };
+        match field {
+            "block_hash" => transactions[0].block_hash = Some(B256::repeat_byte(0xff)),
+            "block_number" => transactions[0].block_number = Some(999),
+            "transaction_index" => transactions[0].transaction_index = Some(999),
+            _ => unreachable!(),
+        }
+        let receipts = vec![
+            serde_json::from_value(accepted.clone()).unwrap(),
+            serde_json::from_value(reverted.clone()).unwrap(),
+        ];
+        let provider = Arc::new(
+            MockChainProvider::new(31337).with_blocks(wrong).with_receipt_response(receipts),
+        );
+        assert!(
+            native_transfer_block_consumer(provider, &[U64::from(block)], "ethereum", &config)
+                .await
+                .is_err(),
+            "transaction {field} must agree with its block"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.position().await, (0, "0".to_string(), "0".to_string()));
+    }
+    // Recovery accepts a complete response in arbitrary receipt order.
+    let receipts =
+        vec![serde_json::from_value(reverted).unwrap(), serde_json::from_value(accepted).unwrap()];
+    let provider =
+        Arc::new(MockChainProvider::new(31337).with_blocks(blocks).with_receipt_response(receipts));
+    native_transfer_block_consumer(provider, &[U64::from(block)], "ethereum", &config)
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(fixture.position().await, (1, "777".to_string(), block.to_string()));
     drop(config);
     fixture.finish().await;
 }

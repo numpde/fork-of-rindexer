@@ -8,6 +8,26 @@ You can expect the event to be defined as if you were indexing an ERC20 Transfer
 This is **experimental** functionality which has not yet been extensively tested in production.
 :::
 
+## Execution status and RPC requirements
+
+The active block-based path indexes top-level transactions with a recipient,
+nonzero value, empty calldata and a successful execution receipt. A transaction
+included in a block can still revert; its value then produces no `NativeTransfer`
+event or derived credit.
+
+The RPC endpoint must provide full transactions through `eth_getBlockByNumber`
+and execution receipts through `eth_getTransactionReceipt`. Each candidate needs
+a receipt matching its transaction hash, block hash, block number, position,
+sender and recipient. Missing, duplicate or inconsistent responses stop that
+range before block/transfer callbacks and checkpointing; processing can retry
+when the RPC data is complete. Receipt order does not matter.
+
+State-root-only receipts from before EIP-658 cannot establish execution success.
+For that history, choose a later start range with status receipts or disable
+native indexing. Previously indexed reverted attempts are not removed by an
+upgrade: stop writers, review affected history and rebuild raw events, derived
+results, application receipts and checkpoints from trusted blocks and receipts.
+
 Supported stream providers:
 
 - [Simple](/docs/start-building/yaml-config/native-transfers#simple) - Simple opt-in (for csv, and postgres)
@@ -33,7 +53,7 @@ project_type: no-code
 networks:
   - name: ethereum
     chain_id: 1
-    # The rpc provider must support the `trace_block` rpc method in simple mode
+    # The RPC must provide full blocks and execution receipts.
     rpc: https://mainnet.gateway.tenderly.co  // [!code focus]
 storage:
   postgres:
@@ -124,16 +144,11 @@ contracts: []
 
 ### method
 
-:::info
-This is optional, if you do not provide a method it will default to using `eth_getBlockByNumber` it is the most efficient,
-well supported, and simple RPC method available.
-:::
-
-The method field is an advanced option, and typically does not need to be defined. By default it 
-will use `eth_getBlockByNumber` and it is only recommended to manually override this in the event that your
-RPC provider does not have adequate support or there is some reason you would prefer to use `trace_block` or `debug_traceBlockByNumber`.
-
-Valid options are: `eth_getBlockByNumber` `debug_traceBlockByNumber` or `trace_block`.
+This field is optional. The manifest accepts `eth_getBlockByNumber`,
+`debug_traceBlockByNumber` and `trace_block`. The active consumer currently
+fetches full blocks and execution receipts for all three values. Selecting another value does not bypass the
+receipt requirements above; the retained debug/trace consumers are inactive.
+The examples below show accepted configuration values.
 
 :::code-group
 

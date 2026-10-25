@@ -1,12 +1,13 @@
 use std::{
     cmp,
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     ops::RangeInclusive,
     sync::Arc,
     time::Duration,
 };
 
 use alloy::consensus::Transaction;
+use alloy::network::{ReceiptResponse, TransactionResponse};
 use alloy::transports::{RpcError, TransportErrorKind};
 use alloy::{
     primitives::{Address, Bytes, U256, U64},
@@ -510,9 +511,13 @@ pub async fn native_transfer_block_consumer(
     }
     let generation = crate::indexer::reorg::reorg_generation(network_name);
     let blocks = provider.get_block_by_number_batch(block_numbers, true).await?;
-    // A successful RPC call is not proof that every requested block and its
-    // transactions arrived. Validate the whole response before either handler.
+    let (from_block, to_block) = block_numbers
+        .iter()
+        .fold((U64::MAX, U64::ZERO), |(min, max), &num| (cmp::min(min, num), cmp::max(max, num)));
+    // Validate the complete range and its candidates before either block or transfer callbacks.
     let mut remaining: HashSet<_> = block_numbers.iter().map(|number| number.to::<u64>()).collect();
+    let mut candidates = Vec::new();
+    let mut candidate_hashes = HashSet::new();
     for block in &blocks {
         let number = block.header.number;
         if !remaining.remove(&number) {
@@ -520,10 +525,35 @@ pub async fn native_transfer_block_consumer(
                 "Cannot process native-transfer blocks on network {network_name:?}: RPC response contains unrequested or repeated block {number}; the requested range cannot be checkpointed"
             )).into());
         }
-        if !matches!(&block.transactions, alloy::rpc::types::BlockTransactions::Full(_)) {
+        let alloy::rpc::types::BlockTransactions::Full(transactions) = &block.transactions else {
             return Err(ProviderError::CustomError(format!(
                 "Cannot process native transfers on network {network_name:?}, block {number}: RPC response omitted full transaction objects despite requesting them; the block cannot be checkpointed"
             )).into());
+        };
+        for (index, tx) in transactions.iter().enumerate() {
+            if tx.to().is_none() || !tx.input().is_empty() || tx.value().is_zero() {
+                continue;
+            }
+            let invalid_field = if tx.block_number != Some(number) {
+                Some("block_number")
+            } else if tx.block_hash != Some(block.header.hash) {
+                Some("block_hash")
+            } else if tx.transaction_index != Some(index as u64) {
+                Some("transaction_index")
+            } else {
+                None
+            };
+            if let Some(field) = invalid_field {
+                return Err(ProviderError::CustomError(format!(
+                    "Cannot process native transfer on network {network_name:?}, transaction {:#x}: RPC {field} is missing or does not match enclosing block {number}, hash {:#x}, transaction index {index}; the range cannot be checkpointed", tx.tx_hash(), block.header.hash
+                )).into());
+            }
+            if !candidate_hashes.insert(tx.tx_hash()) {
+                return Err(ProviderError::CustomError(format!(
+                    "Cannot process native transfers on network {network_name:?}: transaction {:#x} appears more than once in the requested range; the range cannot be checkpointed", tx.tx_hash()
+                )).into());
+            }
+            candidates.push((block.header.timestamp, tx));
         }
     }
     if let Some(number) = remaining.iter().min() {
@@ -531,38 +561,93 @@ pub async fn native_transfer_block_consumer(
             "Cannot process native-transfer blocks on network {network_name:?}: RPC response omitted requested block {number}; the requested range cannot be checkpointed"
         )).into());
     }
-    let (from_block, to_block) = block_numbers
-        .iter()
-        .fold((U64::MAX, U64::ZERO), |(min, max), &num| (cmp::min(min, num), cmp::max(max, num)));
 
-    let native_transfers = blocks
-        .clone()
-        .into_iter()
-        .flat_map(|b| {
-            b.transactions.clone().into_transactions().map(move |tx| (b.header.timestamp, tx))
-        })
-        .filter_map(|(ts, tx)| {
-            let is_empty_input = tx.input().is_empty();
-            let is_value_zero = tx.value().is_zero();
-            let has_to_address = tx.to().is_some();
-
-            if has_to_address && is_empty_input && !is_value_zero {
-                let to = tx.to().unwrap();
-                Some(TraceResult::try_new_native_transfer(
-                    tx,
-                    ts,
-                    to,
-                    network_name,
-                    provider.chain().id(),
-                    from_block,
-                    to_block,
-                ))
-            } else {
-                None
-            }
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(ProviderError::CustomError)?;
+    let hashes: Vec<_> = candidates.iter().map(|(_, tx)| tx.tx_hash()).collect();
+    let receipts =
+        if hashes.is_empty() { vec![] } else { provider.get_tx_receipts_batch(&hashes).await? };
+    let mut receipts_by_hash = HashMap::new();
+    for receipt in receipts {
+        let hash = receipt.transaction_hash();
+        if !candidate_hashes.contains(&hash) {
+            return Err(ProviderError::CustomError(format!(
+                "Cannot process native transfers on network {network_name:?}: RPC returned an unrequested receipt for transaction {hash:#x}; the range cannot be checkpointed"
+            )).into());
+        }
+        if receipts_by_hash.insert(hash, receipt).is_some() {
+            return Err(ProviderError::CustomError(format!(
+                "Cannot process native transfers on network {network_name:?}: RPC repeated the receipt for transaction {hash:#x}; the range cannot be checkpointed"
+            )).into());
+        }
+    }
+    let mut native_transfers = Vec::new();
+    for (timestamp, tx) in candidates {
+        let invalid_receipt = |reason: &str| {
+            ProviderError::CustomError(format!(
+            "Cannot process native transfer on network {network_name:?}, transaction {:#x}: {reason}; the range cannot be checkpointed", tx.tx_hash()
+        ))
+        };
+        let receipt = receipts_by_hash
+            .remove(&tx.tx_hash())
+            .ok_or_else(|| invalid_receipt("RPC omitted its execution receipt"))?;
+        let mismatch = if receipt.block_hash() != tx.block_hash {
+            Some(format!(
+                "RPC receipt block_hash {:?} does not match processed block {:?}",
+                receipt.block_hash(),
+                tx.block_hash
+            ))
+        } else if receipt.block_number() != tx.block_number {
+            Some(format!(
+                "RPC receipt block_number {:?} does not match processed block {:?}",
+                receipt.block_number(),
+                tx.block_number
+            ))
+        } else if receipt.transaction_index() != tx.transaction_index {
+            Some(format!(
+                "RPC receipt transaction_index {:?} does not match processed transaction {:?}",
+                receipt.transaction_index(),
+                tx.transaction_index
+            ))
+        } else if receipt.from() != tx.from() {
+            Some(format!(
+                "RPC receipt sender {:?} does not match processed transaction sender {:?}",
+                receipt.from(),
+                tx.from()
+            ))
+        } else if receipt.to() != tx.to() {
+            Some(format!(
+                "RPC receipt recipient {:?} does not match processed transaction recipient {:?}",
+                receipt.to(),
+                tx.to()
+            ))
+        } else {
+            None
+        };
+        if let Some(reason) = mismatch {
+            return Err(invalid_receipt(&reason).into());
+        }
+        if receipt.state_root().is_some() {
+            return Err(invalid_receipt(
+                "RPC receipt has a pre-EIP-658 state root rather than an execution status",
+            )
+            .into());
+        }
+        // A reverted value transaction was included, but transferred no value.
+        if !receipt.status() {
+            continue;
+        }
+        native_transfers.push(
+            TraceResult::try_new_native_transfer(
+                tx.clone(),
+                timestamp,
+                tx.to().expect("native candidate has a recipient"),
+                network_name,
+                provider.chain().id(),
+                from_block,
+                to_block,
+            )
+            .map_err(ProviderError::CustomError)?,
+        );
+    }
 
     let writer_barrier = event_writer_barrier(network_name);
     let _writer_guard = writer_barrier.read().await;
@@ -914,7 +999,7 @@ mod tests {
 
         // Dummy sig and hash — we only need the fields, not cryptographic validity.
         let sig = Signature::new(U256::ONE, U256::ONE, false);
-        let tx_hash = B256::from([0xabu8; 32]);
+        let tx_hash = B256::from(U256::from(block_number).to_be_bytes::<32>());
         let signed = Signed::new_unchecked(tx_legacy, sig, tx_hash);
         let envelope = AnyTxEnvelope::Ethereum(TxEnvelope::Legacy(signed));
         let recovered = Recovered::new_unchecked(envelope, from);
@@ -937,6 +1022,21 @@ mod tests {
             )
             .into(),
         )
+    }
+
+    fn successful_receipts(
+        blocks: &[alloy::network::AnyRpcBlock],
+    ) -> Vec<alloy::network::AnyTransactionReceipt> {
+        blocks.iter().flat_map(|block| {
+            let alloy::rpc::types::BlockTransactions::Full(transactions) = &block.transactions else { panic!("full test block") };
+            transactions.iter().map(move |tx| serde_json::from_value(serde_json::json!({
+                "transactionHash": tx.tx_hash(), "transactionIndex": tx.transaction_index,
+                "blockHash": tx.block_hash, "blockNumber": tx.block_number,
+                "from": tx.from(), "to": tx.to(), "contractAddress": null,
+                "gasUsed": "0x5208", "effectiveGasPrice": "0x1", "cumulativeGasUsed": "0x5208",
+                "status": "0x1", "type": "0x0", "logs": [], "logsBloom": format!("0x{}", "00".repeat(256))
+            })).unwrap())
+        }).collect()
     }
 
     async fn callback_case(
@@ -973,7 +1073,10 @@ mod tests {
         std::fs::write(&path, "1").unwrap();
         let block =
             make_block_with_native_transfer(42, Address::ZERO, Address::repeat_byte(1), U256::ONE);
-        let provider = Arc::new(MockChainProvider::new(1).with_blocks(vec![block]));
+        let receipts = successful_receipts(std::slice::from_ref(&block));
+        let provider = Arc::new(
+            MockChainProvider::new(1).with_blocks(vec![block]).with_receipt_response(receipts),
+        );
         (directory, Arc::new(config), provider, path)
     }
 
@@ -1137,7 +1240,7 @@ mod tests {
             async { Ok(()) }.boxed()
         }))
         .await;
-        let blocks = [43, 42]
+        let blocks: Vec<_> = [43, 42]
             .into_iter()
             .map(|number| {
                 make_block_with_native_transfer(
@@ -1148,7 +1251,9 @@ mod tests {
                 )
             })
             .collect();
-        let provider = Arc::new(MockChainProvider::new(1).with_blocks(blocks));
+        let receipts = successful_receipts(&blocks);
+        let provider =
+            Arc::new(MockChainProvider::new(1).with_blocks(blocks).with_receipt_response(receipts));
         native_transfer_block_consumer(
             provider,
             &[U64::from(42), U64::from(43)],
@@ -1215,13 +1320,48 @@ mod tests {
         let transfer_block =
             make_block_with_native_transfer(42, from, to, U256::from(1_000_000_000_000_000_000u64));
 
-        let provider = Arc::new(MockChainProvider::new(1).with_blocks(vec![transfer_block]));
+        let receipts = successful_receipts(std::slice::from_ref(&transfer_block));
+        let provider = Arc::new(
+            MockChainProvider::new(1)
+                .with_blocks(vec![transfer_block])
+                .with_receipt_response(receipts),
+        );
         let config = make_trace_config_async().await;
 
         let result =
             native_transfer_block_consumer(provider, &[U64::from(42)], "ethereum", &config).await;
 
         assert!(result.is_ok(), "Consumer should succeed when a native transfer block is present");
+    }
+
+    #[tokio::test]
+    async fn reverted_only_native_range_checkpoints_without_transfer_callbacks() {
+        use futures::FutureExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let (_directory, config, _, path) = callback_case(Arc::new(move |traces| {
+            assert!(traces.iter().all(|trace| matches!(trace, TraceResult::Block { .. })));
+            observed.fetch_add(1, Ordering::SeqCst);
+            async { Ok(()) }.boxed()
+        }))
+        .await;
+        let block =
+            make_block_with_native_transfer(42, Address::ZERO, Address::repeat_byte(1), U256::ONE);
+        let mut receipt =
+            serde_json::to_value(&successful_receipts(std::slice::from_ref(&block))[0]).unwrap();
+        receipt["status"] = serde_json::json!("0x0");
+        let provider = Arc::new(
+            MockChainProvider::new(1)
+                .with_blocks(vec![block])
+                .with_receipt_response(vec![serde_json::from_value(receipt).unwrap()]),
+        );
+        native_transfer_block_consumer(provider, &[U64::from(42)], "ethereum", &config)
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "only the block callback completes");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "42");
+        assert_eq!(crate::indexer::task_tracker::active_indexing_count(), 0);
     }
 
     async fn assert_missing_native_metadata_is_an_error(field: &str) {

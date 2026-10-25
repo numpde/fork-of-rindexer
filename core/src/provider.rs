@@ -1019,6 +1019,12 @@ pub mod mock {
             self
         }
 
+        /// Return the exact RPC receipt response, including malformed sets used by regressions.
+        pub fn with_receipt_response(mut self, receipts: Vec<AnyTransactionReceipt>) -> Self {
+            self.receipts = receipts;
+            self
+        }
+
         pub fn with_traces(mut self, traces: Vec<LocalizedTransactionTrace>) -> Self {
             self.traces = traces;
             self
@@ -1124,15 +1130,9 @@ pub mod mock {
 
         async fn get_tx_receipts_batch(
             &self,
-            hashes: &[TxHash],
+            _hashes: &[TxHash],
         ) -> Result<Vec<AnyTransactionReceipt>, ProviderError> {
-            let requested: HashSet<TxHash> = hashes.iter().copied().collect();
-            Ok(self
-                .receipts
-                .iter()
-                .filter(|r| requested.contains(&r.transaction_hash))
-                .cloned()
-                .collect())
+            Ok(self.receipts.clone())
         }
 
         async fn trace_block(
