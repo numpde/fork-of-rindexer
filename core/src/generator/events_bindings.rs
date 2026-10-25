@@ -1060,6 +1060,26 @@ mod tests {
             .as_string()
     }
 
+    #[test]
+    fn array_handlers_convert_fixed_values_and_nested_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("abi.json"), r#"[{"type":"event","name":"Values","inputs":[{"name":"counts","type":"uint16[2]","indexed":false},{"name":"tags","type":"bytes32[2]","indexed":false},{"name":"groups","type":"uint256[][]","indexed":false}]}]"#).unwrap();
+        let contract: Contract = serde_yaml::from_str(PLAIN_CONTRACT).unwrap();
+        let storage: Storage = serde_yaml::from_str("postgres:\n  enabled: true").unwrap();
+        let code = generate_event_handlers(dir.path(), "TestIndexer", false, &contract, &storage)
+            .unwrap()
+            .as_string();
+        assert!(
+            code.contains("counts.iter().cloned().map("),
+            "fixed values need a vector conversion: {code}"
+        );
+        assert!(
+            code.contains("tags.iter().cloned().map("),
+            "fixed bytes need element conversion: {code}"
+        );
+        assert!(code.contains("groups.iter().map("), "nested shape must be retained: {code}");
+    }
+
     const OPTIN_HINT: &str = "insert_bulk_with_cursor";
 
     /// Generated handlers are always the legacy at-least-once insert — users own
