@@ -218,17 +218,16 @@ impl ProgressCheckpointConfig {
     }
 }
 
-/// Cache key type for view calls: (network, contract_address, calldata, block_number).
-type ViewCallCacheKey = (String, Address, Bytes, u64);
+/// Height orders eviction; the hash identifies the actual historical state.
+type ViewCallCacheKey = (String, Address, Bytes, u64, B256);
 
 /// Maximum entries in VIEW_CALL_CACHE before eviction.
 /// Old block entries are removed since they won't be needed again.
 const VIEW_CALL_CACHE_MAX_SIZE: usize = 10_000;
 
-/// Global cache for view call results. Key is (network, contract, calldata, block_number).
-/// Uses block_number for determinism - same call at same block always returns same result.
-/// Evicts oldest block entries when exceeding VIEW_CALL_CACHE_MAX_SIZE.
-static VIEW_CALL_CACHE: Lazy<RwLock<HashMap<ViewCallCacheKey, DynSolValue>>> =
+/// Cache raw responses by block identity. Decode at consumption so explicit
+/// return fields own interpretation and late orphaned replies cannot replace canonical state.
+static VIEW_CALL_CACHE: Lazy<RwLock<HashMap<ViewCallCacheKey, Vec<u8>>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
 /// Cache key type for static view calls: (network, contract_address, calldata).
@@ -240,14 +239,13 @@ type StaticCallCacheKey = (String, Address, Bytes);
 static STATIC_CALL_CACHE: Lazy<RwLock<HashMap<StaticCallCacheKey, DynSolValue>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
-/// Cache key type for block timestamps: (network, block_number).
-type BlockTimestampCacheKey = (String, u64);
+/// Header timestamps belong to a block hash, not a reusable height.
+type BlockTimestampCacheKey = (String, u64, B256);
 
 /// Maximum entries in BLOCK_TIMESTAMP_CACHE before eviction.
 const BLOCK_TIMESTAMP_CACHE_MAX_SIZE: usize = 10_000;
 
-/// Global cache for block timestamps. Key is (network, block_number).
-/// Block timestamps are immutable. Evicts oldest block entries when full.
+/// Timestamps are immutable for a particular hash. Evict older heights when full.
 static BLOCK_TIMESTAMP_CACHE: Lazy<RwLock<HashMap<BlockTimestampCacheKey, u64>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
@@ -260,12 +258,12 @@ async fn evict_old_view_call_cache_entries() {
     }
 
     // Find the median block number and remove everything below it
-    let mut block_numbers: Vec<u64> = cache.keys().map(|(_, _, _, block)| *block).collect();
+    let mut block_numbers: Vec<u64> = cache.keys().map(|(_, _, _, block, _)| *block).collect();
     block_numbers.sort_unstable();
 
     if let Some(&cutoff_block) = block_numbers.get(block_numbers.len() / 2) {
         let before_len = cache.len();
-        cache.retain(|(_, _, _, block), _| *block > cutoff_block);
+        cache.retain(|(_, _, _, block, _), _| *block > cutoff_block);
         let removed = before_len - cache.len();
         if removed > 0 {
             info!(
@@ -285,12 +283,12 @@ async fn evict_old_block_timestamp_cache_entries() {
         return;
     }
 
-    let mut block_numbers: Vec<u64> = cache.keys().map(|(_, block)| *block).collect();
+    let mut block_numbers: Vec<u64> = cache.keys().map(|(_, block, _)| *block).collect();
     block_numbers.sort_unstable();
 
     if let Some(&cutoff_block) = block_numbers.get(block_numbers.len() / 2) {
         let before_len = cache.len();
-        cache.retain(|(_, block), _| *block > cutoff_block);
+        cache.retain(|(_, block, _), _| *block > cutoff_block);
         let removed = before_len - cache.len();
         if removed > 0 {
             info!(
@@ -391,6 +389,7 @@ struct PendingViewCall {
     target: Address,
     calldata: Bytes,
     block_number: u64,
+    block_hash: B256,
     network: String,
 }
 
@@ -535,6 +534,7 @@ async fn prefetch_view_calls(
                                             pending.target,
                                             pending.calldata.clone(),
                                             pending.block_number,
+                                            pending.block_hash,
                                         );
                                         if !seen_cache_keys.contains(&cache_key) {
                                             seen_cache_keys.insert(cache_key);
@@ -571,6 +571,7 @@ async fn prefetch_view_calls(
                                             pending.target,
                                             pending.calldata.clone(),
                                             pending.block_number,
+                                            pending.block_hash,
                                         );
                                         if !seen_cache_keys.contains(&cache_key) {
                                             seen_cache_keys.insert(cache_key);
@@ -609,9 +610,12 @@ async fn prefetch_view_calls(
     let networks_without_multicall = NETWORKS_WITHOUT_MULTICALL3.read().await;
 
     // Group calls by (network, block_number) for batching
-    let mut grouped: HashMap<(String, u64), Vec<PendingViewCall>> = HashMap::new();
+    let mut grouped: HashMap<(String, u64, B256), Vec<PendingViewCall>> = HashMap::new();
     for call in &pending_calls {
-        grouped.entry((call.network.clone(), call.block_number)).or_default().push(call.clone());
+        grouped
+            .entry((call.network.clone(), call.block_number, call.block_hash))
+            .or_default()
+            .push(call.clone());
     }
 
     // Create atomic counters for events processed per network
@@ -633,7 +637,7 @@ async fn prefetch_view_calls(
         initial_limit, initial_batch_size
     );
 
-    for ((network, block_number), calls) in grouped {
+    for ((network, block_number, block_hash), calls) in grouped {
         if networks_without_multicall.contains(&network) {
             continue;
         }
@@ -668,6 +672,7 @@ async fn prefetch_view_calls(
                     &provider_clone,
                     &network_clone,
                     block_num,
+                    block_hash,
                     &chunk_vec,
                     multicall_address,
                 )
@@ -1110,6 +1115,7 @@ fn resolve_view_call_to_pending(
         target: contract_address,
         calldata,
         block_number: tx_metadata.block_number,
+        block_hash: tx_metadata.block_hash,
         network: network.to_string(),
     })
 }
@@ -1121,6 +1127,7 @@ async fn execute_multicall3_batch(
     provider: &dyn ChainProvider,
     network: &str,
     block_number: u64,
+    block_hash: B256,
     calls: &[PendingViewCall],
     multicall_address: Address,
 ) -> Result<(), String> {
@@ -1152,7 +1159,7 @@ async fn execute_multicall3_batch(
 
     // Execute the multicall
     let result_hex = match provider
-        .eth_call(multicall_address, Bytes::from(calldata), block_number)
+        .eth_call_at_hash(multicall_address, Bytes::from(calldata), block_hash)
         .await
     {
         Ok(r) => r,
@@ -1206,8 +1213,13 @@ async fn execute_multicall3_batch(
         }
 
         let call = &calls[i];
-        let cache_key =
-            (call.network.clone(), call.target, call.calldata.clone(), call.block_number);
+        let cache_key = (
+            call.network.clone(),
+            call.target,
+            call.calldata.clone(),
+            call.block_number,
+            call.block_hash,
+        );
 
         // Extract (success, returnData) from the tuple
         if let DynSolValue::Tuple(fields) = result {
@@ -1215,11 +1227,8 @@ async fn execute_multicall3_batch(
                 let success = matches!(fields[0], DynSolValue::Bool(true));
                 if success {
                     if let DynSolValue::Bytes(return_data) = &fields[1] {
-                        // Try to decode the return value
-                        if let Some(decoded_value) = try_decode_return_value(return_data) {
-                            cache.insert(cache_key, decoded_value);
-                            cached_count += 1;
-                        }
+                        cache.insert(cache_key, return_data.clone());
+                        cached_count += 1;
                     }
                 }
             }
@@ -1270,7 +1279,7 @@ async fn prefetch_block_timestamps(
             }
 
             // Skip if already cached
-            let cache_key = (network.clone(), tx_metadata.block_number);
+            let cache_key = (network.clone(), tx_metadata.block_number, tx_metadata.block_hash);
             if cache.contains_key(&cache_key) {
                 continue;
             }
@@ -1385,7 +1394,7 @@ async fn prefetch_block_timestamps(
                 for block in blocks {
                     let block_num = block.header.number;
                     let timestamp = block.header.timestamp;
-                    cache.insert((network.clone(), block_num), timestamp);
+                    cache.insert((network.clone(), block_num, block.header.hash), timestamp);
                 }
             }
             // Evict old entries if cache is getting large (skip during shutdown)
@@ -1398,9 +1407,13 @@ async fn prefetch_block_timestamps(
 
 /// Gets a block timestamp from the cache, or returns None if not cached.
 /// Should be called after prefetch_block_timestamps has populated the cache.
-async fn get_cached_block_timestamp(network: &str, block_number: u64) -> Option<u64> {
+async fn get_cached_block_timestamp(
+    network: &str,
+    block_number: u64,
+    block_hash: B256,
+) -> Option<u64> {
     let cache = BLOCK_TIMESTAMP_CACHE.read().await;
-    cache.get(&(network.to_string(), block_number)).copied()
+    cache.get(&(network.to_string(), block_number, block_hash)).copied()
 }
 
 /// Transaction metadata available for table value references.
@@ -2252,13 +2265,21 @@ async fn execute_view_call(
     }
 
     // Regular call - check block-specific cache
-    let cache_key =
-        (network.to_string(), contract_address, calldata.clone(), tx_metadata.block_number);
+    let cache_key = (
+        network.to_string(),
+        contract_address,
+        calldata.clone(),
+        tx_metadata.block_number,
+        tx_metadata.block_hash,
+    );
     {
         let cache = VIEW_CALL_CACHE.read().await;
         if let Some(cached) = cache.get(&cache_key) {
             debug!("View call cache hit for {}::{}", contract_address, func_name);
-            return apply_accessor_if_present(cached.clone(), view_call);
+            return apply_accessor_if_present(
+                decode_view_call_result(cached, view_call)?,
+                view_call,
+            );
         }
     }
 
@@ -2270,20 +2291,24 @@ async fn execute_view_call(
     {
         let cache = VIEW_CALL_CACHE.read().await;
         if let Some(cached) = cache.get(&cache_key) {
-            return apply_accessor_if_present(cached.clone(), view_call);
+            return apply_accessor_if_present(
+                decode_view_call_result(cached, view_call)?,
+                view_call,
+            );
         }
     }
 
     // Execute the call at the event's block number
-    let result_bytes: String =
-        match provider.eth_call(contract_address, calldata.clone(), tx_metadata.block_number).await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("View call failed for {}::{}: {}", contract_address, func_name, e);
-                return None;
-            }
-        };
+    let result_bytes: String = match provider
+        .eth_call_at_hash(contract_address, calldata.clone(), tx_metadata.block_hash)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("View call failed for {}::{}: {}", contract_address, func_name, e);
+            return None;
+        }
+    };
 
     let result_bytes = hex::decode(result_bytes.trim_start_matches("0x")).ok()?;
     let decoded = decode_view_call_result(&result_bytes, view_call)?;
@@ -2291,7 +2316,7 @@ async fn execute_view_call(
     // Cache the full result (before accessor is applied)
     {
         let mut cache = VIEW_CALL_CACHE.write().await;
-        cache.insert(cache_key, decoded.clone());
+        cache.insert(cache_key, result_bytes);
     }
 
     // Evict old entries if cache is getting large (skip during shutdown)
@@ -2691,7 +2716,10 @@ async fn extract_value_from_event_async(
     // in eth_getLogs. The prefetch_block_timestamps call earlier in the pipeline will have
     // fetched it via eth_getBlockByNumber if any table references this field.
     if after_constants == "$rindexer_block_timestamp" && tx_metadata.block_timestamp.is_none() {
-        if let Some(epoch) = get_cached_block_timestamp(network, tx_metadata.block_number).await {
+        if let Some(epoch) =
+            get_cached_block_timestamp(network, tx_metadata.block_number, tx_metadata.block_hash)
+                .await
+        {
             return Some(match column_type {
                 ColumnType::Uint256 | ColumnType::Uint128 | ColumnType::Uint64 => {
                     EthereumSqlTypeWrapper::U256Numeric(U256::from(epoch))
@@ -3748,7 +3776,12 @@ pub(crate) async fn prepare_table_operations<'t>(
                                 Some(ts.to::<u64>())
                             } else {
                                 // Look up from cache (prefetched at start of processing)
-                                get_cached_block_timestamp(network, tx_metadata.block_number).await
+                                get_cached_block_timestamp(
+                                    network,
+                                    tx_metadata.block_number,
+                                    tx_metadata.block_hash,
+                                )
+                                .await
                             };
 
                             // block_timestamp is required (NOT NULL column) — if missing after
@@ -4547,14 +4580,36 @@ async fn execute_view_call_for_cron_internal(
         Bytes::from(data)
     };
 
+    // Cron has no event header. Resolve a concrete header before selecting state.
+    let block_hash = if tx_metadata.block_hash == B256::ZERO {
+        let blocks = provider
+            .get_block_by_number_batch(&[U64::from(tx_metadata.block_number)], false)
+            .await
+            .ok()?;
+        if blocks.len() != 1 || blocks[0].header.number != tx_metadata.block_number {
+            return None;
+        }
+        blocks[0].header.hash
+    } else {
+        tx_metadata.block_hash
+    };
+
     // Check cache first
-    let cache_key =
-        (network.to_string(), resolved_address, calldata.clone(), tx_metadata.block_number);
+    let cache_key = (
+        network.to_string(),
+        resolved_address,
+        calldata.clone(),
+        tx_metadata.block_number,
+        block_hash,
+    );
     {
         let cache = VIEW_CALL_CACHE.read().await;
         if let Some(cached) = cache.get(&cache_key) {
             debug!("View call cache hit for {}::{}", resolved_address, func_name);
-            return apply_accessor_if_present(cached.clone(), view_call);
+            return apply_accessor_if_present(
+                decode_view_call_result(cached, view_call)?,
+                view_call,
+            );
         }
     }
 
@@ -4566,14 +4621,16 @@ async fn execute_view_call_for_cron_internal(
     {
         let cache = VIEW_CALL_CACHE.read().await;
         if let Some(cached) = cache.get(&cache_key) {
-            return apply_accessor_if_present(cached.clone(), view_call);
+            return apply_accessor_if_present(
+                decode_view_call_result(cached, view_call)?,
+                view_call,
+            );
         }
     }
 
     // Execute the call
     let result_bytes: String =
-        match provider.eth_call(resolved_address, calldata.clone(), tx_metadata.block_number).await
-        {
+        match provider.eth_call_at_hash(resolved_address, calldata.clone(), block_hash).await {
             Ok(r) => r,
             Err(e) => {
                 warn!("View call failed for {}::{}: {}", resolved_address, func_name, e);
@@ -4584,31 +4641,12 @@ async fn execute_view_call_for_cron_internal(
     // Decode the result
     let result_bytes = hex::decode(result_bytes.trim_start_matches("0x")).ok()?;
 
-    // Determine return type - use explicit return_fields if provided, otherwise auto-detect
-    let decoded = if !view_call.return_fields.is_empty() {
-        let return_type = build_return_type_from_fields(&view_call.return_fields);
-        match return_type.abi_decode(&result_bytes) {
-            Ok(decoded) => decoded,
-            Err(_) => {
-                // Fallback for string type: some tokens (MKR) return bytes32 for symbol()/name()
-                // Try to decode as bytes32 and convert to string
-                if result_bytes.len() == 32 {
-                    let s = try_bytes32_as_string(&result_bytes)?;
-                    DynSolValue::String(s)
-                } else {
-                    return None;
-                }
-            }
-        }
-    } else {
-        // Auto-detect the return type from the raw bytes
-        try_decode_return_value(&result_bytes)?
-    };
+    let decoded = decode_view_call_result(&result_bytes, view_call)?;
 
     // Cache the result
     {
         let mut cache = VIEW_CALL_CACHE.write().await;
-        cache.insert(cache_key, decoded.clone());
+        cache.insert(cache_key, result_bytes);
     }
 
     // Evict old entries if cache is getting large (skip during shutdown)
@@ -5437,7 +5475,7 @@ mod tests {
         // Pre-populate the BlockClock cache (simulating prefetch_block_timestamps)
         {
             let mut cache = BLOCK_TIMESTAMP_CACHE.write().await;
-            cache.insert(("polygon".to_string(), 99999999), 1700000042);
+            cache.insert(("polygon".to_string(), 99999999, B256::ZERO), 1700000042);
         }
 
         let constants = Constants::default();
@@ -5463,7 +5501,7 @@ mod tests {
         // Clean up cache entry
         {
             let mut cache = BLOCK_TIMESTAMP_CACHE.write().await;
-            cache.remove(&("polygon".to_string(), 99999999));
+            cache.remove(&("polygon".to_string(), 99999999, B256::ZERO));
         }
     }
 
@@ -5484,7 +5522,7 @@ mod tests {
 
         {
             let mut cache = BLOCK_TIMESTAMP_CACHE.write().await;
-            cache.insert(("polygon".to_string(), 99999998), 1700000000);
+            cache.insert(("polygon".to_string(), 99999998, B256::ZERO), 1700000000);
         }
 
         let constants = Constants::default();
@@ -5509,7 +5547,7 @@ mod tests {
 
         {
             let mut cache = BLOCK_TIMESTAMP_CACHE.write().await;
-            cache.remove(&("polygon".to_string(), 99999998));
+            cache.remove(&("polygon".to_string(), 99999998, B256::ZERO));
         }
     }
 
@@ -5562,7 +5600,7 @@ mod tests {
         // Put a DIFFERENT value in cache to prove metadata wins
         {
             let mut cache = BLOCK_TIMESTAMP_CACHE.write().await;
-            cache.insert(("polygon".to_string(), 77777777), 9999999999);
+            cache.insert(("polygon".to_string(), 77777777, B256::ZERO), 9999999999);
         }
 
         let constants = Constants::default();
@@ -5588,7 +5626,7 @@ mod tests {
 
         {
             let mut cache = BLOCK_TIMESTAMP_CACHE.write().await;
-            cache.remove(&("polygon".to_string(), 77777777));
+            cache.remove(&("polygon".to_string(), 77777777, B256::ZERO));
         }
     }
 

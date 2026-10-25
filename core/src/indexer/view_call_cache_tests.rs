@@ -16,10 +16,55 @@ pub(crate) const CALL: &str = "$call($rindexer_contract_address, \"state()\")";
 #[derive(Default)]
 struct RpcState {
     replacement: AtomicBool,
+    reject_hash: AtomicBool,
     hold_original: AtomicBool,
     original_started: Notify,
     release_original: Notify,
     requests: Mutex<Vec<Value>>,
+}
+
+impl RpcState {
+    async fn reply(&self, request: Value) -> Value {
+        let replaced = self.replacement.load(Ordering::SeqCst);
+        if request["method"] == "eth_chainId" {
+            return json!({"jsonrpc":"2.0", "id":request["id"], "result":"0x1"});
+        }
+        if request["method"] == "eth_getBlockByNumber" {
+            assert_eq!(request["params"][0], "0x64");
+            return json!({"jsonrpc":"2.0", "id":request["id"], "result":header(
+                if replaced { REPLACEMENT } else { ORIGINAL }, if replaced { 20 } else { 10 }
+            )});
+        }
+        assert_eq!(request["method"], "eth_call");
+        self.requests.lock().await.push(request.clone());
+        let hash = request["params"][1].get("blockHash").and_then(Value::as_str);
+        if let Some(hash) = hash {
+            if self.reject_hash.load(Ordering::SeqCst) {
+                return json!({"jsonrpc":"2.0", "id":request["id"], "error":{"code":-32602,"message":"hash selectors unavailable"}});
+            }
+            let canonical = if replaced { REPLACEMENT } else { ORIGINAL };
+            if hash != format!("{canonical:#x}") {
+                return json!({"jsonrpc":"2.0", "id":request["id"], "error":{"code":-32000,"message":"block is not canonical"}});
+            }
+        }
+        let value = U256::from(if replaced { 20 } else { 10 });
+        if !replaced && self.hold_original.swap(false, Ordering::SeqCst) {
+            self.original_started.notify_one();
+            self.release_original.notified().await;
+        }
+        let word = value.to_be_bytes::<32>().to_vec();
+        let is_multicall = request["params"][0]["data"].as_str().unwrap().starts_with("0x82ad56cb");
+        let bytes = if is_multicall {
+            DynSolValue::Array(vec![DynSolValue::Tuple(vec![
+                DynSolValue::Bool(true),
+                DynSolValue::Bytes(word),
+            ])])
+            .abi_encode_params()
+        } else {
+            word
+        };
+        json!({"jsonrpc":"2.0", "id":request["id"], "result":format!("0x{}", hex::encode(bytes))})
+    }
 }
 
 pub(crate) struct HistoricalRpc {
@@ -34,36 +79,22 @@ impl HistoricalRpc {
         let url = format!("http://{}", listener.local_addr().unwrap());
         let state = Arc::new(RpcState::default());
         let shared = state.clone();
-        let app = Router::new().route("/", post(move |Json(request): Json<Value>| {
-            let state = shared.clone();
-            async move {
-                if request["method"] == "eth_chainId" {
-                    return Json(json!({"jsonrpc":"2.0", "id":request["id"], "result":"0x1"}));
-                }
-                assert_eq!(request["method"], "eth_call");
-                state.requests.lock().await.push(request.clone());
-                let replaced = state.replacement.load(Ordering::SeqCst);
-                let hash = request["params"][1].get("blockHash").and_then(Value::as_str);
-                if let Some(hash) = hash {
-                    let canonical = if replaced { REPLACEMENT } else { ORIGINAL };
-                    if hash != format!("{canonical:#x}") {
-                        return Json(json!({"jsonrpc":"2.0", "id":request["id"], "error":{"code":-32000,"message":"block is not canonical"}}));
+        let app = Router::new().route(
+            "/",
+            post(move |Json(request): Json<Value>| {
+                let state = shared.clone();
+                async move {
+                    let batch = request.is_array();
+                    let requests =
+                        if let Value::Array(requests) = request { requests } else { vec![request] };
+                    let mut responses = Vec::new();
+                    for request in requests {
+                        responses.push(state.reply(request).await);
                     }
+                    Json(if batch { Value::Array(responses) } else { responses.remove(0) })
                 }
-                // Snapshot state when the node executes the call, before delaying its reply.
-                let value = U256::from(if replaced { 20 } else { 10 });
-                if !replaced && state.hold_original.swap(false, Ordering::SeqCst) {
-                    state.original_started.notify_one();
-                    state.release_original.notified().await;
-                }
-                let word = value.to_be_bytes::<32>().to_vec();
-                let is_multicall = request["params"][0]["data"].as_str().unwrap().starts_with("0x82ad56cb");
-                let bytes = if is_multicall {
-                    DynSolValue::Array(vec![DynSolValue::Tuple(vec![DynSolValue::Bool(true), DynSolValue::Bytes(word)])]).abi_encode_params()
-                } else { word };
-                Json(json!({"jsonrpc":"2.0", "id":request["id"], "result":format!("0x{}", hex::encode(bytes))}))
-            }
-        }));
+            }),
+        );
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
@@ -249,4 +280,71 @@ async fn timestamp_response_for_another_hash_cannot_satisfy_event_metadata() {
     )
     .await
     .is_none());
+}
+
+#[tokio::test]
+async fn unsupported_hash_selectors_never_fall_back_to_a_number_call() {
+    let rpc = HistoricalRpc::start().await;
+    rpc.state.reject_hash.store(true, Ordering::SeqCst);
+    let provider = crate::provider::create_client(
+        &rpc.url,
+        1,
+        None,
+        None,
+        None,
+        Default::default(),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(execute_view_call(
+        &parse_view_call(CALL).unwrap(),
+        &[],
+        &metadata(ORIGINAL),
+        provider.as_ref(),
+        "unsupported_hash",
+        &Constants::default()
+    )
+    .await
+    .is_none());
+    assert_eq!(rpc.request_count().await, 1);
+    rpc.assert_hash_qualified().await;
+    rpc.stop().await;
+}
+
+#[tokio::test]
+async fn cron_resolves_a_header_before_sharing_historical_call_cache() {
+    let rpc = HistoricalRpc::start().await;
+    let provider = crate::provider::create_client(
+        &rpc.url,
+        1,
+        None,
+        None,
+        None,
+        Default::default(),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let meta = metadata(B256::ZERO);
+    for expected in [10, 20] {
+        let actual = execute_view_call_for_cron(
+            CALL,
+            &meta,
+            &Address::ZERO,
+            &ColumnType::Uint256,
+            provider.as_ref(),
+            "cron_fork",
+        )
+        .await;
+        assert!(
+            matches!(actual, Some(EthereumSqlTypeWrapper::U256Numeric(value)) if value == U256::from(expected))
+        );
+        rpc.replace();
+    }
+    assert_eq!(rpc.request_count().await, 2);
+    rpc.assert_hash_qualified().await;
+    rpc.stop().await;
 }

@@ -6,7 +6,7 @@ use alloy::rpc::types::{Filter, ValueOrArray};
 use alloy::transports::mock::Asserter;
 use alloy::{
     eips::{BlockId, BlockNumberOrTag},
-    primitives::{Address, Bytes, TxHash, U256, U64},
+    primitives::{Address, Bytes, TxHash, B256, U256, U64},
     providers::{
         ext::TraceApi,
         fillers::{BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller},
@@ -108,6 +108,15 @@ pub trait ChainProvider: Send + Sync + Debug {
         data: Bytes,
         block_number: u64,
     ) -> Result<String, ProviderError>;
+    /// Historical state must be selected by hash, never emulated with a height lookup.
+    async fn eth_call_at_hash(
+        &self,
+        _to: Address,
+        _data: Bytes,
+        block_hash: B256,
+    ) -> Result<String, ProviderError> {
+        Err(ProviderError::CustomError(format!("Cannot query historical state at block {block_hash:#x}: this provider does not implement hash-qualified eth_call")))
+    }
     async fn eth_call_latest(&self, to: Address, data: Bytes) -> Result<String, ProviderError>;
 }
 
@@ -460,6 +469,26 @@ impl JsonRpcCachedProvider {
             .await?;
 
         Ok(result)
+    }
+
+    /// Bind the RPC execution to the event's block and reject an orphaned block.
+    #[tracing::instrument(skip_all)]
+    pub async fn eth_call_at_hash(
+        &self,
+        to: Address,
+        data: Bytes,
+        block_hash: B256,
+    ) -> Result<String, ProviderError> {
+        Ok(self
+            .provider
+            .raw_request(
+                "eth_call".into(),
+                (
+                    json!({"to": format!("{to:?}"), "data": format!("0x{}", hex::encode(&data))}),
+                    json!({"blockHash": block_hash, "requireCanonical": true}),
+                ),
+            )
+            .await?)
     }
 
     /// Executes eth_call at the "latest" block.
@@ -866,6 +895,15 @@ impl ChainProvider for JsonRpcCachedProvider {
         self.eth_call(to, data, block_number).await
     }
 
+    async fn eth_call_at_hash(
+        &self,
+        to: Address,
+        data: Bytes,
+        block_hash: B256,
+    ) -> Result<String, ProviderError> {
+        self.eth_call_at_hash(to, data, block_hash).await
+    }
+
     async fn eth_call_latest(&self, to: Address, data: Bytes) -> Result<String, ProviderError> {
         self.eth_call_latest(to, data).await
     }
@@ -956,6 +994,15 @@ impl<T: ChainProvider + ?Sized> ChainProvider for Arc<T> {
         block_number: u64,
     ) -> Result<String, ProviderError> {
         (**self).eth_call(to, data, block_number).await
+    }
+
+    async fn eth_call_at_hash(
+        &self,
+        to: Address,
+        data: Bytes,
+        block_hash: B256,
+    ) -> Result<String, ProviderError> {
+        (**self).eth_call_at_hash(to, data, block_hash).await
     }
 
     async fn eth_call_latest(&self, to: Address, data: Bytes) -> Result<String, ProviderError> {

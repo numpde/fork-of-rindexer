@@ -44,12 +44,12 @@ case "$1" in
     ;;
   view-call-reorg-compile)
     exec cargo nextest run --frozen -p rindexer --lib --no-run \
-      -E 'test(/view_call_(cache|reorg)_tests::/)'
+      -E 'test(/view_call_(cache|reorg)_tests::/) | test(/^indexer::tables::tests::test_block_timestamp/)'
     ;;
   view-call-reorg)
     : "${RINDEXER_TEST_POSTGRES_URL:?missing explicit PostgreSQL fixture}"
     exec timeout --signal=TERM --kill-after=20s 900s cargo nextest run --frozen \
-      -p rindexer --lib --no-fail-fast --no-capture -E 'test(/view_call_(cache|reorg)_tests::/)'
+      -p rindexer --lib --no-fail-fast --no-capture -E 'test(/view_call_(cache|reorg)_tests::/) | test(/^indexer::tables::tests::test_block_timestamp/)'
     ;;
   postgres-replay-compile)
     exec cargo nextest run --frozen -p rindexer --lib --no-run -E 'test(/postgres_replay_tests::/) & not test(/_on_anvil$/)'

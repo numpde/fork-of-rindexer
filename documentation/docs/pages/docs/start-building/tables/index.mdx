@@ -722,6 +722,24 @@ Without it, the column won't exist. See [timestamp](#timestamp) for details.
 
 ### View Calls (On-Chain Data)
 
+Historical `$call` queries execute at the event's block hash using
+[EIP-1898](https://eips.ethereum.org/EIPS/eip-1898) with `requireCanonical: true`.
+Your RPC endpoint must support this selector and retain the required historical
+state. An unsupported selector or unavailable state causes the affected work to
+retry; rindexer does not substitute a height-based call.
+
+Responses and fallback block timestamps are cached by block identity, so a
+same-height replacement uses its own state. A late orphaned response remains
+associated with the old hash. Raw responses are decoded using each call's declared
+return fields when consumed. Cron calls resolve a header before querying its
+state. Custom Rust providers must implement `ChainProvider::eth_call_at_hash`.
+
+For data previously derived from an orphaned cached value, stop writers and review
+rebuilding the affected derived history and application receipts from trusted logs
+and historical state. Duplicate suppression does not correct old derived values.
+`$call_static` retains its explicit immutable-data cache at `latest`.
+
+
 Call view functions on smart contracts to fetch additional data not available in events:
 
 ```yaml
