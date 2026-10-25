@@ -131,6 +131,23 @@ case "$1" in
       -p rindexer --lib --no-fail-fast --no-capture \
       -E 'test(/^database::nested_array_tests::postgres_/)'
     ;;
+  indexed-topic-hashes)
+    cargo nextest run --frozen -p rindexer --lib --no-run \
+      -E '(test(/^database::indexed_topic_hash_tests::/) & not test(/::postgres_/))'
+    exec timeout --signal=TERM --kill-after=20s 900s cargo nextest run --frozen \
+      -p rindexer --lib --no-fail-fast --no-capture \
+      -E '(test(/^database::indexed_topic_hash_tests::/) & not test(/::postgres_/))'
+    ;;
+  indexed-topic-hashes-compile)
+    exec cargo nextest run --frozen -p rindexer --lib --no-run \
+      -E 'test(/^database::indexed_topic_hash_tests::postgres_/)'
+    ;;
+  indexed-topic-hashes-postgres)
+    : "${RINDEXER_TEST_POSTGRES_URL:?missing explicit PostgreSQL fixture}"
+    exec timeout --signal=TERM --kill-after=20s 900s cargo nextest run --frozen \
+      -p rindexer --lib --no-fail-fast --no-capture \
+      -E 'test(/^database::indexed_topic_hash_tests::postgres_/)'
+    ;;
   signed-integers)
     cargo nextest run --frozen -p rindexer --lib --no-run \
       -E 'test(/^database::signed_integer(_array)?_tests::/) & not test(/::postgres_/)'

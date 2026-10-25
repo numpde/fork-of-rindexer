@@ -419,3 +419,15 @@ tests/nested-arrays/postgres: tests/posture ## Read back nested tuple-array JSON
 	$(compose) run --rm --no-deps -T offline nested-arrays-compile
 	$(compose) up -d --no-build --pull never --wait --wait-timeout 90 postgres
 	$(compose) run --rm --no-deps -T postgres-tests nested-arrays-postgres
+
+.PHONY: tests/indexed-topic-hashes/docker tests/indexed-topic-hashes/postgres
+
+tests/indexed-topic-hashes/docker: tests/posture ## Check indexed array/tuple topic hashes offline
+	@$(call offline_runner,$$dependency_image)
+	$(compose) run --rm --no-deps -T offline indexed-topic-hashes
+
+tests/indexed-topic-hashes/postgres: tests/posture ## Read back indexed array/tuple hashes through PostgreSQL INSERT and COPY
+	@$(call offline_runner,$$dependency_image)
+	$(compose) run --rm --no-deps -T offline indexed-topic-hashes-compile
+	$(compose) up -d --no-build --pull never --wait --wait-timeout 90 postgres
+	$(compose) run --rm --no-deps -T postgres-tests indexed-topic-hashes-postgres

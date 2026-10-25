@@ -10,6 +10,9 @@ pub mod sql_type_wrapper;
 mod nested_array_tests;
 
 #[cfg(test)]
+mod indexed_topic_hash_tests;
+
+#[cfg(test)]
 mod signed_integer_tests;
 
 #[cfg(test)]
