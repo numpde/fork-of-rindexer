@@ -846,3 +846,17 @@ be recovered by a SQL cast. Update downstream SQL and payload readers to consume
 the single digest field. Custom-table keys or values receiving it must use
 `bytes32`. For Rust projects, run `rindexer codegen typings` before restarting.
 The event ABI and signature still describe the original Solidity types.
+
+### Fixed-length byte values
+
+A `bytesN` value contains exactly `N` bytes. rindexer preserves those bytes,
+including any trailing zeros, and excludes the padding in its 32-byte ABI word.
+This also applies to elements of dynamic arrays and members of tuple-array JSONB.
+Indexed fixed-byte scalars also retain their declared length; an indexed array
+or tuple still contains a full 32-byte digest.
+
+Earlier versions could store padded `bytes1`–`bytes31` values. Review and rebuild
+affected history, application receipts and derived results from trusted logs.
+Do not trim trailing zeros: they can belong to the original value. Column types
+remain unchanged; readers should use the declared byte length rather than assume
+all fixed-byte values contain 32 bytes.

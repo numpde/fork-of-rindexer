@@ -1415,7 +1415,9 @@ fn abi_value_to_json(component: &ABIInput, value: &DynSolValue) -> Value {
         DynSolValue::Bool(value) => Value::Bool(*value),
         DynSolValue::Address(value) => Value::String(format!("{value:?}")),
         DynSolValue::Bytes(value) => Value::String(format!("0x{}", hex::encode(value))),
-        DynSolValue::FixedBytes(value, _) => Value::String(format!("0x{}", hex::encode(value))),
+        DynSolValue::FixedBytes(value, length) => {
+            Value::String(format!("0x{}", hex::encode(&value[..*length])))
+        }
         DynSolValue::Function(value) => Value::String(format!("0x{}", hex::encode(value))),
         DynSolValue::Tuple(values) | DynSolValue::CustomStruct { tuple: values, .. } => {
             tuple_to_json_value(
@@ -1605,7 +1607,7 @@ fn map_log_token_to_ethereum_wrapper(
         }
         DynSolValue::Bool(b) => vec![EthereumSqlTypeWrapper::Bool(*b)],
         DynSolValue::String(s) => vec![EthereumSqlTypeWrapper::String(s.clone())],
-        DynSolValue::FixedBytes(bytes, _) => match abi_input.type_.as_str() {
+        DynSolValue::FixedBytes(bytes, length) => match abi_input.type_.as_str() {
             // Indexed strings are emitted in log
             // topics as keccak256(value), not the original plaintext. Alloy surfaces
             // those as fixed bytes, so storing raw bytes into a TEXT column causes
@@ -1613,7 +1615,7 @@ fn map_log_token_to_ethereum_wrapper(
             "string" => {
                 vec![EthereumSqlTypeWrapper::String(format!("0x{}", hex::encode(bytes)))]
             }
-            _ => vec![EthereumSqlTypeWrapper::Bytes(Bytes::from(*bytes))],
+            _ => vec![EthereumSqlTypeWrapper::Bytes(Bytes::copy_from_slice(&bytes[..*length]))],
         },
         DynSolValue::Bytes(bytes) => {
             vec![EthereumSqlTypeWrapper::Bytes(Bytes::from(bytes.clone()))]
@@ -1661,8 +1663,8 @@ fn map_log_token_to_ethereum_wrapper(
                         DynSolValue::FixedBytes(_, _) | DynSolValue::Bytes(_) => {
                             let mut vec: Vec<Bytes> = vec![];
                             for token in tokens {
-                                if let DynSolValue::FixedBytes(bytes, _) = token {
-                                    vec.push(Bytes::from(*bytes));
+                                if let DynSolValue::FixedBytes(bytes, length) = token {
+                                    vec.push(Bytes::copy_from_slice(&bytes[..*length]));
                                 } else if let DynSolValue::Bytes(bytes) = token {
                                     vec.push(Bytes::from(bytes.clone()));
                                 }

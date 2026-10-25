@@ -17,6 +17,7 @@
 
 ### Bug fixes
 -------------------------------------------------
+- fix: `bytes1`–`bytes31` values now store their exact declared length in scalar/array columns and tuple-array JSONB, excluding ABI transport padding while preserving logical trailing zero bytes. `bytes32` values and indexed complex-field topic hashes remain 32 bytes. Review and rebuild affected history, receipts and derived results from trusted logs; never repair by trimming trailing zeros. Existing column types are unchanged.
 - fix: PostgreSQL tuple-array JSONB values now preserve nested dynamic and fixed arrays at every depth, including empty inner arrays, instead of substituting `null`. Integer values keep their decimal-string representation and existing columns are unchanged. Already corrupted rows and their receipts/derived results require reviewed reindexing from trusted logs; duplicate replay alone does not repair them.
 - fix: failed reorg rollback requests now remain pending with the network writer barrier and retry before normal header processing, including when a removed-log or ExEx notification is not repeated. Recovery resumes after transient database or RPC failures clear without requiring another changed header. Pending requests are retained in memory; restart validation remains separate.
 - fix: historical backfill with `config.fetch_concurrency` greater than one now keeps delayed workers in their range plan's generation. A worker scheduled after rollback can no longer present an obsolete later range as current and checkpoint ahead of unfinished recovery history.

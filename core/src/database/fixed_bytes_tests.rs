@@ -24,6 +24,7 @@ use crate::{abi::ABIInput, helpers::parse_log};
 #[derive(Clone, Copy, Debug)]
 enum Shape {
     Scalar,
+    IndexedScalar,
     Array,
     TupleArray,
 }
@@ -39,9 +40,9 @@ fn decoded(
     shape: Shape,
     values: &[Vec<u8>],
 ) -> (Vec<ABIInput>, EthereumSqlTypeWrapper) {
-    let mut input = json!({"name": "payload", "indexed": false});
+    let mut input = json!({"name": "payload", "indexed": matches!(shape, Shape::IndexedScalar)});
     input["type"] = json!(match shape {
-        Shape::Scalar => kind.to_string(),
+        Shape::Scalar | Shape::IndexedScalar => kind.to_string(),
         Shape::Array => format!("{kind}[]"),
         Shape::TupleArray => "tuple[]".to_string(),
     });
@@ -66,7 +67,7 @@ fn decoded(
         })
         .collect();
     let token = match shape {
-        Shape::Scalar => {
+        Shape::Scalar | Shape::IndexedScalar => {
             assert_eq!(tokens.len(), 1);
             tokens.into_iter().next().unwrap()
         }
@@ -75,12 +76,14 @@ fn decoded(
             tokens.into_iter().map(|token| DynSolValue::Tuple(vec![token])).collect(),
         ),
     };
+    let encoded = DynSolValue::Tuple(vec![token]).abi_encode_params();
+    let (topics, data) = if matches!(shape, Shape::IndexedScalar) {
+        (vec![event.selector(), B256::from_slice(&encoded)], vec![])
+    } else {
+        (vec![event.selector()], encoded)
+    };
     let log = Log {
-        inner: alloy::primitives::Log::new_unchecked(
-            Address::ZERO,
-            vec![event.selector()],
-            DynSolValue::Tuple(vec![token]).abi_encode_params().into(),
-        ),
+        inner: alloy::primitives::Log::new_unchecked(Address::ZERO, topics, data.into()),
         ..Default::default()
     };
     let parsed = parse_log(&event, &log).unwrap();
@@ -99,13 +102,17 @@ fn expected_json(values: &[Vec<u8>]) -> Value {
 fn assert_encoding(shape: Shape) {
     for size in [1, 4, 31, 32] {
         let values = logical_values(size);
-        let values = if matches!(shape, Shape::Scalar) { &values[..1] } else { &values[..] };
+        let values = if matches!(shape, Shape::Scalar | Shape::IndexedScalar) {
+            &values[..1]
+        } else {
+            &values[..]
+        };
         let (_, wrapper) = decoded(&format!("bytes{size}"), shape, values);
         let mut bytes = BytesMut::new();
         let ty = wrapper.to_type();
         assert!(matches!(wrapper.to_sql(&ty, &mut bytes).unwrap(), IsNull::No));
         match shape {
-            Shape::Scalar => assert_eq!(
+            Shape::Scalar | Shape::IndexedScalar => assert_eq!(
                 Vec::<u8>::from_sql(&Type::BYTEA, &bytes).unwrap(),
                 values[0],
                 "bytes{size}"
@@ -143,11 +150,18 @@ async fn roundtrip(via_copy: bool) {
     let connection = tokio::spawn(connection);
     let mut index = 0;
     for size in [1, 4, 31, 32] {
-        for shape in [Shape::Scalar, Shape::Array, Shape::TupleArray] {
+        for shape in [Shape::Scalar, Shape::IndexedScalar, Shape::Array, Shape::TupleArray] {
             for kind in [format!("bytes{size}"), "bytes".to_string()] {
+                // Indexed dynamic bytes are a hash, not the original byte value.
+                if kind == "bytes" && matches!(shape, Shape::IndexedScalar) {
+                    continue;
+                }
                 let values = logical_values(size);
-                let values =
-                    if matches!(shape, Shape::Scalar) { &values[..1] } else { &values[..] };
+                let values = if matches!(shape, Shape::Scalar | Shape::IndexedScalar) {
+                    &values[..1]
+                } else {
+                    &values[..]
+                };
                 let (inputs, wrapper) = decoded(&kind, shape, values);
                 let table = format!("fixed_bytes_{index}");
                 index += 1;
@@ -176,7 +190,9 @@ async fn roundtrip(via_copy: bool) {
                 let row =
                     client.query_one(&format!("SELECT payload FROM {table}"), &[]).await.unwrap();
                 match shape {
-                    Shape::Scalar => assert_eq!(row.get::<_, Vec<u8>>(0), values[0], "{kind}"),
+                    Shape::Scalar | Shape::IndexedScalar => {
+                        assert_eq!(row.get::<_, Vec<u8>>(0), values[0], "{kind}")
+                    }
                     Shape::Array => assert_eq!(row.get::<_, Vec<Vec<u8>>>(0), values, "{kind}[]"),
                     Shape::TupleArray => {
                         assert_eq!(row.get::<_, Value>(0), expected_json(values), "tuple {kind}")
@@ -196,4 +212,23 @@ async fn postgres_fixed_bytes_insert() {
 #[tokio::test]
 async fn postgres_fixed_bytes_copy() {
     roundtrip(true).await;
+}
+
+#[test]
+fn empty_fixed_byte_arrays_keep_existing_null_and_json_representations() {
+    for size in [1, 4, 31, 32] {
+        let kind = format!("bytes{size}");
+        let (_, array) = decoded(&kind, Shape::Array, &[]);
+        let mut bytes = BytesMut::new();
+        assert!(matches!(array.to_sql(&array.to_type(), &mut bytes).unwrap(), IsNull::Yes));
+        assert!(bytes.is_empty());
+        let (_, tuples) = decoded(&kind, Shape::TupleArray, &[]);
+        assert!(matches!(tuples.to_sql(&Type::JSONB, &mut bytes).unwrap(), IsNull::No));
+        assert_eq!(Value::from_sql(&Type::JSONB, &bytes).unwrap(), json!([]));
+    }
+}
+
+#[test]
+fn indexed_fixed_byte_scalars_preserve_their_declared_lengths() {
+    assert_encoding(Shape::IndexedScalar);
 }
