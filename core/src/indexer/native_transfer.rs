@@ -1,7 +1,6 @@
 use std::{
     cmp,
-    collections::{HashMap, HashSet, VecDeque},
-    ops::RangeInclusive,
+    collections::{HashMap, HashSet},
     sync::Arc,
     time::Duration,
 };
@@ -24,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 use crate::database::clickhouse::client::ClickhouseClient;
 use crate::indexer::reorg::{
     detect_and_handle_reorg, event_writer_barrier, ReorgContext, ReorgCoordinator,
+    ReorgSubscription,
 };
 use crate::is_running;
 use crate::provider::RECOMMENDED_RPC_CHUNK_SIZE;
@@ -88,24 +88,57 @@ pub struct NativeTransfer {
     pub transaction_information: TxInformation,
 }
 
-/// Push a range of blocks to the back-pressured channel and block producer when full.
-async fn push_range(block_tx: &mpsc::Sender<U64>, last: U64, latest: U64) {
-    let range: RangeInclusive<u64> =
-        last.try_into().expect("U64 fits u64")..=latest.try_into().expect("U64 fits u64");
-    let mut range = range.collect::<VecDeque<_>>();
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NativeBlockRequest {
+    pub(crate) block_number: U64,
+    pub(crate) generation: u64,
+}
 
-    while let Some(block) = range.pop_front() {
-        if let Err(e) = block_tx.send(U64::from(block)).await {
-            if block_tx.is_closed() {
-                // Log error if not shutting down
-                if is_running() {
-                    error!("Failed to send block via channel: {}", e.to_string());
-                }
-                break;
+/// Producer and consumer share completion state; fetching ahead never finishes a prefix.
+#[derive(Clone)]
+pub struct NativeBlockSender {
+    pub(crate) sender: mpsc::Sender<NativeBlockRequest>,
+    pub(crate) recovery: ReorgSubscription,
+}
+
+pub struct NativeBlockReceiver {
+    pub(crate) receiver: mpsc::Receiver<NativeBlockRequest>,
+    pub(crate) recovery: ReorgSubscription,
+}
+
+/// Initialize the stream from its last completed/start boundary, before planning work.
+pub fn native_block_channel(
+    network: &str,
+    start_after: U64,
+    capacity: usize,
+) -> (NativeBlockSender, NativeBlockReceiver) {
+    let recovery = crate::indexer::reorg::subscribe_reorgs(network);
+    recovery.start_at(start_after.to::<u64>().saturating_add(1));
+    let (sender, receiver) = mpsc::channel(capacity);
+    (
+        NativeBlockSender { sender, recovery: recovery.clone() },
+        NativeBlockReceiver { receiver, recovery },
+    )
+}
+
+/// Each request keeps the generation sampled before its range's RPC validation.
+async fn push_range(
+    block_tx: &NativeBlockSender,
+    last: U64,
+    latest: U64,
+    generation: u64,
+    network: &str,
+) {
+    for block in last.to::<u64>()..=latest.to::<u64>() {
+        if generation != crate::indexer::reorg::reorg_generation(network) {
+            break;
+        }
+        let request = NativeBlockRequest { block_number: U64::from(block), generation };
+        if let Err(error) = block_tx.sender.send(request).await {
+            if is_running() {
+                error!("Failed to send block via channel: {}", error);
             }
-
-            error!("Failed to send block via channel. Re-queuing: {}", e.to_string());
-            range.push_front(block);
+            break;
         }
     }
 }
@@ -227,7 +260,7 @@ pub(crate) async fn native_transfer_detect_reorg_in_range(
 
 /// Block publisher.
 ///
-/// This is a long-running process designed to accept a [`Sender`] handle and publish blocks
+/// This is a long-running process designed to accept a [`NativeBlockSender`] handle and publish blocks
 /// in an efficient manner which respects the user defined manifest block ranges.
 ///
 /// This process respects channel backpressure and will only complete once the `end_block` is
@@ -235,7 +268,7 @@ pub(crate) async fn native_transfer_detect_reorg_in_range(
 #[allow(clippy::too_many_arguments)]
 pub async fn native_transfer_block_fetch(
     publisher: Arc<dyn ChainProvider>,
-    block_tx: mpsc::Sender<U64>,
+    block_tx: NativeBlockSender,
     start_block: U64,
     end_block: Option<U64>,
     indexing_distance_from_head: U64,
@@ -248,10 +281,10 @@ pub async fn native_transfer_block_fetch(
     trace_registry: Arc<TraceCallbackRegistry>,
 ) -> Result<(), ProcessEventError> {
     let mut last_seen_block = start_block;
-    let reorgs = crate::indexer::reorg::subscribe_reorgs(&network);
+    let reorgs = &block_tx.recovery;
 
     loop {
-        if !is_running() || cancel_token.is_cancelled() || block_tx.is_closed() {
+        if !is_running() || cancel_token.is_cancelled() || block_tx.sender.is_closed() {
             info!("Exiting native transfer indexing block processor!");
             break Ok(());
         }
@@ -261,7 +294,8 @@ pub async fn native_transfer_block_fetch(
         // `target_iteration_duration` used in the contract-event fetch loop.
         sleep(Duration::from_millis(200)).await;
 
-        if let Some(fork_point) = reorgs.take_rewind() {
+        let (plan_generation, rewind) = reorgs.snapshot();
+        if let Some(fork_point) = rewind {
             last_seen_block = last_seen_block.min(U64::from(fork_point.saturating_sub(1)));
         }
 
@@ -325,9 +359,9 @@ pub async fn native_transfer_block_fetch(
                 // Always trim back to the safe indexing threshold (which is zero if disabled)
                 let block = block - indexing_distance_from_head;
 
-                if block > last_seen_block {
-                    let to_block = end_block.map(|end| block.min(end)).unwrap_or(block);
-                    let from_block = block.min(last_seen_block + U64::from(1));
+                let to_block = end_block.map(|end| block.min(end)).unwrap_or(block);
+                if to_block > last_seen_block {
+                    let from_block = last_seen_block + U64::from(1);
 
                     // Reorg detection runs on the fetch side so every block - even those
                     // with zero native transfers - feeds the coordinator's window, keeping
@@ -348,7 +382,8 @@ pub async fn native_transfer_block_fetch(
                         NativeTransferReorgOutcome::Canonical
                         | NativeTransferReorgOutcome::NoCoordinator => {
                             debug!("Pushing trace blocks {} - {}", from_block, to_block);
-                            push_range(&block_tx, from_block, to_block).await;
+                            push_range(&block_tx, from_block, to_block, plan_generation, &network)
+                                .await;
                             last_seen_block = to_block;
                         }
                         NativeTransferReorgOutcome::Rewound { rewind_to } => {
@@ -369,7 +404,10 @@ pub async fn native_transfer_block_fetch(
                     }
                 }
 
-                if end_block.is_some() && block > end_block.expect("must have block") {
+                if end_block.is_some_and(|end| {
+                    block > end
+                        && reorgs.first_unfinished().is_some_and(|next| next > end.to::<u64>())
+                }) {
                     info!("Finished HISTORICAL INDEXING for {} NativeEvmTraces. No more blocks to push.", network);
                     debug!("Dropping {} 'NativeEvmTraces' block Sender handle", network);
                     drop(block_tx);
@@ -389,7 +427,7 @@ pub async fn native_transfer_block_processor(
     network_name: String,
     provider: Arc<dyn ChainProvider>,
     config: Arc<TraceProcessingConfig>,
-    mut block_rx: mpsc::Receiver<U64>,
+    mut block_rx: NativeBlockReceiver,
 ) -> Result<(), ProcessEventError> {
     // Set the concurrency used to make requests based on the method.
     //
@@ -398,7 +436,7 @@ pub async fn native_transfer_block_processor(
     let (initial_concurrent_requests, limit_concurrent_requests) = (5, RECOMMENDED_RPC_CHUNK_SIZE);
 
     let mut concurrent_requests: usize = initial_concurrent_requests;
-    let mut buffer: Vec<U64> = Vec::with_capacity(limit_concurrent_requests);
+    let mut buffer: Vec<NativeBlockRequest> = Vec::with_capacity(limit_concurrent_requests);
 
     loop {
         if let Some(failure) = config.terminal_failure() {
@@ -411,7 +449,7 @@ pub async fn native_transfer_block_processor(
 
         // Fetch more only if buffer was processed ok last time and cleared.
         let recv = if buffer.is_empty() {
-            block_rx.recv_many(&mut buffer, concurrent_requests).await
+            block_rx.receiver.recv_many(&mut buffer, concurrent_requests).await
         } else {
             buffer.len()
         };
@@ -420,11 +458,19 @@ pub async fn native_transfer_block_processor(
             break Ok(());
         }
 
-        let processed_block = native_transfer_block_consumer(
+        let current_generation = crate::indexer::reorg::reorg_generation(&network_name);
+        buffer.retain(|request| request.generation == current_generation);
+        if buffer.is_empty() {
+            continue;
+        }
+        let numbers: Vec<U64> = buffer.iter().map(|request| request.block_number).collect();
+        let processed_block = native_transfer_block_consumer_at_generation(
             provider.clone(),
-            &buffer[..recv],
+            &numbers,
             &network_name,
             &config,
+            buffer[0].generation,
+            Some(&block_rx.recovery),
         )
         .await;
 
@@ -458,8 +504,14 @@ pub async fn native_transfer_block_processor(
                 warn!(
                     "Could not process '{}' block requests for {}..{}, Retrying in 500ms: {}",
                     network_name,
-                    &buffer.first().map(|n| n.as_limbs()[0]).unwrap_or_else(|| 0),
-                    &buffer.last().map(|n| n.as_limbs()[0]).unwrap_or_else(|| 0),
+                    &buffer
+                        .first()
+                        .map(|request| request.block_number.as_limbs()[0])
+                        .unwrap_or_else(|| 0),
+                    &buffer
+                        .last()
+                        .map(|request| request.block_number.as_limbs()[0])
+                        .unwrap_or_else(|| 0),
                     e.to_string(),
                 );
             }
@@ -503,13 +555,32 @@ pub async fn native_transfer_block_consumer(
     network_name: &str,
     config: &Arc<TraceProcessingConfig>,
 ) -> Result<(), ProcessEventError> {
+    let generation = crate::indexer::reorg::reorg_generation(network_name);
+    native_transfer_block_consumer_at_generation(
+        provider,
+        block_numbers,
+        network_name,
+        config,
+        generation,
+        None,
+    )
+    .await
+}
+
+async fn native_transfer_block_consumer_at_generation(
+    provider: Arc<dyn ChainProvider>,
+    block_numbers: &[U64],
+    network_name: &str,
+    config: &Arc<TraceProcessingConfig>,
+    generation: u64,
+    recovery: Option<&ReorgSubscription>,
+) -> Result<(), ProcessEventError> {
     if let Some(failure) = config.terminal_failure() {
         return Err(failure.into());
     }
     if block_numbers.is_empty() {
         return Ok(());
     }
-    let generation = crate::indexer::reorg::reorg_generation(network_name);
     let blocks = provider.get_block_by_number_batch(block_numbers, true).await?;
     let (from_block, to_block) = block_numbers
         .iter()
@@ -657,6 +728,17 @@ pub async fn native_transfer_block_consumer(
         )).into());
     }
 
+    if let Some(recovery) = recovery {
+        let required = recovery.first_unfinished();
+        let contiguous =
+            block_numbers.windows(2).all(|pair| pair[0].checked_add(U64::from(1)) == Some(pair[1]));
+        if required != Some(from_block.to::<u64>()) || !contiguous {
+            return Err(ProviderError::CustomError(format!(
+                "Cannot complete native-transfer range {from_block}..{to_block} on network {network_name:?}: first unfinished block is {required:?}; queued requests must form its contiguous prefix"
+            )).into());
+        }
+    }
+
     // Empty transfer ranges still checkpoint after any block callbacks succeed.
     let _activity = ActiveCallback::start();
 
@@ -673,6 +755,9 @@ pub async fn native_transfer_block_consumer(
     }
 
     evm_trace_update_progress_and_last_synced_task(config.clone(), to_block, || {}).await;
+    if let Some(recovery) = recovery {
+        recovery.completed_through(to_block.to::<u64>());
+    }
 
     Ok(())
 }
@@ -1114,8 +1199,15 @@ mod tests {
             async { Err(CallbackError::Permanent("terminal trace effect".to_string())) }.boxed()
         }))
         .await;
-        let (sender, receiver) = mpsc::channel(1);
-        sender.send(U64::from(42)).await.unwrap();
+        let (sender, receiver) = native_block_channel("ethereum", U64::from(41), 1);
+        sender
+            .sender
+            .send(NativeBlockRequest {
+                block_number: U64::from(42),
+                generation: crate::indexer::reorg::reorg_generation("ethereum"),
+            })
+            .await
+            .unwrap();
         let result = tokio::time::timeout(
             Duration::from_secs(5),
             native_transfer_block_processor("ethereum".to_string(), provider, config, receiver),
@@ -1155,7 +1247,7 @@ mod tests {
 
     #[tokio::test]
     async fn closed_trace_block_queue_finishes_without_waiting_for_more_input() {
-        let (sender, receiver) = mpsc::channel(1);
+        let (sender, receiver) = native_block_channel("ethereum", U64::from(41), 1);
         drop(sender);
         tokio::time::timeout(
             Duration::from_secs(1),
@@ -1364,6 +1456,92 @@ mod tests {
         assert_eq!(crate::indexer::task_tracker::active_indexing_count(), 0);
     }
 
+    #[tokio::test]
+    async fn native_queue_requires_its_contiguous_unfinished_prefix() {
+        use futures::FutureExt;
+        let (_directory, config, _, path) = callback_case(Arc::new(|_| {
+            async { panic!("a gap cannot invoke either callback") }.boxed()
+        }))
+        .await;
+        let (sender, _receiver) = native_block_channel("ethereum", U64::from(41), 8);
+        for numbers in [vec![U64::from(43)], vec![U64::from(42), U64::from(44)]] {
+            let blocks: Vec<_> = numbers
+                .iter()
+                .map(|number| {
+                    make_block_with_native_transfer(
+                        number.to::<u64>(),
+                        Address::ZERO,
+                        Address::repeat_byte(1),
+                        U256::ONE,
+                    )
+                })
+                .collect();
+            let receipts = successful_receipts(&blocks);
+            let provider = Arc::new(
+                MockChainProvider::new(1).with_blocks(blocks).with_receipt_response(receipts),
+            );
+            let error = native_transfer_block_consumer_at_generation(
+                provider,
+                &numbers,
+                "ethereum",
+                &config,
+                crate::indexer::reorg::reorg_generation("ethereum"),
+                Some(&sender.recovery),
+            )
+            .await
+            .expect_err("gaps must fail before checkpointing");
+            assert!(error.to_string().contains("first unfinished block"));
+            assert_eq!(sender.recovery.first_unfinished(), Some(42));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "1");
+        }
+        assert_eq!(crate::indexer::task_tracker::active_indexing_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn historical_native_publisher_waits_for_queue_completion() {
+        let network = "historical-native-completion";
+        let provider = Arc::new(MockChainProvider::new(1).with_blocks(vec![
+            make_block_with_parent(98, b256(98), b256(97)),
+            make_block_with_parent(100, b256(100), b256(99)),
+        ]));
+        let (sender, receiver) = native_block_channel(network, U64::from(97), 1);
+        let publisher = tokio::spawn(native_transfer_block_fetch(
+            provider.clone(),
+            sender,
+            U64::from(97),
+            Some(U64::from(98)),
+            U64::ZERO,
+            network.to_string(),
+            CancellationToken::new(),
+            None,
+            "test".to_string(),
+            None,
+            None,
+            Arc::new(TraceCallbackRegistry::new()),
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while receiver.receiver.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!publisher.is_finished(), "queueing end_block alone does not finish indexing");
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            native_transfer_block_processor(
+                network.to_string(),
+                provider,
+                make_trace_config_async().await,
+                receiver,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        publisher.await.unwrap().unwrap();
+    }
+
     async fn assert_missing_native_metadata_is_an_error(field: &str) {
         use alloy::rpc::types::BlockTransactions;
         use futures::FutureExt;
@@ -1505,7 +1683,7 @@ mod tests {
             ),
         );
         let coordinator = make_test_coordinator(network, &[], provider.clone());
-        let (tx, mut rx) = mpsc::channel(1);
+        let (tx, mut rx) = native_block_channel(network, U64::from(80), 1);
         let cancel = CancellationToken::new();
         let mut publisher = Box::pin(native_transfer_block_fetch(
             provider,
@@ -1541,13 +1719,18 @@ mod tests {
         let first = tokio::time::timeout(Duration::from_secs(1), async {
             tokio::select! {
                 result = publisher.as_mut() => panic!("publisher ended: {result:?}"),
-                first = rx.recv() => first.unwrap(),
+                first = rx.receiver.recv() => first.unwrap(),
             }
         })
         .await
         .unwrap();
         cancel.cancel();
-        assert_eq!(first, U64::from(81), "blocks before the fork are still unprocessed");
+        assert_eq!(
+            first.block_number,
+            U64::from(81),
+            "blocks before the fork are still unprocessed"
+        );
+        assert_eq!(first.generation, crate::indexer::reorg::reorg_generation(network));
     }
 
     #[tokio::test]

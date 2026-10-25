@@ -312,7 +312,9 @@ async fn assert_receipt_failures_leave_range_unfinished(
 #[tokio::test]
 async fn postgres_native_queue_recovery_preserves_replacement_prefix_on_anvil() {
     use crate::indexer::{
-        native_transfer::native_transfer_block_processor,
+        native_transfer::{
+            native_block_channel, native_transfer_block_processor, NativeBlockRequest,
+        },
         reorg::{
             task::{
                 DerivedColumnRollback, DerivedTableInfo, DerivedTableRollbackOp,
@@ -373,9 +375,17 @@ async fn postgres_native_queue_recovery_preserves_replacement_prefix_on_anvil() 
         .await
         .unwrap();
     // Real FIFO requests already planned before rollback. Delay replacement delivery.
-    let (requests, queued) = tokio::sync::mpsc::channel(32);
+    let (requests, queued) = native_block_channel("ethereum", U64::from(100), 32);
+    let planned_generation = crate::indexer::reorg::reorg_generation("ethereum");
     for number in 101..=110 {
-        requests.send(U64::from(number)).await.unwrap();
+        requests
+            .sender
+            .send(NativeBlockRequest {
+                block_number: U64::from(number),
+                generation: planned_generation,
+            })
+            .await
+            .unwrap();
     }
     assert!(rpc(&client, &url, "evm_revert", json!([snapshot])).await.as_bool().unwrap());
     rpc(&client, &url, "evm_setAutomine", json!([false])).await;
@@ -466,7 +476,7 @@ async fn postgres_native_queue_recovery_preserves_replacement_prefix_on_anvil() 
         queued,
     ));
     tokio::time::timeout(Duration::from_secs(10), async {
-        while requests.capacity() != 32 {
+        while requests.sender.capacity() != 32 {
             tokio::task::yield_now().await;
         }
     })
@@ -487,9 +497,17 @@ async fn postgres_native_queue_recovery_preserves_replacement_prefix_on_anvil() 
     let saved: u64 = fixture.position().await.2.parse().unwrap();
     let (mut restarted, _) = processing_config(&fixture, 110).await;
     Arc::get_mut(&mut restarted).unwrap().start_block = U64::from(saved + 1);
-    let (requests, queue) = tokio::sync::mpsc::channel(32);
+    let (requests, queue) = native_block_channel("ethereum", U64::from(saved), 32);
+    let planned_generation = crate::indexer::reorg::reorg_generation("ethereum");
     for number in saved + 1..=110 {
-        requests.send(U64::from(number)).await.unwrap();
+        requests
+            .sender
+            .send(NativeBlockRequest {
+                block_number: U64::from(number),
+                generation: planned_generation,
+            })
+            .await
+            .unwrap();
     }
     drop(requests);
     native_transfer_block_processor("ethereum".to_string(), provider, restarted.clone(), queue)

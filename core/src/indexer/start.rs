@@ -37,7 +37,8 @@ use crate::{
         dependency::ContractEventsDependenciesConfig,
         last_synced::{get_last_synced_block_number, SyncConfig},
         native_transfer::{
-            native_transfer_block_fetch, NATIVE_TRANSFER_ABI, NATIVE_TRANSFER_CONTRACT_NAME,
+            native_block_channel, native_transfer_block_fetch, NATIVE_TRANSFER_ABI,
+            NATIVE_TRANSFER_CONTRACT_NAME,
         },
         process::{
             process_contracts_events_with_dependencies, process_non_blocking_event,
@@ -248,30 +249,40 @@ async fn start_indexing_traces(
             .find(|c| c.name == first_event.contract_name)
             .and_then(|c| c.streams.as_ref());
 
-        let sync_config = SyncConfig {
-            project_path,
-            postgres: &postgres,
-            clickhouse: &clickhouse,
-            csv_details: &manifest.storage.csv,
-            contract_csv_enabled: manifest.contract_csv_enabled(&first_event.contract_name),
-            stream_details: &stream_details,
-            indexer_name: &first_event.indexer_name,
-            contract_name: &first_event.contract_name,
-            event_name: &first_event.event_name,
-            network: &network_name,
-        };
+        // A rollback between reading progress and registering the queue invalidates
+        // that bootstrap read. Retry instead of seeding a current-generation gap.
+        let (start_block, end_block, indexing_distance_from_head, block_tx, block_rx) = loop {
+            let generation = crate::indexer::reorg::reorg_generation(&network_name);
+            let sync_config = SyncConfig {
+                project_path,
+                postgres: &postgres,
+                clickhouse: &clickhouse,
+                csv_details: &manifest.storage.csv,
+                contract_csv_enabled: manifest.contract_csv_enabled(&first_event.contract_name),
+                stream_details: &stream_details,
+                indexer_name: &first_event.indexer_name,
+                contract_name: &first_event.contract_name,
+                event_name: &first_event.event_name,
+                network: &network_name,
+            };
 
-        let (block_tx, block_rx) = tokio::sync::mpsc::channel(4096);
-        let (start_block, end_block, indexing_distance_from_head) = get_start_end_block(
-            &*network_details.cached_provider,
-            network_details.start_block,
-            network_details.end_block,
-            sync_config,
-            &format!("TraceEvents[{}]", network_name),
-            &network_name,
-            first_event.trace_information.reorg_safe_distance,
-        )
-        .await?;
+            let (start_block, end_block, indexing_distance_from_head) = get_start_end_block(
+                &*network_details.cached_provider,
+                network_details.start_block,
+                network_details.end_block,
+                sync_config,
+                &format!("TraceEvents[{}]", network_name),
+                &network_name,
+                first_event.trace_information.reorg_safe_distance,
+            )
+            .await?;
+
+            let (block_tx, block_rx) = native_block_channel(&network_name, start_block, 4096);
+            // Registration precedes this check, so a later rollback reaches the queue.
+            if generation == crate::indexer::reorg::reorg_generation(&network_name) {
+                break (start_block, end_block, indexing_distance_from_head, block_tx, block_rx);
+            }
+        };
 
         // Create a shared registry for this network's events
         let mut network_registry = trace_registry.as_ref().clone();

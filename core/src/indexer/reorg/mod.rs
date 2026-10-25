@@ -71,9 +71,12 @@ impl ReorgSubscription {
     pub(crate) fn start_at(&self, first_unfinished: u64) {
         let mut position = self.position.lock().unwrap_or_else(|e| e.into_inner());
         if position.next_unfinished.is_none() {
-            position.next_unfinished = Some(first_unfinished);
+            let first = position
+                .pending_rewind
+                .map_or(first_unfinished, |rewind| rewind.min(first_unfinished));
+            position.next_unfinished = Some(first);
             if let Some(rewind) = position.pending_rewind.as_mut() {
-                *rewind = (*rewind).min(first_unfinished);
+                *rewind = first;
             }
         }
     }
@@ -87,6 +90,11 @@ impl ReorgSubscription {
         }
     }
 
+    pub(crate) fn first_unfinished(&self) -> Option<u64> {
+        self.position.lock().unwrap_or_else(|e| e.into_inner()).next_unfinished
+    }
+
+    #[cfg(test)]
     pub(crate) fn take_rewind(&self) -> Option<u64> {
         self.snapshot().1
     }
@@ -443,6 +451,20 @@ mod tests {
     }
 
     use super::*;
+
+    #[tokio::test]
+    async fn initialization_keeps_recovery_and_completion_boundaries_aligned() {
+        for (first, expected) in [(101, 98), (81, 81)] {
+            let network = format!("bootstrap-{first}");
+            let subscription = subscribe_reorgs(&network);
+            let writer = event_writer_barrier(&network).write_owned().await;
+            publish_rewind(&network, 98);
+            drop(writer);
+            subscription.start_at(first);
+            assert_eq!(subscription.first_unfinished(), Some(expected));
+            assert_eq!(subscription.take_rewind(), Some(expected));
+        }
+    }
 
     use crate::manifest::contract::ReorgSafeDistance;
 

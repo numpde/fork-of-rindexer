@@ -8,6 +8,22 @@ You can expect the event to be defined as if you were indexing an ERC20 Transfer
 This is **experimental** functionality which has not yet been extensively tested in production.
 :::
 
+## Recovery and progress
+
+Queued block requests retain the recovery generation in which their range was
+planned. After rollback, the processor retires old requests and resumes from the
+earlier of the fork and the first unfinished block. A checkpoint certifies a
+contiguous completed prefix; fetching later canonical blocks alone cannot advance
+it across missing replacement history. Historical publishers finish after the
+processor completes through `end_block`.
+
+Existing gaps from older queued-work recovery require reviewed reconstruction of
+affected raw events, derived effects, application receipts and checkpoints. An
+upgrade does not identify or repair those gaps automatically. Rust callers using
+the low-level native publisher/processor functions must construct both endpoints
+with `native_block_channel(network, start_after, capacity)`, where `start_after`
+is their last completed/start boundary. YAML and generated bindings are unchanged.
+
 ## Execution status and RPC requirements
 
 The active block-based path indexes top-level transactions with a recipient,
