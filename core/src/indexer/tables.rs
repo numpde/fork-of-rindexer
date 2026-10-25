@@ -2168,108 +2168,63 @@ async fn execute_view_call(
     provider: &dyn ChainProvider,
     network: &str,
     constants: &Constants,
-) -> Option<DynSolValue> {
-    use alloy::primitives::keccak256;
-
-    // Resolve contract address - may be a constant, field reference, or literal
-    let contract_address: Address = if view_call.contract_address.starts_with("$constant(") {
-        // Resolve constant reference
-        let resolved = resolve_constants_in_value(&view_call.contract_address, constants, network)?;
-        resolved.parse().ok()?
-    } else if view_call.contract_address.starts_with('$') {
-        let field_name = &view_call.contract_address[1..];
-        if field_name == "rindexer_contract_address" {
-            tx_metadata.contract_address
-        } else {
-            let value = resolve_field_path(field_name, log_params)?;
-            match value {
-                DynSolValue::Address(addr) => addr,
-                _ => return None,
-            }
-        }
+) -> Result<DynSolValue, String> {
+    let pending =
+        resolve_view_call_to_pending(view_call, log_params, tx_metadata, network, constants)
+            .ok_or_else(|| {
+                format!(
+            "Cannot resolve target or arguments for required view call {:?} on network {:?}",
+            view_call.function_sig, network
+        )
+            })?;
+    let contract_address = pending.target;
+    let calldata = pending.calldata;
+    let func_name = view_call.function_sig.split('(').next().unwrap_or(&view_call.function_sig);
+    let state = if view_call.is_static {
+        "latest state".to_string()
     } else {
-        view_call.contract_address.parse().ok()?
+        format!("block {} ({:#x})", tx_metadata.block_number, tx_metadata.block_hash)
     };
-
-    // Parse function signature to get types
-    // e.g., "balanceOf(address)" -> selector + encode args
-    let (func_name, param_types) = parse_function_signature(&view_call.function_sig)?;
-
-    // Build function selector (first 4 bytes of keccak256 of signature)
-    let selector = &keccak256(view_call.function_sig.as_bytes())[..4];
-
-    // Encode arguments
-    let mut encoded_args = Vec::new();
-    for (i, arg_str) in view_call.args.iter().enumerate() {
-        let param_type = param_types.get(i)?;
-        let value =
-            resolve_arg_value(arg_str, log_params, tx_metadata, param_type, constants, network)?;
-        encoded_args.push(value);
-    }
-
-    // Build calldata: selector + encoded args
-    let calldata = if encoded_args.is_empty() {
-        Bytes::copy_from_slice(selector)
-    } else {
-        let encoded = DynSolValue::Tuple(encoded_args).abi_encode_params();
-        let mut data = selector.to_vec();
-        data.extend(encoded);
-        Bytes::from(data)
+    let context = format!(
+        "required view call {contract_address}::{} on network {network:?} at {state}",
+        view_call.function_sig
+    );
+    let decode = |bytes: &[u8]| {
+        let value = decode_view_call_result(bytes, view_call)
+            .ok_or_else(|| format!("Cannot decode {context}: response does not match the return declaration or a supported automatic layout"))?;
+        apply_accessor_if_present(value, view_call).ok_or_else(|| {
+            format!("Cannot resolve accessor {:?} for {context}", view_call.accessor)
+        })
     };
-
-    // For static calls, check the static cache first (no block number in key)
     if view_call.is_static {
-        let static_cache_key = (network.to_string(), contract_address, calldata.clone());
+        let key = (network.to_string(), contract_address, calldata.clone());
         {
             let cache = STATIC_CALL_CACHE.read().await;
-            if let Some(cached) = cache.get(&static_cache_key) {
+            if let Some(bytes) = cache.get(&key) {
                 debug!("Static call cache hit for {}::{}", contract_address, func_name);
-                return apply_accessor_if_present(
-                    decode_view_call_result(cached, view_call)?,
-                    view_call,
-                );
+                return decode(bytes);
             }
         }
-
-        // Acquire semaphore permit
         let semaphore = VIEW_CALL_SEMAPHORE.read().await.clone();
-        let _permit = semaphore.acquire().await.ok()?;
-
-        // Double-check cache after acquiring permit
+        let _permit =
+            semaphore.acquire().await.map_err(|e| format!("Cannot execute {context}: {e}"))?;
         {
             let cache = STATIC_CALL_CACHE.read().await;
-            if let Some(cached) = cache.get(&static_cache_key) {
-                return apply_accessor_if_present(
-                    decode_view_call_result(cached, view_call)?,
-                    view_call,
-                );
+            if let Some(bytes) = cache.get(&key) {
+                return decode(bytes);
             }
         }
-
-        // Execute static call at latest block
-        let result_bytes: String =
-            match provider.eth_call_latest(contract_address, calldata.clone()).await {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!("Static view call failed for {}::{}: {}", contract_address, func_name, e);
-                    return None;
-                }
-            };
-
-        let result_bytes = hex::decode(result_bytes.trim_start_matches("0x")).ok()?;
-        let decoded = decode_view_call_result(&result_bytes, view_call)?;
-
-        // Cache in static cache (forever)
-        {
-            let mut cache = STATIC_CALL_CACHE.write().await;
-            cache.insert(static_cache_key, result_bytes);
-        }
-
-        return apply_accessor_if_present(decoded, view_call);
+        let response = provider.eth_call_latest(contract_address, calldata).await.map_err(|e| {
+            warn!("Static view call failed for {}::{}: {}", contract_address, func_name, e);
+            format!("Cannot execute {context}: RPC request failed: {e}")
+        })?;
+        let bytes = hex::decode(response.trim_start_matches("0x"))
+            .map_err(|e| format!("Cannot decode {context}: RPC result is not hexadecimal: {e}"))?;
+        let value = decode(&bytes)?;
+        STATIC_CALL_CACHE.write().await.insert(key, bytes);
+        return Ok(value);
     }
-
-    // Regular call - check block-specific cache
-    let cache_key = (
+    let key = (
         network.to_string(),
         contract_address,
         calldata.clone(),
@@ -2278,57 +2233,35 @@ async fn execute_view_call(
     );
     {
         let cache = VIEW_CALL_CACHE.read().await;
-        if let Some(cached) = cache.get(&cache_key) {
+        if let Some(bytes) = cache.get(&key) {
             debug!("View call cache hit for {}::{}", contract_address, func_name);
-            return apply_accessor_if_present(
-                decode_view_call_result(cached, view_call)?,
-                view_call,
-            );
+            return decode(bytes);
         }
     }
-
-    // Acquire semaphore permit to limit concurrent RPC calls
     let semaphore = VIEW_CALL_SEMAPHORE.read().await.clone();
-    let _permit = semaphore.acquire().await.ok()?;
-
-    // Double-check cache after acquiring permit
+    let _permit =
+        semaphore.acquire().await.map_err(|e| format!("Cannot execute {context}: {e}"))?;
     {
         let cache = VIEW_CALL_CACHE.read().await;
-        if let Some(cached) = cache.get(&cache_key) {
-            return apply_accessor_if_present(
-                decode_view_call_result(cached, view_call)?,
-                view_call,
-            );
+        if let Some(bytes) = cache.get(&key) {
+            return decode(bytes);
         }
     }
-
-    // Execute the call at the event's block number
-    let result_bytes: String = match provider
-        .eth_call_at_hash(contract_address, calldata.clone(), tx_metadata.block_hash)
+    let response = provider
+        .eth_call_at_hash(contract_address, calldata, tx_metadata.block_hash)
         .await
-    {
-        Ok(r) => r,
-        Err(e) => {
+        .map_err(|e| {
             warn!("View call failed for {}::{}: {}", contract_address, func_name, e);
-            return None;
-        }
-    };
-
-    let result_bytes = hex::decode(result_bytes.trim_start_matches("0x")).ok()?;
-    let decoded = decode_view_call_result(&result_bytes, view_call)?;
-
-    // Cache the full result (before accessor is applied)
-    {
-        let mut cache = VIEW_CALL_CACHE.write().await;
-        cache.insert(cache_key, result_bytes);
-    }
-
-    // Evict old entries if cache is getting large (skip during shutdown)
+            format!("Cannot execute {context}: RPC request failed: {e}")
+        })?;
+    let bytes = hex::decode(response.trim_start_matches("0x"))
+        .map_err(|e| format!("Cannot decode {context}: RPC result is not hexadecimal: {e}"))?;
+    let value = decode(&bytes)?;
+    VIEW_CALL_CACHE.write().await.insert(key, bytes);
     if is_running() {
         evict_old_view_call_cache_entries().await;
     }
-
-    apply_accessor_if_present(decoded, view_call)
+    Ok(value)
 }
 
 /// Decodes the raw bytes from a view call result.
@@ -2361,10 +2294,10 @@ async fn resolve_calls_in_arithmetic_expression(
     provider: &dyn ChainProvider,
     network: &str,
     constants: &Constants,
-) -> Option<String> {
+) -> Result<String, String> {
     let call_patterns = find_call_patterns(expression);
     if call_patterns.is_empty() {
-        return Some(expression.to_string());
+        return Ok(expression.to_string());
     }
 
     let mut result = expression.to_string();
@@ -2372,7 +2305,8 @@ async fn resolve_calls_in_arithmetic_expression(
     // Process calls in reverse order so indices remain valid after replacements
     for (start, end, call_expr) in call_patterns.into_iter().rev() {
         // Parse and execute the view call
-        let view_call = parse_view_call(&call_expr)?;
+        let view_call = parse_view_call(&call_expr)
+            .ok_or_else(|| format!("Cannot parse required view call {call_expr:?}"))?;
         let call_result =
             execute_view_call(&view_call, log_params, tx_metadata, provider, network, constants)
                 .await?;
@@ -2384,7 +2318,10 @@ async fn resolve_calls_in_arithmetic_expression(
             DynSolValue::Bool(b) => if b { "1" } else { "0" }.to_string(),
             _ => {
                 warn!("View call in arithmetic returned non-numeric value: {:?}", call_result);
-                return None;
+                return Err(format!(
+                    "Cannot evaluate arithmetic with a non-numeric view call result for {:?}",
+                    view_call.function_sig
+                ));
             }
         };
 
@@ -2392,7 +2329,7 @@ async fn resolve_calls_in_arithmetic_expression(
         result.replace_range(start..end, &value_str);
     }
 
-    Some(result)
+    Ok(result)
 }
 
 /// Applies accessor to a view call result if one is specified.
@@ -2604,10 +2541,10 @@ async fn extract_value_from_event_async(
     provider: Option<&dyn ChainProvider>,
     network: &str,
     constants: &Constants,
-) -> Option<EthereumSqlTypeWrapper> {
+) -> Result<Option<EthereumSqlTypeWrapper>, String> {
     // Check for explicit null value first
     if value_ref == "$null" {
-        return Some(EthereumSqlTypeWrapper::Null);
+        return Ok(Some(EthereumSqlTypeWrapper::Null));
     }
 
     // Check for conditional expression: $if(condition, trueValue, falseValue)
@@ -2645,13 +2582,13 @@ async fn extract_value_from_event_async(
                     }
                     Err(e) => {
                         debug!("$if condition evaluation failed: {}. Condition: {}", e, condition);
-                        return None;
+                        return Err(format!("Cannot resolve conditional value {value_ref:?}: {e}"));
                     }
                 }
             }
             Err(e) => {
                 debug!("Failed to parse $if expression: {}. Expression: {}", e, value_ref);
-                return None;
+                return Err(format!("Cannot resolve conditional value {value_ref:?}: {e}"));
             }
         }
     }
@@ -2659,7 +2596,10 @@ async fn extract_value_from_event_async(
     // First resolve any constants in the value (handles $constant(...) anywhere in string)
     let resolved_constants: String;
     let after_constants = if value_ref.contains("$constant(") {
-        resolved_constants = resolve_all_constants_in_value(value_ref, constants, network)?;
+        resolved_constants = resolve_all_constants_in_value(value_ref, constants, network)
+            .ok_or_else(|| {
+                format!("Cannot resolve constants in {value_ref:?} on network {network:?}")
+            })?;
         resolved_constants.as_str()
     } else {
         value_ref
@@ -2668,7 +2608,7 @@ async fn extract_value_from_event_async(
     // Check for arithmetic expression with $call() patterns
     // e.g., "$amount / (10 ^ $call($asset, \"decimals()\")) * $call($oracle, \"getAssetPrice(address)\", $asset)"
     if is_arithmetic_expression(after_constants) && arithmetic_has_calls(after_constants) {
-        let provider = provider?;
+        let provider = provider.ok_or_else(|| format!("Cannot resolve required view call in {value_ref:?}: no provider for network {network:?}"))?;
         // Resolve all $call() patterns first, then evaluate arithmetic
         let resolved_expr = resolve_calls_in_arithmetic_expression(
             after_constants,
@@ -2687,31 +2627,27 @@ async fn extract_value_from_event_async(
             map.insert("rindexer_tx_index".to_string(), json!(tx_metadata.tx_index));
             map.insert("rindexer_log_index".to_string(), json!(tx_metadata.log_index.to::<u64>()));
         }
-        return match evaluate_arithmetic(&resolved_expr, &json_data) {
-            Ok(ComputedValue::U256(val)) => match column_type {
-                ColumnType::Uint64 => Some(EthereumSqlTypeWrapper::U64BigInt(val.to::<u64>())),
-                ColumnType::Uint128 => Some(EthereumSqlTypeWrapper::U256Numeric(val)),
-                _ => Some(EthereumSqlTypeWrapper::U256Numeric(val)),
+        let value = match evaluate_arithmetic(&resolved_expr, &json_data).map_err(|e| {
+            format!("Cannot evaluate required view-call arithmetic {resolved_expr:?}: {e}")
+        })? {
+            ComputedValue::U256(val) => match column_type {
+                ColumnType::Uint64 => EthereumSqlTypeWrapper::U64BigInt(val.to::<u64>()),
+                _ => EthereumSqlTypeWrapper::U256Numeric(val),
             },
-            Ok(ComputedValue::String(s)) => Some(EthereumSqlTypeWrapper::String(s)),
-            Err(e) => {
-                debug!(
-                    "Arithmetic expression with calls evaluation failed: {}. Expression: {}",
-                    e, resolved_expr
-                );
-                None
-            }
+            ComputedValue::String(value) => EthereumSqlTypeWrapper::String(value),
         };
+        return Ok(Some(value));
     }
 
     // Check for standalone view call (not in arithmetic)
     if is_view_call(after_constants) {
-        let provider = provider?;
-        let view_call = parse_view_call(after_constants)?;
+        let provider = provider.ok_or_else(|| format!("Cannot resolve required view call in {value_ref:?}: no provider for network {network:?}"))?;
+        let view_call = parse_view_call(after_constants)
+            .ok_or_else(|| format!("Cannot parse required view call {after_constants:?}"))?;
         let result =
             execute_view_call(&view_call, log_params, tx_metadata, provider, network, constants)
                 .await?;
-        return Some(dyn_sol_value_to_wrapper(&result, column_type));
+        return Ok(Some(dyn_sol_value_to_wrapper(&result, column_type)));
     }
 
     // BlockClock cache fallback for $rindexer_block_timestamp when RPC didn't include it
@@ -2722,7 +2658,7 @@ async fn extract_value_from_event_async(
             get_cached_block_timestamp(network, tx_metadata.block_number, tx_metadata.block_hash)
                 .await
         {
-            return Some(match column_type {
+            return Ok(Some(match column_type {
                 ColumnType::Uint256 | ColumnType::Uint128 | ColumnType::Uint64 => {
                     EthereumSqlTypeWrapper::U256Numeric(U256::from(epoch))
                 }
@@ -2730,7 +2666,7 @@ async fn extract_value_from_event_async(
                     .map(|dt| EthereumSqlTypeWrapper::DateTime(dt.with_timezone(&Utc)))
                     .unwrap_or_else(|| EthereumSqlTypeWrapper::U256Numeric(U256::from(epoch))),
                 _ => EthereumSqlTypeWrapper::U256Numeric(U256::from(epoch)),
-            });
+            }));
         }
         warn!(
             "block_timestamp unavailable for block {} on {} — RPC may not include \
@@ -2740,7 +2676,7 @@ async fn extract_value_from_event_async(
     }
 
     // Fall back to sync extraction for everything else
-    extract_value_from_event(after_constants, log_params, tx_metadata, column_type)
+    Ok(extract_value_from_event(after_constants, log_params, tx_metadata, column_type))
 }
 
 /// Resolves a field path from event log parameters, supporting:
@@ -3727,7 +3663,7 @@ pub(crate) async fn prepare_table_operations<'t>(
                                 network,
                                 constants,
                             )
-                            .await
+                            .await?
                             {
                                 columns.insert(column_name.clone(), value);
                             }
@@ -3749,7 +3685,7 @@ pub(crate) async fn prepare_table_operations<'t>(
                                 network,
                                 constants,
                             )
-                            .await
+                            .await?
                             {
                                 columns.insert(set_col.column.clone(), value);
                             }
@@ -5494,7 +5430,8 @@ mod tests {
             "polygon",
             &constants,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert!(result.is_some(), "Async path should resolve from BlockClock cache");
         match result.unwrap() {
@@ -5541,7 +5478,8 @@ mod tests {
             "polygon",
             &constants,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert!(result.is_some(), "Should return DateTime from cache");
         match result.unwrap() {
@@ -5583,7 +5521,8 @@ mod tests {
             "polygon",
             &constants,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert!(result.is_none(), "Should return None when both metadata and cache miss");
     }
@@ -5619,7 +5558,8 @@ mod tests {
             "polygon",
             &constants,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert!(result.is_some());
         match result.unwrap() {

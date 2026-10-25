@@ -229,12 +229,12 @@ async fn late_original_prefetch_cannot_overwrite_replacement_state() {
     let constants = Constants::default();
     let read =
         || execute_view_call(&call, &[], &replacement, provider.as_ref(), "cache_race", &constants);
-    assert_eq!(read().await, Some(DynSolValue::Uint(U256::from(20), 256)));
+    assert_eq!(read().await, Ok(DynSolValue::Uint(U256::from(20), 256)));
     rpc.state.release_original.notify_one();
     tokio::time::timeout(std::time::Duration::from_secs(10), prefetch).await.unwrap().unwrap();
     assert_eq!(
         read().await,
-        Some(DynSolValue::Uint(U256::from(20), 256)),
+        Ok(DynSolValue::Uint(U256::from(20), 256)),
         "late A reply cannot poison B"
     );
     assert_eq!(rpc.request_count().await, 2, "identical replacement blocks must hit cache");
@@ -264,7 +264,8 @@ async fn fallback_timestamps_belong_to_the_event_block_hash() {
             "timestamp_fork",
             &Constants::default(),
         )
-        .await;
+        .await
+        .unwrap();
         assert!(
             matches!(actual, Some(EthereumSqlTypeWrapper::U256Numeric(value)) if value == U256::from(expected))
         );
@@ -293,6 +294,7 @@ async fn timestamp_response_for_another_hash_cannot_satisfy_event_metadata() {
         &Constants::default()
     )
     .await
+    .unwrap()
     .is_none());
 }
 
@@ -321,7 +323,7 @@ async fn unsupported_hash_selectors_never_fall_back_to_a_number_call() {
         &Constants::default()
     )
     .await
-    .is_none());
+    .is_err());
     assert_eq!(rpc.request_count().await, 1);
     rpc.assert_hash_qualified().await;
     rpc.stop().await;

@@ -169,7 +169,9 @@ async fn required_call_failure_is_atomic(partial: bool) {
         .into(),
     );
     let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
-    let events = fixture.events(&[1]);
+    let mut events = fixture.events(&[1]);
+    events[0].log.block_hash = Some(ORIGINAL);
+    events[0].tx_information.block_hash = ORIGINAL;
     let before = fixture.position().await;
     let result = callback(events.clone()).await;
     assert!(

@@ -97,3 +97,24 @@ locked dependencies first using `make dev/image/build` and `make deps/install`.
 `make tests/trace-bindings/docker` enables native transfers only in a disposable
 copy of the playground, generates its bindings, and compiles that example with
 Clippy. It does not change the example's checked-in manifest or generated files.
+
+## Required view calls and recovery
+
+No-code custom-table `$call` and `$call_static` values are required lookups. An RPC
+failure, invalid argument, undecodable return value, or invalid accessor now fails
+preparation for retry. A column default does not replace a failed lookup. This
+also applies to calls selected by `$if` or used in arithmetic. An unselected `$if`
+branch is not executed, and deliberate `$null` retains its existing meaning.
+
+An affected PostgreSQL callback commits no raw row, derived operation, application
+receipt or progress for the failed attempt. Once the RPC or configuration is
+corrected, the same event can be retried. These failures previously could commit
+missing or defaulted derived effects; upgrading cannot repair that history. Review
+raw and derived data, receipts and progress together before a controlled rebuild.
+
+Recovery signals obsolete callback retries before acquiring the network writer
+barrier. An active attempt retains its guard until it returns; it is then retired
+without retrying or checkpointing. Replacement writes wait until rollback succeeds.
+This prevents an orphaned block's required enrichment from indefinitely blocking
+recovery through repeated callback retries. A custom handler that never returns
+from an active attempt still must be allowed to finish before rollback can run.

@@ -9,7 +9,7 @@ async fn resolve_fixture(
     prefetch: bool,
     signature: &str,
     accessor: &str,
-) -> Option<DynSolValue> {
+) -> Result<DynSolValue, String> {
     let rpc = HistoricalRpc::start().await;
     rpc.set_return_data(bytes).await;
     let provider = crate::provider::create_client(
@@ -53,7 +53,7 @@ async fn resolve_fixture(
     let value = execute_view_call(&call, &[], &meta, provider.as_ref(), network, &constants).await;
     let cached = execute_view_call(&call, &[], &meta, provider.as_ref(), network, &constants).await;
     assert_eq!(value, cached);
-    assert_eq!(rpc.request_count().await, if value.is_some() || prefetch { 1 } else { 2 });
+    assert_eq!(rpc.request_count().await, if value.is_ok() || prefetch { 1 } else { 2 });
     rpc.stop().await;
     value
 }
@@ -67,7 +67,7 @@ async fn large_tuple(is_static: bool, prefetch: bool, network: &str) {
     .abi_encode_params();
     assert_eq!(bytes.len(), 64);
     let result = resolve_fixture(bytes, network, is_static, prefetch, "state()", "[1]").await;
-    assert_eq!(result, Some(DynSolValue::Uint(large, 256)));
+    assert_eq!(result, Ok(DynSolValue::Uint(large, 256)));
 }
 
 #[tokio::test]
@@ -95,7 +95,7 @@ async fn explicit_return_type_owns_static_prefetch_and_cache_interpretation() {
         "",
     )
     .await;
-    assert_eq!(value, Some(DynSolValue::FixedBytes(B256::from(word), 32)));
+    assert_eq!(value, Ok(DynSolValue::FixedBytes(B256::from(word), 32)));
 }
 
 #[tokio::test]
@@ -120,7 +120,7 @@ async fn impossible_explicit_dynamic_length_returns_failure() {
             ""
         )
         .await
-        .is_none());
+        .is_err());
     }
 }
 
@@ -159,10 +159,54 @@ async fn each_expression_decodes_the_same_cached_response_with_its_own_return_ty
             .unwrap();
             assert_eq!(
                 execute_view_call(&call, &[], &meta, provider.as_ref(), network, &constants).await,
-                Some(expected)
+                Ok(expected)
             );
         }
         assert_eq!(rpc.request_count().await, 1);
         rpc.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn required_resolution_distinguishes_errors_from_deliberate_null_and_unselected_calls() {
+    let meta = metadata(ORIGINAL);
+    let constants = Constants::default();
+    let params = vec![LogParam::new("value".to_string(), DynSolValue::Uint(U256::from(1), 256))];
+    for expression in
+        ["$null", "$if(value == 1, $null, $call($rindexer_contract_address, \"state()\"))"]
+    {
+        assert!(matches!(
+            extract_value_from_event_async(
+                expression,
+                &params,
+                &meta,
+                &ColumnType::Uint256,
+                None,
+                "required-resolution",
+                &constants
+            )
+            .await
+            .unwrap(),
+            Some(EthereumSqlTypeWrapper::Null)
+        ));
+    }
+    for expression in [
+        "$call($rindexer_contract_address, \"state()\")",
+        "$value + $call($rindexer_contract_address, \"state()\")",
+        "$if(value == 0, $null, $call($rindexer_contract_address, \"state()\"))",
+    ] {
+        let error = extract_value_from_event_async(
+            expression,
+            &params,
+            &meta,
+            &ColumnType::Uint256,
+            None,
+            "required-resolution",
+            &constants,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("required-resolution"));
+        assert!(error.contains("no provider"));
     }
 }
