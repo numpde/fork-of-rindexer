@@ -106,14 +106,14 @@ pub struct NativeBlockReceiver {
     pub(crate) recovery: ReorgSubscription,
 }
 
-/// Initialize the stream from its last completed/start boundary, before planning work.
+/// Initialize the stream at its inclusive first unfinished block, before planning work.
 pub fn native_block_channel(
     network: &str,
-    start_after: U64,
+    first_unfinished: U64,
     capacity: usize,
 ) -> (NativeBlockSender, NativeBlockReceiver) {
     let recovery = crate::indexer::reorg::subscribe_reorgs(network);
-    recovery.start_at(start_after.to::<u64>().saturating_add(1));
+    recovery.start_at(first_unfinished.to::<u64>());
     let (sender, receiver) = mpsc::channel(capacity);
     (
         NativeBlockSender { sender, recovery: recovery.clone() },
@@ -151,8 +151,7 @@ pub(crate) enum NativeTransferReorgOutcome {
     /// All blocks in the range are canonical. Safe to emit.
     Canonical,
     /// A reorg was handled. `rewind_to` is the first canonical block to re-fetch
-    /// (inclusive) — the caller rewinds `last_seen_block` to `rewind_to - 1` so
-    /// the next iteration's `from_block` equals `rewind_to`.
+    /// (inclusive), matching the publisher's first-unfinished boundary.
     Rewound { rewind_to: u64 },
     /// Detection or rollback failed. Caller should back off and retry.
     Failed,
@@ -280,7 +279,7 @@ pub async fn native_transfer_block_fetch(
     clickhouse: Option<Arc<ClickhouseClient>>,
     trace_registry: Arc<TraceCallbackRegistry>,
 ) -> Result<(), ProcessEventError> {
-    let mut last_seen_block = start_block;
+    let mut next_block = start_block;
     let reorgs = &block_tx.recovery;
 
     loop {
@@ -296,7 +295,7 @@ pub async fn native_transfer_block_fetch(
 
         let (plan_generation, rewind) = reorgs.snapshot();
         if let Some(fork_point) = rewind {
-            last_seen_block = last_seen_block.min(U64::from(fork_point.saturating_sub(1)));
+            next_block = next_block.min(U64::from(fork_point));
         }
 
         let latest_block = publisher.get_latest_block().await;
@@ -336,8 +335,7 @@ pub async fn native_transfer_block_fetch(
                                 fork_point,
                                 "Native transfer tip reorg - rewinding fetch cursor",
                             );
-                            last_seen_block =
-                                last_seen_block.min(U64::from(fork_point.saturating_sub(1)));
+                            next_block = next_block.min(U64::from(fork_point));
                             continue;
                         }
                         Ok(None) => {}
@@ -357,11 +355,11 @@ pub async fn native_transfer_block_fetch(
                 let block = U64::from(latest_block.header.number);
 
                 // Always trim back to the safe indexing threshold (which is zero if disabled)
-                let block = block - indexing_distance_from_head;
+                let block = block.saturating_sub(indexing_distance_from_head);
 
                 let to_block = end_block.map(|end| block.min(end)).unwrap_or(block);
-                if to_block > last_seen_block {
-                    let from_block = last_seen_block + U64::from(1);
+                if to_block >= next_block {
+                    let from_block = next_block;
 
                     // Reorg detection runs on the fetch side so every block - even those
                     // with zero native transfers - feeds the coordinator's window, keeping
@@ -384,16 +382,10 @@ pub async fn native_transfer_block_fetch(
                             debug!("Pushing trace blocks {} - {}", from_block, to_block);
                             push_range(&block_tx, from_block, to_block, plan_generation, &network)
                                 .await;
-                            last_seen_block = to_block;
+                            next_block = to_block.saturating_add(U64::from(1));
                         }
                         NativeTransferReorgOutcome::Rewound { rewind_to } => {
-                            // `rewind_to` is the first canonical block to re-fetch (inclusive).
-                            // Subtract 1 from the cursor so the next iteration computes
-                            // `from_block = last_seen_block + 1 = rewind_to`, matching the
-                            // coordinator's rollback which deletes rows with
-                            // `block_number >= fork_point`.
-                            last_seen_block =
-                                last_seen_block.min(U64::from(rewind_to.saturating_sub(1)));
+                            next_block = next_block.min(U64::from(rewind_to));
                             continue;
                         }
                         NativeTransferReorgOutcome::Failed => {
@@ -1199,7 +1191,7 @@ mod tests {
             async { Err(CallbackError::Permanent("terminal trace effect".to_string())) }.boxed()
         }))
         .await;
-        let (sender, receiver) = native_block_channel("ethereum", U64::from(41), 1);
+        let (sender, receiver) = native_block_channel("ethereum", U64::from(42), 1);
         sender
             .sender
             .send(NativeBlockRequest {
@@ -1247,7 +1239,7 @@ mod tests {
 
     #[tokio::test]
     async fn closed_trace_block_queue_finishes_without_waiting_for_more_input() {
-        let (sender, receiver) = native_block_channel("ethereum", U64::from(41), 1);
+        let (sender, receiver) = native_block_channel("ethereum", U64::from(42), 1);
         drop(sender);
         tokio::time::timeout(
             Duration::from_secs(1),
@@ -1463,7 +1455,7 @@ mod tests {
             async { panic!("a gap cannot invoke either callback") }.boxed()
         }))
         .await;
-        let (sender, _receiver) = native_block_channel("ethereum", U64::from(41), 8);
+        let (sender, _receiver) = native_block_channel("ethereum", U64::from(42), 8);
         for numbers in [vec![U64::from(43)], vec![U64::from(42), U64::from(44)]] {
             let blocks: Vec<_> = numbers
                 .iter()
@@ -1504,11 +1496,11 @@ mod tests {
             make_block_with_parent(98, b256(98), b256(97)),
             make_block_with_parent(100, b256(100), b256(99)),
         ]));
-        let (sender, receiver) = native_block_channel(network, U64::from(97), 1);
+        let (sender, receiver) = native_block_channel(network, U64::from(98), 1);
         let publisher = tokio::spawn(native_transfer_block_fetch(
             provider.clone(),
             sender,
-            U64::from(97),
+            U64::from(98),
             Some(U64::from(98)),
             U64::ZERO,
             network.to_string(),
@@ -1683,12 +1675,12 @@ mod tests {
             ),
         );
         let coordinator = make_test_coordinator(network, &[], provider.clone());
-        let (tx, mut rx) = native_block_channel(network, U64::from(80), 1);
+        let (tx, mut rx) = native_block_channel(network, U64::from(81), 1);
         let cancel = CancellationToken::new();
         let mut publisher = Box::pin(native_transfer_block_fetch(
             provider,
             tx,
-            U64::from(80),
+            U64::from(81),
             None,
             U64::ZERO,
             network.to_string(),

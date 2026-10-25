@@ -413,3 +413,20 @@ contracts: []
 ## chat
 
 You can configure chat to send messages You can read more about it [here](/docs/start-building/chatbots).
+## Startup and restart boundaries
+
+Native indexing includes the configured `start_block`. For example, a fresh start
+at 98 processes blocks 98 and 99. With a durable checkpoint at 100, restart begins
+at 101. The publisher and queue both use that inclusive first-unfinished block;
+a fresh genesis start passes zero without subtracting one.
+
+Older versions could skip that first required block and later checkpoint beyond
+it. Upgrading does not repair existing gaps. Review and rebuild affected native
+raw history, derived state, application receipts and progress together from trusted
+chain data. See [PostgreSQL event replay](/docs/migrations/postgres-event-replay).
+
+Handwritten Rust callers of `native_block_channel` and
+`native_transfer_block_fetch` must use the same inclusive boundary. When resuming
+from a saved checkpoint, use checked addition once to obtain the next block;
+handle exhausted block-number space explicitly. Generated projects use the engine
+startup path and do not need to change their YAML ranges.

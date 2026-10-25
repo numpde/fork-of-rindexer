@@ -375,7 +375,7 @@ async fn postgres_native_queue_recovery_preserves_replacement_prefix_on_anvil() 
         .await
         .unwrap();
     // Real FIFO requests already planned before rollback. Delay replacement delivery.
-    let (requests, queued) = native_block_channel("ethereum", U64::from(100), 32);
+    let (requests, queued) = native_block_channel("ethereum", U64::from(101), 32);
     let planned_generation = crate::indexer::reorg::reorg_generation("ethereum");
     for number in 101..=110 {
         requests
@@ -497,7 +497,7 @@ async fn postgres_native_queue_recovery_preserves_replacement_prefix_on_anvil() 
     let saved: u64 = fixture.position().await.2.parse().unwrap();
     let (mut restarted, _) = processing_config(&fixture, 110).await;
     Arc::get_mut(&mut restarted).unwrap().start_block = U64::from(saved + 1);
-    let (requests, queue) = native_block_channel("ethereum", U64::from(saved), 32);
+    let (requests, queue) = native_block_channel("ethereum", U64::from(saved + 1), 32);
     let planned_generation = crate::indexer::reorg::reorg_generation("ethereum");
     for number in saved + 1..=110 {
         requests
