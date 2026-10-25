@@ -496,3 +496,8 @@ tests/native-transfer-recovery/docker: tests/posture ## Check queued native work
 	compose_profile_args=(--profile native-transfers)
 	$(compose) up -d --no-build --pull never --wait --wait-timeout 90 postgres anvil
 	$(compose) run --rm --no-deps -T -e RINDEXER_TEST_ANVIL_URL=http://anvil:8545 postgres-tests native-transfer-recovery
+
+.PHONY: tests/view-call-decoding/docker
+tests/view-call-decoding/docker: tests/posture ## Check large view-call tuples and explicit return types through RPC and caches
+	@$(call offline_runner,$$dependency_image)
+	$(compose) run --rm --no-deps -T offline view-call-decoding

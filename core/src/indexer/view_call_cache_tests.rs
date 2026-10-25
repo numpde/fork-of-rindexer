@@ -21,6 +21,7 @@ struct RpcState {
     original_started: Notify,
     release_original: Notify,
     requests: Mutex<Vec<Value>>,
+    return_data: Mutex<Option<Vec<u8>>>,
 }
 
 impl RpcState {
@@ -52,7 +53,12 @@ impl RpcState {
             self.original_started.notify_one();
             self.release_original.notified().await;
         }
-        let word = value.to_be_bytes::<32>().to_vec();
+        let word = self
+            .return_data
+            .lock()
+            .await
+            .clone()
+            .unwrap_or_else(|| value.to_be_bytes::<32>().to_vec());
         let is_multicall = request["params"][0]["data"].as_str().unwrap().starts_with("0x82ad56cb");
         let bytes = if is_multicall {
             DynSolValue::Array(vec![DynSolValue::Tuple(vec![
@@ -101,6 +107,10 @@ impl HistoricalRpc {
         Self { url, state, server }
     }
 
+    pub(super) async fn set_return_data(&self, bytes: Vec<u8>) {
+        *self.state.return_data.lock().await = Some(bytes);
+    }
+
     pub(crate) fn replace(&self) {
         self.state.replacement.store(true, Ordering::SeqCst);
     }
@@ -141,7 +151,7 @@ pub(crate) fn header(hash: B256, timestamp: u64) -> alloy::network::AnyRpcBlock 
     )
 }
 
-fn metadata(hash: B256) -> TxMetadata {
+pub(super) fn metadata(hash: B256) -> TxMetadata {
     TxMetadata {
         block_number: 100,
         block_timestamp: None,

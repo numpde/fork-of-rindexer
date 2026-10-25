@@ -42,6 +42,13 @@ case "$1" in
       -p rindexer --lib --no-fail-fast --no-capture \
       -E '(test(/^indexer::reorg::/) | test(/^indexer::fetch_logs::tests::all_live_streams_refetch_after_shared_rollback$/) | (test(/^indexer::native_transfer::tests::/) & test(/reorg/)))'
     ;;
+  view-call-decoding)
+    cargo nextest run --frozen -p rindexer --lib --no-run \
+      -E 'test(/view_call_decode_tests::/) | test(/^indexer::tables::tests::test_try_decode_return_value$/)'
+    exec timeout --signal=TERM --kill-after=20s 900s cargo nextest run --frozen \
+      -p rindexer --lib --no-fail-fast --no-capture \
+      -E 'test(/view_call_decode_tests::/) | test(/^indexer::tables::tests::test_try_decode_return_value$/)'
+    ;;
   view-call-reorg-compile)
     exec cargo nextest run --frozen -p rindexer --lib --no-run \
       -E 'test(/view_call_(cache|reorg)_tests::/) | test(/^indexer::tables::tests::test_block_timestamp/)'

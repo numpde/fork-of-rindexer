@@ -236,7 +236,7 @@ type StaticCallCacheKey = (String, Address, Bytes);
 
 /// Global cache for static view call results. Key is (network, contract, calldata).
 /// For immutable onchain data (symbol, decimals, name) - cached forever, called at latest block.
-static STATIC_CALL_CACHE: Lazy<RwLock<HashMap<StaticCallCacheKey, DynSolValue>>> =
+static STATIC_CALL_CACHE: Lazy<RwLock<HashMap<StaticCallCacheKey, Vec<u8>>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
 /// Header timestamps belong to a block hash, not a reusable height.
@@ -1042,10 +1042,8 @@ async fn execute_static_multicall3_batch(
                 let success = matches!(fields[0], DynSolValue::Bool(true));
                 if success {
                     if let DynSolValue::Bytes(return_data) = &fields[1] {
-                        if let Some(decoded_value) = try_decode_return_value(return_data) {
-                            cache.insert(cache_key, decoded_value);
-                            cached_count += 1;
-                        }
+                        cache.insert(cache_key, return_data.clone());
+                        cached_count += 1;
                     }
                 }
             }
@@ -2226,7 +2224,10 @@ async fn execute_view_call(
             let cache = STATIC_CALL_CACHE.read().await;
             if let Some(cached) = cache.get(&static_cache_key) {
                 debug!("Static call cache hit for {}::{}", contract_address, func_name);
-                return apply_accessor_if_present(cached.clone(), view_call);
+                return apply_accessor_if_present(
+                    decode_view_call_result(cached, view_call)?,
+                    view_call,
+                );
             }
         }
 
@@ -2238,7 +2239,10 @@ async fn execute_view_call(
         {
             let cache = STATIC_CALL_CACHE.read().await;
             if let Some(cached) = cache.get(&static_cache_key) {
-                return apply_accessor_if_present(cached.clone(), view_call);
+                return apply_accessor_if_present(
+                    decode_view_call_result(cached, view_call)?,
+                    view_call,
+                );
             }
         }
 
@@ -2258,7 +2262,7 @@ async fn execute_view_call(
         // Cache in static cache (forever)
         {
             let mut cache = STATIC_CALL_CACHE.write().await;
-            cache.insert(static_cache_key, decoded.clone());
+            cache.insert(static_cache_key, result_bytes);
         }
 
         return apply_accessor_if_present(decoded, view_call);
@@ -2515,10 +2519,8 @@ fn try_decode_return_value(bytes: &[u8]) -> Option<DynSolValue> {
         let offset = U256::from_be_slice(&bytes[0..32]);
         if offset == U256::from(32) && bytes.len() >= 64 {
             let length = U256::from_be_slice(&bytes[32..64]);
-            let length_usize = length.to::<usize>();
-
-            // Sanity check: length should be reasonable and data should exist
-            if length_usize < 10000 && bytes.len() >= 64 + length_usize {
+            // Compare in the ABI word's width before narrowing a possible tuple value.
+            if length < U256::from(10000) && length <= U256::from(bytes.len() - 64) {
                 // Try decoding as string
                 if let Ok(decoded) = DynSolType::String.abi_decode(bytes) {
                     if let DynSolValue::String(s) = &decoded {
@@ -4934,6 +4936,10 @@ fn format_wrapper_for_sql(w: &EthereumSqlTypeWrapper) -> String {
 #[cfg(test)]
 #[path = "view_call_cache_tests.rs"]
 pub(crate) mod view_call_cache_tests;
+
+#[cfg(test)]
+#[path = "view_call_decode_tests.rs"]
+mod view_call_decode_tests;
 
 #[cfg(test)]
 mod tests {
