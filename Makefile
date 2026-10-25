@@ -478,3 +478,10 @@ tests/native-transfer-status/docker: tests/posture ## Check native credits again
 	compose_profile_args=(--profile native-transfers)
 	$(compose) up -d --no-build --pull never --wait --wait-timeout 90 postgres anvil
 	$(compose) run --rm --no-deps -T -e RINDEXER_TEST_ANVIL_URL=http://anvil:8545 postgres-tests native-transfer-status
+
+.PHONY: tests/view-call-reorg/docker
+tests/view-call-reorg/docker: tests/posture ## Check historical calls, late RPC replies and PostgreSQL replacement state after rollback
+	@$(call offline_runner,$$dependency_image)
+	$(compose) run --rm --no-deps -T offline view-call-reorg-compile
+	$(compose) up -d --no-build --pull never --wait --wait-timeout 90 postgres
+	$(compose) run --rm --no-deps -T postgres-tests view-call-reorg

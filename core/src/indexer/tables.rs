@@ -4894,6 +4894,10 @@ fn format_wrapper_for_sql(w: &EthereumSqlTypeWrapper) -> String {
 }
 
 #[cfg(test)]
+#[path = "view_call_cache_tests.rs"]
+pub(crate) mod view_call_cache_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
