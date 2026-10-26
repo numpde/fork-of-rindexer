@@ -6,6 +6,39 @@ This means you can extract that data from the error message and use it to get th
 The slower providers give you a max block range and this means you have to crawl through the blocks to get the logs even if no data is in the blocks, 
 this is a lot slower.
 
+## Historical log availability
+
+Choose a network `rpc` endpoint that retains logs and receipts for the complete
+configured `start_block`–`end_block` range. Header availability alone does not
+establish this: a node can retain headers while pruning block bodies and
+receipts ([Geth history pruning](https://geth.ethereum.org/docs/fundamentals/historypruning)).
+
+If `eth_getLogs` returns the Execution API's error code `4444`, **Pruned history
+unavailable**, rindexer stops the affected contract-event stream and reports its
+name and failed block range. This applies to sequential or parallel historical
+fetches and live catch-up. The failed range produces no callback/checkpoint
+batch. Parallel fetching closes after the terminal error rather than forwarding
+later ranges or entering live indexing. Earlier successful batches may already
+have committed.
+
+**Upgrading:** this error now stops indexing instead of triggering repeated
+range shrinking. Configure an endpoint retaining the required history, then
+restart from durable progress. Supervisors should treat the reported error as
+an indexing failure. Do not advance a checkpoint to skip unavailable history
+unless omitting that history is an intentional change to your indexing range.
+
+An empty successful log response remains valid: there may be no events matching
+the filter. This handling does not detect silent omissions, infer pruning from
+empty results, classify every provider-specific error, or certify a provider's
+entire retention range through a startup probe. Providers using other error
+codes keep the existing retry behavior. If earlier runs silently indexed
+incomplete history, switching endpoints will not repair already-completed
+checkpoints; plan canonical replay with affected raw/derived state, journals and
+receipts included.
+
+References: [Execution API error definition](https://ethereum.github.io/execution-apis/api/methods/eth_getLogs/#errors),
+[unavailable-history report #348](https://github.com/joshstevens19/rindexer/issues/348).
+
 ## Tenderly
 
 [Tenderly](https://tenderly.co/) has some very fast nodes and in internal testing with free nodes they blew everyone out the water

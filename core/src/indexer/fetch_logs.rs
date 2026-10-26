@@ -179,7 +179,7 @@ pub fn fetch_logs_stream(
 
                 let active_workers = Arc::new(AtomicUsize::new(0));
                 let worker_done_notify = Arc::new(tokio::sync::Notify::new());
-                let cancel_token = config.cancel_token().clone();
+                let cancel_token = config.cancel_token().child_token();
 
                 // worker_tx is MOVED into the dispatcher so the channel is kept
                 // alive only by the worker clones once dispatching finishes.
@@ -196,7 +196,7 @@ pub fn fetch_logs_stream(
                     let mut next_from = from_block;
                     let mut sequence_id: u64 = 0;
 
-                    while next_from <= snapshot_to_block {
+                    'dispatch: while next_from <= snapshot_to_block {
                         if !is_running()
                             || dispatcher_cancel.is_cancelled()
                             || crate::indexer::reorg::reorg_generation(&dispatcher_network)
@@ -216,7 +216,10 @@ pub fn fetch_logs_stream(
                             if active < limit {
                                 break;
                             }
-                            notified.await;
+                            tokio::select! {
+                                _ = dispatcher_cancel.cancelled() => break 'dispatch,
+                                _ = notified => {},
+                            }
                         }
 
                         dispatcher_active.fetch_add(1, Ordering::Release);
@@ -260,22 +263,40 @@ pub fn fetch_logs_stream(
 
                 // Reorder buffer: forwards worker results in strict sequence_id order.
                 let reorder_tx = tx.clone();
+                let reorder_cancel = cancel_token.clone();
                 let reorder_handle = tokio::spawn(async move {
                     let mut buffer = ReorderBuffer::new();
                     while let Some(batch) = worker_rx.recv().await {
-                        for r in buffer.accept(batch) {
-                            if reorder_tx.send(r).await.is_err() {
-                                return;
+                        for result in buffer.accept(batch) {
+                            let failed = result.is_err();
+                            if reorder_tx.send(result).await.is_err() || failed {
+                                // A terminal range cannot certify its successors.
+                                // Stop this worker scope without turning the error
+                                // into a user-requested cancellation.
+                                reorder_cancel.cancel();
+                                return false;
                             }
                         }
                     }
+                    true
                 });
 
                 if let Err(e) = dispatcher_handle.await {
                     error!("{} - Dispatcher task failed: {:?}", config.info_log_name(), e);
                 }
-                if let Err(e) = reorder_handle.await {
-                    error!("{} - Reorder task failed: {:?}", config.info_log_name(), e);
+                let history_complete = match reorder_handle.await {
+                    Ok(complete) => complete,
+                    Err(error) => {
+                        error!("{} - Reorder task failed: {:?}", config.info_log_name(), error);
+                        false
+                    }
+                };
+                if !history_complete {
+                    monitor_stop.cancel();
+                    if let Some(monitor) = monitor {
+                        let _ = monitor.await;
+                    }
+                    return;
                 }
 
                 info!(
@@ -627,6 +648,15 @@ async fn fetch_historic_logs_stream<P: ChainProvider>(
             }
         }
         Err(err) => {
+            if is_pruned_history_error(&err) {
+                sender.send(Err(Box::new(PrunedHistoryError {
+                    stream: info_log_name.to_string(),
+                    from_block,
+                    to_block,
+                    source: err,
+                })));
+                return None;
+            }
             // This is fundamental to the rindexer flow. We intentionally fetch a large block range
             // to get information on what the ideal block range should be.
             if let Some(retry_result) = retry_with_block_range(
@@ -903,9 +933,14 @@ async fn parallel_worker(
             break;
         }
 
-        controller.wait_for_backoff().await;
+        tokio::select! {
+            _ = cancel_token.cancelled() => break,
+            _ = controller.wait_for_backoff() => {},
+        }
 
-        let (maybe_result, next_state, error_kind) = fetch_logs_once(
+        let (maybe_result, next_state, error_kind) = tokio::select! {
+            _ = cancel_token.cancelled() => break,
+            result = fetch_logs_once(
             timestamps,
             &block_clock,
             cached_provider.as_ref(),
@@ -914,8 +949,8 @@ async fn parallel_worker(
             sub_range_end,
             &info_log_name,
             reorg_generation,
-        )
-        .await;
+            ) => result,
+        };
 
         match maybe_result {
             Some(fetch_result) => {
@@ -1189,6 +1224,18 @@ async fn fetch_logs_once<P: ChainProvider + ?Sized>(
             }
         }
         Err(err) => {
+            if is_pruned_history_error(&err) {
+                return (
+                    Some(Err(Box::new(PrunedHistoryError {
+                        stream: info_log_name.to_string(),
+                        from_block,
+                        to_block,
+                        source: err,
+                    }))),
+                    None,
+                    Some(FetchErrorKind::Other),
+                );
+            }
             let kind = classify_fetch_error(&err);
 
             if let Some(retry_result) = retry_with_block_range(
@@ -1917,6 +1964,17 @@ async fn live_indexing_stream(
                                         }
                                     }
                                     Err(err) => {
+                                        if is_pruned_history_error(&err) {
+                                            let _ = tx
+                                                .send(Err(Box::new(PrunedHistoryError {
+                                                    stream: info_log_name.to_string(),
+                                                    from_block,
+                                                    to_block,
+                                                    source: err,
+                                                })))
+                                                .await;
+                                            return;
+                                        }
                                         if let Some(retry_result) = retry_with_block_range(
                                             info_log_name,
                                             &err,
@@ -1978,6 +2036,23 @@ async fn live_indexing_stream(
             tokio::time::sleep(target_iteration_duration - elapsed).await;
         }
     }
+}
+
+/// The Execution API's explicit history-expiry response is independent of
+/// range size. Do not infer this condition from an empty successful result.
+fn is_pruned_history_error(error: &ProviderError) -> bool {
+    matches!(error, ProviderError::RequestFailed(error)
+        if error.as_error_resp().is_some_and(|response| response.code == 4444))
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{stream} - Cannot fetch logs for blocks {from_block} - {to_block}: RPC reports pruned history (code 4444). Use a provider retaining this range, then restart from durable progress.")]
+struct PrunedHistoryError {
+    stream: String,
+    from_block: U64,
+    to_block: U64,
+    #[source]
+    source: ProviderError,
 }
 
 #[derive(Debug)]

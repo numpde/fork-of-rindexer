@@ -1050,6 +1050,7 @@ pub mod mock {
         block_fetch_error: Option<String>,
         panic_on_log_fetch: bool,
         log_rpc_error: Option<(i64, String)>,
+        log_fetch_waiter: Option<Arc<tokio::sync::Notify>>,
         log_fetches: std::sync::atomic::AtomicUsize,
         block_batches: Option<std::sync::Mutex<std::collections::VecDeque<Vec<AnyRpcBlock>>>>,
         receipts: Vec<AnyTransactionReceipt>,
@@ -1068,6 +1069,7 @@ pub mod mock {
                 block_fetch_error: None,
                 panic_on_log_fetch: false,
                 log_rpc_error: None,
+                log_fetch_waiter: None,
                 log_fetches: std::sync::atomic::AtomicUsize::new(0),
                 block_batches: None,
                 receipts: vec![],
@@ -1078,6 +1080,13 @@ pub mod mock {
 
         pub fn with_log_rpc_error(mut self, code: i64, message: &str) -> Self {
             self.log_rpc_error = Some((code, message.to_string()));
+            self
+        }
+
+        /// Keep a read-only request pending until the test releases it or the
+        /// caller drops its future during fetch-scope cancellation.
+        pub fn with_log_fetch_waiter(mut self, waiter: Arc<tokio::sync::Notify>) -> Self {
+            self.log_fetch_waiter = Some(waiter);
             self
         }
 
@@ -1172,6 +1181,9 @@ pub mod mock {
         ) -> Result<Vec<Log>, ProviderError> {
             assert!(!self.panic_on_log_fetch, "scripted log producer panic");
             self.log_fetches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(waiter) = &self.log_fetch_waiter {
+                waiter.notified().await;
+            }
             if let Some((code, message)) = &self.log_rpc_error {
                 // Real RPC failures yield to the runtime; keep timeout-driven
                 // dispatcher tests from spinning synchronously inside the mock.
