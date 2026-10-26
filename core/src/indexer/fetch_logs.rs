@@ -1517,12 +1517,10 @@ async fn live_indexing_stream(
                         );
                     }
 
-                    let latest_block_number = log_response_to_large_to_block
-                        .unwrap_or(U64::from(latest_block.header.number));
+                    let latest_block_number = U64::from(latest_block.header.number);
 
-                    // A reduced retry ceiling can equal `last_seen_block_number` while the
-                    // filter cursor is still behind it. Only declare the stream caught up when
-                    // the next block to fetch is also beyond the effective ceiling.
+                    // Pending work can remain below an unchanged tip after an RPC error.
+                    // The cursor, rather than the retry ceiling, decides whether we caught up.
                     if last_seen_block_number == latest_block_number
                         && current_filter.from_block() > latest_block_number
                     {
@@ -1545,7 +1543,7 @@ async fn live_indexing_stream(
                         let from_block = current_filter.from_block();
                         if from_block > safe_block_number {
                             if reorg_safe_distance.is_zero() {
-                                let block_distance = from_block - latest_block_number;
+                                let block_distance = from_block.saturating_sub(latest_block_number);
                                 let is_outside_reorg_range = block_distance
                                     > reorg_safe_distance_for_chain(cached_provider.chain().id());
 
@@ -1585,6 +1583,11 @@ async fn live_indexing_stream(
                             } else {
                                 safe_block_number
                             };
+                            // Safety is measured from the actual tip. A failed request's
+                            // ceiling only narrows this range; subtracting the distance
+                            // from that ceiling again can strand its unfinished block.
+                            let to_block = log_response_to_large_to_block
+                                .map_or(to_block, |ceiling| to_block.min(ceiling));
                             // The bloom-filter shortcut only applies when the
                             // single block we're about to fetch IS `latest_block`.
                             // With `reorg_safe_distance > 0` the processed block

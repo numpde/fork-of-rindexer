@@ -27,6 +27,7 @@
 
 ### Bug fixes
 -------------------------------------------------
+- fix: live indexing with nonzero `reorg_safe_distance` now retries unfinished safe blocks after transient RPC failures instead of stalling behind a reduced retry ceiling ([#484](https://github.com/joshstevens19/rindexer/pull/484)).
 - fix: rolling back a `cross_chain: true` table now invalidates only the reorganizing network's journal entries; shared aggregates retain unaffected networks' canonical contributions and wait for concurrent applications before recalculation.
 - fix: custom-table `update` and `delete` operations now enforce `if`/`filter` predicates containing `@column` references in PostgreSQL, including mixed event/table predicates.
 - fix: PostgreSQL derived `set`, `max` and `min` operations now bind typed recovery values, preserve full `uint256`/`int256` precision and nonnumeric `set` values in JSONB, and abort the application transaction when required journal insertion fails. Rebuild existing derived state and `rindexer_internal.derived_op_log` with the current schema before resuming.
