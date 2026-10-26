@@ -182,7 +182,9 @@ fn increment_row(index: usize) -> TableRowData {
 async fn create_table(postgres: &PostgresClient, table: &Table) -> Result<()> {
     postgres.batch_execute(&format!("CREATE SCHEMA IF NOT EXISTS {SCHEMA}")).await?;
     postgres
-        .batch_execute(&generate_tables_sql(std::slice::from_ref(table), "Values", SCHEMA, &[]))
+        .batch_execute(
+            &generate_tables_sql(std::slice::from_ref(table), "Values", SCHEMA, &[]).unwrap(),
+        )
         .await?;
     Ok(())
 }

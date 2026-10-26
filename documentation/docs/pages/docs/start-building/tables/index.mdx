@@ -311,6 +311,19 @@ The `database` override only applies to custom tables. Raw event tables (auto-ge
 always use the default `{project}_{contract}` database for isolation.
 :::
 
+PostgreSQL startup creates the override schema and table, and schema synchronization
+inspects that same destination. Multiple contracts declaring the same physical
+table schedule an identical migration only once. Override schemas must be valid
+SQL identifiers; invalid names stop DDL generation.
+
+If an earlier version created a table in the default contract schema despite an
+override, stop writers and back up both destinations before upgrading. Reconcile
+which raw events, receipts and derived effects were actually committed, then
+perform a reviewed migration or rebuild into the intended override schema. No
+existing rows are moved automatically, and copying balances without reconciling
+receipts and progress can duplicate or omit effects.
+
+
 ---
 
 ### columns

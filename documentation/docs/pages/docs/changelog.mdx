@@ -2,6 +2,7 @@
 
 ### Breaking changes
 -------------------------------------------------
+- breaking: PostgreSQL custom-table `database` schema names now fail before startup DDL when they are not valid SQL identifiers. Correct the override before restarting; handwritten Rust exhaustive matches on `GenerateTablesForIndexerSqlError` must handle `InvalidCustomTableSchema`.
 - breaking: custom-table `if`/`filter` guards now reject unknown stored `@columns` at manifest validation, including names previously accepted because they matched event fields. Declare the stored column or use `$field` for event data; injected `@network` and `@rindexer_block_timestamp` require a network-scoped table and `timestamp: true`, respectively.
 - breaking: contract subscriptions now resume with independent query-keyed checkpoints instead of a shared event/network maximum. Stop writers before the PostgreSQL checkpoint primary-key migration; legacy contract progress is not adopted, so review replay receipts or rebuild affected history. Existing ClickHouse checkpoint tables require a reviewed sorting-key rebuild, and CSV/stream-only queries replay from their configured start with possible repeated deliveries. Handwritten Rust request/cursor structs need `cursor_key`; see [migration instructions](/docs/migrations/postgres-event-replay#independent-subscription-cursors).
 - breaking: handwritten `SimpleEventFilter.topics` and `FactoryFilter.topics` values must now be vectors of topic-position arrays; use `vec![old_topics]` for a single predicate. `FilterDetails.indexed_filters` now accepts the complete filter vector; wrap an existing singleton in `vec![filter]`. Fetch integrations must use `topic_sets()` for the full OR union; `topic1()`/`topic2()`/`topic3()` expose only its first alternative. YAML keys and single-filter behavior are unchanged.
@@ -30,6 +31,7 @@
 
 ### Bug fixes
 -------------------------------------------------
+- fix: PostgreSQL custom-table `database` overrides now select the startup schema and schema-sync destination as well as the write target. Shared declarations schedule identical migrations once, and invalid schema identifiers stop DDL generation. Review data left in the old default schema before restarting; no rows move automatically ([#487](https://github.com/joshstevens19/rindexer/pull/487)).
 - fix: custom-table conditions validate parsed references in their actual event or stored-column namespace; valid `@column` guards and quoted string literals no longer require matching event ABI fields ([#488](https://github.com/joshstevens19/rindexer/pull/488)).
 - fix: one filtered contract subscription can no longer advance another subscription's restart position; network rollback rewinds all affected query cursors without repeating shared derived reversals.
 - fix: all same-event `indexed_filters` alternatives now participate in RPC, shared-tip and HyperSync log fetching; overlapping alternatives deliver each canonical log once, and a failed alternative fails the whole RPC range.

@@ -191,6 +191,9 @@ pub enum GenerateTablesForIndexerSqlError {
 
     #[error("failed to execute {0}")]
     Postgres(#[from] PostgresError),
+
+    #[error("Cannot generate custom-table DDL: {0}")]
+    InvalidCustomTableSchema(String),
 }
 
 /// Generate SQL for custom tables
@@ -199,10 +202,19 @@ fn generate_tables_sql(
     contract_name: &str,
     schema_name: &str,
     clashing_table_names: &[String],
-) -> String {
-    tables
+) -> Result<String, GenerateTablesForIndexerSqlError> {
+    Ok(tables
         .iter()
         .map(|table| {
+            let schema_name = table.database.as_deref().unwrap_or(schema_name);
+            if table.database.is_some() {
+                crate::indexer::reorg::validate_sql_identifier(schema_name, "custom table schema")
+                    .map_err(|error| {
+                        GenerateTablesForIndexerSqlError::InvalidCustomTableSchema(
+                            error.to_string(),
+                        )
+                    })?;
+            }
             let table_name = format!("{}.{}", schema_name, camel_to_snake(&table.name));
             info!("Creating custom table if not exists: {}", table_name);
 
@@ -292,10 +304,15 @@ fn generate_tables_sql(
                 format!("COMMENT ON TABLE {} IS E'@name {}';", table_name, graphql_name)
             };
 
-            format!("{}\n{}", create_table_sql, table_comment)
+            let create_schema_sql = if table.database.is_some() {
+                format!("CREATE SCHEMA IF NOT EXISTS {schema_name};\n")
+            } else {
+                String::new()
+            };
+            Ok(format!("{create_schema_sql}{create_table_sql}\n{table_comment}"))
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect::<Result<Vec<_>, GenerateTablesForIndexerSqlError>>()?
+        .join("\n"))
 }
 
 /// Generate table name for a custom table
@@ -423,7 +440,7 @@ pub fn generate_tables_for_indexer_sql(
                     &contract.name,
                     &schema_name,
                     &clashing_table_names,
-                ));
+                )?);
             }
         }
 
