@@ -13,7 +13,7 @@ use tracing::error;
 
 use crate::{
     abi::ABIItem,
-    event::{parse_arithmetic_expression, parse_filter_expression},
+    event::{parse_arithmetic_expression, parse_filter_expression, VariableSource},
     helpers::{load_env_from_full_path, replace_env_variable_to_raw_name},
     manifest::{
         core::{Manifest, ProjectType},
@@ -44,57 +44,6 @@ fn is_arithmetic_expression(value: &str) -> bool {
 /// Checks if a value contains $call() patterns that need runtime resolution.
 fn contains_call_pattern(value: &str) -> bool {
     value.contains("$call(") || value.contains("$call_static(")
-}
-
-/// Extracts variable names from a filter/condition expression string.
-/// For example, "from != to && value > 100" would return ["from", "to", "value"].
-/// Also handles $ prefix: "$from != $to" returns ["from", "to"].
-fn extract_filter_variables(expr: &str) -> Vec<String> {
-    let mut variables = Vec::new();
-    let mut current_word = String::new();
-    let mut has_dollar_prefix = false;
-
-    // Keywords and operators to skip
-    let keywords = ["true", "false", "null", "and", "or", "AND", "OR"];
-
-    for c in expr.chars() {
-        if c == '$' && current_word.is_empty() {
-            // Start of a $-prefixed variable
-            has_dollar_prefix = true;
-        } else if c.is_alphanumeric() || c == '_' || c == '.' {
-            current_word.push(c);
-        } else if !current_word.is_empty() {
-            // Check if it's a variable (starts with letter or underscore, not a keyword or number)
-            let first_char = current_word.chars().next().unwrap();
-            if (first_char.is_alphabetic() || first_char == '_' || has_dollar_prefix)
-                && !keywords.contains(&current_word.as_str())
-            {
-                // Get root variable name (before any dot)
-                let root_name = current_word.split('.').next().unwrap_or(&current_word);
-                // Avoid duplicates
-                if !variables.contains(&root_name.to_string()) {
-                    variables.push(root_name.to_string());
-                }
-            }
-            current_word.clear();
-            has_dollar_prefix = false;
-        }
-    }
-
-    // Handle last word
-    if !current_word.is_empty() {
-        let first_char = current_word.chars().next().unwrap();
-        if (first_char.is_alphabetic() || first_char == '_' || has_dollar_prefix)
-            && !keywords.contains(&current_word.as_str())
-        {
-            let root_name = current_word.split('.').next().unwrap_or(&current_word);
-            if !variables.contains(&root_name.to_string()) {
-                variables.push(root_name.to_string());
-            }
-        }
-    }
-
-    variables
 }
 
 /// Extracts variable names from an arithmetic expression string.
@@ -422,6 +371,26 @@ fn validate_manifest(
                 // Collect table column names for validation
                 let table_column_names: HashSet<&str> =
                     table.columns.iter().map(|c| c.name.as_str()).collect();
+                // Conditions may read injected columns only when the generated
+                // table actually contains them; event metadata is a separate source.
+                let mut stored_condition_columns = table_column_names.clone();
+                use crate::manifest::contract::injected_columns;
+                stored_condition_columns.extend([
+                    injected_columns::BLOCK_NUMBER,
+                    injected_columns::TX_HASH,
+                    injected_columns::BLOCK_HASH,
+                    injected_columns::CONTRACT_ADDRESS,
+                    injected_columns::RINDEXER_SEQUENCE_ID,
+                ]);
+                if !table.cross_chain {
+                    stored_condition_columns.insert("network");
+                }
+                if table.timestamp {
+                    stored_condition_columns.insert(injected_columns::BLOCK_TIMESTAMP);
+                }
+                if table.is_insert_only() {
+                    stored_condition_columns.insert(injected_columns::RINDEXER_ID);
+                }
 
                 for event_mapping in &table.events {
                     // Check event exists in ABI
@@ -566,32 +535,41 @@ fn validate_manifest(
                                 }
                             }
 
-                            // Extract and validate variable references in the condition
-                            // Variables in filter expressions don't use $ prefix
-                            let variables = extract_filter_variables(condition_expr);
-                            for var_name in variables {
-                                // Strip array indices like ids[0] -> ids
-                                let root_field =
-                                    var_name.split(&['.', '['][..]).next().unwrap_or(&var_name);
-                                // Skip validation for built-in metadata fields
-                                if BUILTIN_METADATA_FIELDS.contains(&root_field) {
-                                    continue;
+                            let mut validation = Ok(());
+                            expression.visit_variables(&mut |variable| {
+                                if validation.is_err() {
+                                    return;
                                 }
-                                // Also accept iterate aliases
-                                if iterate_aliases.contains(root_field) {
-                                    continue;
-                                }
-                                if !event_input_names.contains(root_field) {
-                                    return Err(
-                                        ValidateManifestError::CustomIndexingEventFieldNotFound(
-                                            var_name,
+                                let name = variable.base_name();
+                                validation = match variable.source() {
+                                    VariableSource::Table
+                                        if !stored_condition_columns.contains(name) =>
+                                    {
+                                        Err(ValidateManifestError::CustomIndexingFieldNotFound(
+                                            name.to_string(),
                                             event_mapping.event.clone(),
                                             table.name.clone(),
                                             contract.name.clone(),
-                                        ),
-                                    );
-                                }
-                            }
+                                        ))
+                                    }
+                                    VariableSource::Event
+                                        if !BUILTIN_METADATA_FIELDS.contains(&name)
+                                            && !iterate_aliases.contains(name)
+                                            && !event_input_names.contains(name) =>
+                                    {
+                                        Err(
+                                            ValidateManifestError::CustomIndexingEventFieldNotFound(
+                                                name.to_string(),
+                                                event_mapping.event.clone(),
+                                                table.name.clone(),
+                                                contract.name.clone(),
+                                            ),
+                                        )
+                                    }
+                                    _ => Ok(()),
+                                };
+                            });
+                            validation?;
                         }
 
                         // Validate set columns

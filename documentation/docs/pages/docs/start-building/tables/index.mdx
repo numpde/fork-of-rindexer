@@ -1311,6 +1311,19 @@ When using `!`, wrap the expression in parentheses: `!($condition)` not `!$condi
 | `$value` | Incoming event value | Compare event data |
 | `@balance` | Current database value | Compare with existing state |
 
+Manifest validation checks `@column` against the stored table and `$field`
+(or a bare event field) against the event ABI, iteration aliases and event
+metadata. Quoted strings are literals, so `'Token A'` does not require a field
+named `Token`. Both operands, nested arithmetic and negated conditions follow
+these same rules.
+
+Stored metadata references must name columns that exist: `@network` is absent
+when `cross_chain: true`, `@rindexer_block_timestamp` requires `timestamp: true`,
+and an upsert table has no automatic `rindexer_id`. Event metadata such as
+`$rindexer_tx_index` does not imply a stored `@rindexer_tx_index` column.
+Unknown stored columns now fail during manifest validation; correct the prefix
+or declare the intended column before restarting.
+
 **Example: Only update if the new value exceeds the current balance**
 
 ```yaml
