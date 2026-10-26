@@ -26,7 +26,13 @@ async fn fixture(action: &str, value_type: &str, cross_chain: bool) -> Fixture {
     .await
 }
 
-fn at(fixture: &Fixture, network: &str, block: u64, hash: B256, value: u64) -> EventResult {
+pub(super) fn at(
+    fixture: &Fixture,
+    network: &str,
+    block: u64,
+    hash: B256,
+    value: u64,
+) -> EventResult {
     let mut event = fixture.events(&[value]).remove(0);
     event.tx_information.network = network.to_string();
     event.log.inner.data = alloy::primitives::LogData::new_unchecked(

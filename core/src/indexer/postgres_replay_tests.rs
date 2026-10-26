@@ -1648,3 +1648,6 @@ mod historical_handoff_tests;
 
 #[path = "journal_recovery_tests.rs"]
 mod journal_recovery_tests;
+
+#[path = "table_condition_tests.rs"]
+mod table_condition_tests;
