@@ -129,10 +129,39 @@ Live indexing reads each new tip block once per network with an unfiltered `eth_
 | `rindexer_shared_tip_logs_fetch_seconds` | Histogram | `network` | Seconds from the first observation of a head block to its terminal state |
 | `rindexer_shared_tip_logs_cache_blocks` | Gauge | `network` | Head blocks resident in the per-network cache (at most `cache_blocks`) |
 
-The `network` label of these series is the chain name, the same label `rindexer_rpc_requests_total` carries
-(`polygon` for chain id 137), so the two can be subtracted to count the per-stream tip calls that remain.
+The `network` label uses the configured `networks[].name`, matching RPC and
+indexing metrics. For example, if chain 137 is configured as `mainnet`, all
+three use `network="mainnet"`. Two configured names for the same chain keep
+separate provider and shared-tip series.
 
 **Histogram buckets:** 50ms, 100ms, 250ms, 500ms, 1s, 2s, 3s, 5s, 8s, 12s
+
+### Network label migration
+
+RPC counters and latency histograms, including `hypersync_getLogs`, and
+`rindexer_shared_tip_logs_*` metrics now use the configured `networks[].name`.
+Previously these provider-owned series derived their label from the chain ID,
+for example `arbitrum` for chain 42161, while indexing series used the configured
+name. Metric names and other labels are unchanged.
+
+Update dashboards, recording rules and alerts that select a chain-derived
+`network` value to select the configured name instead. A changed label value
+creates a new Prometheus series; historical samples retain their old labels.
+This also separates aliases of the same chain, so queries that previously
+combined their RPC activity may need to sum the intended network names. Shared-tip
+runtime messages also identify the configured name; update log filters that
+selected the previous chain-name context.
+
+Rust projects must run `rindexer codegen typings` to pass the configured name
+through regenerated provider initializers, including Shadow providers. Custom
+Rust setup can call `provider::create_client_for_network` with the configured
+name followed by the existing provider settings. The older `create_client` and
+`create_client_with_shared_tip_logs` functions remain callable with their old
+signatures and retain chain-derived labels because they receive no configured
+network name. Existing generated code keeps that behavior until regenerated.
+
+See [issue #462](https://github.com/joshstevens19/rindexer/issues/462) and the
+[Prometheus data model](https://prometheus.io/docs/concepts/data_model/).
 
 ### Build Info
 

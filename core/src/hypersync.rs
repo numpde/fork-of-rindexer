@@ -386,7 +386,7 @@ impl ChainProvider for HypersyncProvider {
             self.get_logs_via_hypersync(event_filter, addresses, from_block, to_block).await;
 
         rpc_metrics::record_rpc_request(
-            &self.rpc.chain.to_string(),
+            self.rpc.metrics_network_name(),
             "hypersync_getLogs",
             result.is_ok(),
             start.elapsed().as_secs_f64(),
@@ -478,7 +478,8 @@ mod tests {
     /// A provider whose HyperSync endpoint refuses connections (nothing listens on the
     /// target port) and whose RPC side is a mock that serves pushed responses.
     fn provider_with_unreachable_hypersync() -> (HypersyncProvider, Asserter) {
-        let (rpc, asserter) = JsonRpcCachedProvider::mock_with_asserter(1);
+        let (rpc, asserter) =
+            JsonRpcCachedProvider::mock_with_asserter_for_network(1, "hypersync-fixture");
         let client = Client::builder()
             .url("http://127.0.0.1:9")
             .api_token("00000000-0000-0000-0000-000000000000")
@@ -542,6 +543,34 @@ mod tests {
             request.to_lowercase().contains(&expected),
             "expected `{expected}` in request:\n{request}"
         );
+    }
+
+    #[tokio::test]
+    async fn provider_metric_labels_align_hypersync_errors_and_rpc_fallback() {
+        use crate::metrics::definitions::{RPC_REQUESTS_TOTAL, RPC_REQUEST_DURATION};
+        let (provider, asserter) = provider_with_unreachable_hypersync();
+        *provider.height_cache.lock().await = Some((Instant::now(), 100));
+        asserter.push_success(&Vec::<Log>::new());
+        provider
+            .get_logs(
+                &RindexerEventFilter::empty_for_test()
+                    .set_from_block(U64::ZERO)
+                    .set_to_block(U64::from(1)),
+            )
+            .await
+            .unwrap();
+        for (method, status) in [("hypersync_getLogs", "error"), ("eth_getLogs", "success")] {
+            assert_eq!(
+                RPC_REQUESTS_TOTAL.with_label_values(&["hypersync-fixture", method, status]).get(),
+                1.0
+            );
+            assert_eq!(
+                RPC_REQUEST_DURATION
+                    .with_label_values(&["hypersync-fixture", method])
+                    .get_sample_count(),
+                1
+            );
+        }
     }
 
     #[tokio::test]

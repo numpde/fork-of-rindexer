@@ -65,7 +65,7 @@ fn generate_network_lazy_provider_code(network: &Network) -> Code {
         {network_name}
             .get_or_init(|| async {{
                 {reth_init_fn}
-                {client_fn}(&public_read_env_value("{network_url}").unwrap_or("{network_url}".to_string()), {chain_id}, {compute_units_per_second}, {max_block_range}, {block_poll_frq} {placeholder_headers}, {get_logs_settings}, {chain_state_notification}, {shared_tip_logs})
+                {client_fn}({configured_network_name:?}, &public_read_env_value("{network_url}").unwrap_or("{network_url}".to_string()), {chain_id}, {compute_units_per_second}, {max_block_range}, {block_poll_frq} {placeholder_headers}, {get_logs_settings}, {chain_state_notification}, {shared_tip_logs})
                 .await
                 .expect("Error creating provider")
             }})
@@ -73,6 +73,7 @@ fn generate_network_lazy_provider_code(network: &Network) -> Code {
             .clone()
         "#,
         network_name = network_provider_name(network),
+        configured_network_name = network.name,
         network_url = get_network_url(network),
         chain_id = network.chain_id,
         compute_units_per_second =
@@ -99,7 +100,7 @@ fn generate_network_lazy_provider_code(network: &Network) -> Code {
         client_fn = if network.rpc.contains("shadow") {
             "create_shadow_client"
         } else {
-            "create_client_with_shared_tip_logs"
+            "create_client_for_network"
         },
         placeholder_headers =
             if network.rpc.contains("shadow") { "" } else { ", HeaderMap::new()" },
@@ -261,7 +262,7 @@ pub fn generate_networks_code(networks: &[Network]) -> Code {
     use rindexer::{
         lazy_static,
         manifest::network::{AddressFiltering, BlockPollFrequency},
-        provider::{ChainProvider, RindexerProvider, create_client_with_shared_tip_logs, JsonRpcCachedProvider, RetryClientError},
+        provider::{ChainProvider, RindexerProvider, create_client_for_network, JsonRpcCachedProvider, RetryClientError},
         notifications::ChainStateNotification,
         public_read_env_value,
         SharedTipLogsSettings
@@ -272,11 +273,12 @@ pub fn generate_networks_code(networks: &[Network]) -> Code {
 
     #[allow(dead_code)]
     async fn create_shadow_client(
+        network_name: &str,
         rpc_url: &str,
         chain_id: u64,
         compute_units_per_second: Option<u64>,
-        block_poll_frequency: Option<BlockPollFrequency>,
         max_block_range: Option<U64>,
+        block_poll_frequency: Option<BlockPollFrequency>,
         address_filtering: Option<AddressFiltering>,
         chain_state_notification: Option<Sender<ChainStateNotification>>,
         shared_tip_logs: Option<SharedTipLogsSettings>,
@@ -286,7 +288,7 @@ pub fn generate_networks_code(networks: &[Network]) -> Code {
             "X-SHADOW-API-KEY",
             public_read_env_value("RINDEXER_PHANTOM_API_KEY").unwrap().parse().unwrap(),
         );
-        create_client_with_shared_tip_logs(rpc_url, chain_id, compute_units_per_second, max_block_range, block_poll_frequency, header, address_filtering, chain_state_notification, shared_tip_logs).await
+        create_client_for_network(network_name, rpc_url, chain_id, compute_units_per_second, max_block_range, block_poll_frequency, header, address_filtering, chain_state_notification, shared_tip_logs).await
     }
         "#
         .to_string(),

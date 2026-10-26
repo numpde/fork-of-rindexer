@@ -10,7 +10,7 @@ use rindexer::{
     notifications::ChainStateNotification,
     provider::{
         ChainProvider, JsonRpcCachedProvider, RetryClientError, RindexerProvider,
-        create_client_with_shared_tip_logs,
+        create_client_for_network,
     },
     public_read_env_value,
 };
@@ -20,11 +20,12 @@ use tokio::sync::broadcast::Sender;
 
 #[allow(dead_code)]
 async fn create_shadow_client(
+    network_name: &str,
     rpc_url: &str,
     chain_id: u64,
     compute_units_per_second: Option<u64>,
-    block_poll_frequency: Option<BlockPollFrequency>,
     max_block_range: Option<U64>,
+    block_poll_frequency: Option<BlockPollFrequency>,
     address_filtering: Option<AddressFiltering>,
     chain_state_notification: Option<Sender<ChainStateNotification>>,
     shared_tip_logs: Option<SharedTipLogsSettings>,
@@ -34,7 +35,8 @@ async fn create_shadow_client(
         "X-SHADOW-API-KEY",
         public_read_env_value("RINDEXER_PHANTOM_API_KEY").unwrap().parse().unwrap(),
     );
-    create_client_with_shared_tip_logs(
+    create_client_for_network(
+        network_name,
         rpc_url,
         chain_id,
         compute_units_per_second,
@@ -57,7 +59,8 @@ pub async fn get_ethereum_provider_cache() -> Arc<JsonRpcCachedProvider> {
         .get_or_init(|| async {
             let chain_state_notification = None;
 
-            create_client_with_shared_tip_logs(
+            create_client_for_network(
+                "ethereum",
                 &public_read_env_value("https://mainnet.gateway.tenderly.co")
                     .unwrap_or("https://mainnet.gateway.tenderly.co".to_string()),
                 1,
@@ -89,7 +92,8 @@ pub async fn get_base_provider_cache() -> Arc<JsonRpcCachedProvider> {
         .get_or_init(|| async {
             let chain_state_notification = None;
 
-            create_client_with_shared_tip_logs(
+            create_client_for_network(
+                "base",
                 &public_read_env_value("https://mainnet.base.org")
                     .unwrap_or("https://mainnet.base.org".to_string()),
                 8453,

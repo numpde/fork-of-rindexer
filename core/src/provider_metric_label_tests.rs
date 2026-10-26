@@ -140,3 +140,39 @@ async fn provider_metric_labels_include_shared_tip_source_and_cache_for_each_ali
         assert_eq!(SHARED_TIP_LOGS_CACHE_BLOCKS.with_label_values(&[name]).get(), 1.0);
     }
 }
+
+#[tokio::test]
+async fn provider_metric_labels_legacy_constructors_keep_chain_derived_defaults() {
+    let (server, _requests) = rpc_server().await;
+    let old = create_client(&server.url(), 42161, None, None, None, HeaderMap::new(), None, None)
+        .await
+        .unwrap();
+    let shared = create_client_with_shared_tip_logs(
+        &server.url(),
+        42161,
+        None,
+        None,
+        None,
+        HeaderMap::new(),
+        None,
+        None,
+        Some(SharedTipLogsSettings {
+            empty_retry_deadline_ms: 1,
+            cache_blocks: 2,
+            bloom_trusted: false,
+        }),
+    )
+    .await
+    .unwrap();
+    old.get_logs(&filter(1)).await.unwrap();
+    shared.get_logs(&filter(1)).await.unwrap();
+    assert_eq!(shared.shared_tip_logs().unwrap().network(), "arbitrum");
+    assert_eq!(
+        RPC_REQUESTS_TOTAL.with_label_values(&["arbitrum", "eth_getLogs", "success"]).get(),
+        2.0
+    );
+    assert_eq!(
+        RPC_REQUEST_DURATION.with_label_values(&["arbitrum", "eth_getLogs"]).get_sample_count(),
+        2
+    );
+}

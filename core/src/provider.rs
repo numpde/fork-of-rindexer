@@ -148,6 +148,7 @@ pub struct JsonRpcCachedProvider {
     cache: Mutex<Option<(Instant, Arc<AnyRpcBlock>)>>,
     is_zk_chain: bool,
     pub chain: Chain,
+    metrics_network_name: String,
     block_poll_frequency: Option<BlockPollFrequency>,
     address_filtering: Option<AddressFiltering>,
     pub max_block_range: Option<U64>,
@@ -253,6 +254,11 @@ fn is_known_zk_evm_compatible_chain(chain: Chain) -> Option<bool> {
 }
 
 impl JsonRpcCachedProvider {
+    /// Configured network identity used by this provider and its auxiliary fetchers.
+    pub(crate) fn metrics_network_name(&self) -> &str {
+        &self.metrics_network_name
+    }
+
     /// Return a duration for block poll caching based on user configuration.
     fn block_poll_frequency(&self) -> Duration {
         let Some(block_poll_frequency) = self.block_poll_frequency else {
@@ -293,7 +299,7 @@ impl JsonRpcCachedProvider {
         }
 
         let start = Instant::now();
-        let network = self.chain.to_string();
+        let network = self.metrics_network_name();
 
         let result = self
             .provider
@@ -304,7 +310,7 @@ impl JsonRpcCachedProvider {
 
         // Record RPC metrics for both success and failure (only when we actually call RPC, not from cache)
         let duration = start.elapsed().as_secs_f64();
-        rpc_metrics::record_rpc_request(&network, "eth_getBlockByNumber", result.is_ok(), duration);
+        rpc_metrics::record_rpc_request(network, "eth_getBlockByNumber", result.is_ok(), duration);
 
         // Now propagate the error if any
         let latest_block = result?;
@@ -655,7 +661,7 @@ impl JsonRpcCachedProvider {
         event_filter: &RindexerEventFilter,
     ) -> Result<Vec<Log>, ProviderError> {
         let start = Instant::now();
-        let network = self.chain.to_string();
+        let network = self.metrics_network_name();
 
         let addresses = event_filter.contract_addresses().await;
 
@@ -707,7 +713,7 @@ impl JsonRpcCachedProvider {
 
         // Record RPC metrics
         let duration = start.elapsed().as_secs_f64();
-        rpc_metrics::record_rpc_request(&network, "eth_getLogs", logs.is_ok(), duration);
+        rpc_metrics::record_rpc_request(network, "eth_getLogs", logs.is_ok(), duration);
 
         logs
     }
@@ -777,6 +783,18 @@ impl JsonRpcCachedProvider {
         (provider, asserter)
     }
 
+    #[cfg(test)]
+    pub(crate) fn mock_with_asserter_for_network(
+        chain_id: u64,
+        network_name: &str,
+    ) -> (Arc<Self>, Asserter) {
+        let (mut provider, asserter) = Self::mock_with_asserter(chain_id);
+        Arc::get_mut(&mut provider)
+            .expect("fresh fixture owns its provider")
+            .metrics_network_name = network_name.to_string();
+        (provider, asserter)
+    }
+
     /// Creates a mock provider backed by alloy's [`Asserter`] transport.
     ///
     /// Push canned JSON-RPC responses into the returned [`Asserter`] before
@@ -802,6 +820,7 @@ impl JsonRpcCachedProvider {
             cache: Mutex::new(None),
             is_zk_chain,
             chain,
+            metrics_network_name: chain.to_string(),
             block_poll_frequency: None,
             address_filtering: None,
             max_block_range: None,
@@ -1347,7 +1366,7 @@ pub fn validate_manifest_network_rpc_urls(manifest: &Manifest) -> Result<(), Ret
 /// Creates a network provider without the shared tip-block log fetch: its live streams issue
 /// their own tip `eth_getLogs`. Kept with its pre-0.43.5 signature so a `networks.rs` generated
 /// by an earlier version keeps compiling; regenerated typings call
-/// [`create_client_with_shared_tip_logs`] and pass the network's `shared_tip_logs` settings.
+/// [`create_client_for_network`] and pass the configured name and `shared_tip_logs` settings.
 #[allow(clippy::too_many_arguments)]
 pub async fn create_client(
     rpc_url: &str,
@@ -1374,9 +1393,41 @@ pub async fn create_client(
 }
 
 /// [`create_client`] plus the network's resolved `shared_tip_logs` settings (`None` disables the
-/// shared tip-block log fetch for this provider).
+/// shared tip-block log fetch for this provider). It retains chain-derived metric labels;
+/// manifest-backed callers use [`create_client_for_network`] to preserve configured names.
 #[allow(clippy::too_many_arguments)]
 pub async fn create_client_with_shared_tip_logs(
+    rpc_url: &str,
+    chain_id: u64,
+    compute_units_per_second: Option<u64>,
+    max_block_range: Option<U64>,
+    block_poll_frequency: Option<BlockPollFrequency>,
+    custom_headers: HeaderMap,
+    address_filtering: Option<AddressFiltering>,
+    chain_state_notification: Option<Sender<ChainStateNotification>>,
+    shared_tip_logs: Option<SharedTipLogsSettings>,
+) -> Result<Arc<JsonRpcCachedProvider>, RetryClientError> {
+    let network_name = Chain::from(chain_id).to_string();
+    create_client_for_network(
+        &network_name,
+        rpc_url,
+        chain_id,
+        compute_units_per_second,
+        max_block_range,
+        block_poll_frequency,
+        custom_headers,
+        address_filtering,
+        chain_state_notification,
+        shared_tip_logs,
+    )
+    .await
+}
+
+/// Create a manifest-scoped provider whose RPC and shared-tip metrics use the
+/// configured network name, including when several names identify the same chain.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_client_for_network(
+    network_name: &str,
     rpc_url: &str,
     chain_id: u64,
     compute_units_per_second: Option<u64>,
@@ -1459,7 +1510,9 @@ pub async fn create_client_with_shared_tip_logs(
 
     let provider = Arc::new(provider);
     let shared_tip_logs = match shared_tip_logs {
-        Some(settings) => Some(shared_tip_logs_handle(chain, Arc::clone(&provider), settings)),
+        Some(settings) => {
+            Some(shared_tip_logs_handle(chain, network_name, Arc::clone(&provider), settings))
+        }
         None => {
             info!("shared tip logs disabled for {chain}");
             None
@@ -1472,6 +1525,7 @@ pub async fn create_client_with_shared_tip_logs(
         max_block_range,
         client,
         chain,
+        metrics_network_name: network_name.to_string(),
         is_zk_chain,
         block_poll_frequency,
         address_filtering,
@@ -1483,16 +1537,16 @@ pub async fn create_client_with_shared_tip_logs(
 /// Builds the network's shared tip-block cache and logs the boot line operators grep for.
 fn shared_tip_logs_handle(
     chain: Chain,
+    network_name: &str,
     provider: Arc<RindexerProvider>,
     settings: SharedTipLogsSettings,
 ) -> Arc<SharedTipLogs> {
-    let network = chain.to_string();
     info!(
-        "shared tip logs enabled for {network} (empty_retry_deadline_ms={}, cache_blocks={}, bloom_trusted={})",
+        "shared tip logs enabled for {chain} (empty_retry_deadline_ms={}, cache_blocks={}, bloom_trusted={})",
         settings.empty_retry_deadline_ms, settings.cache_blocks, settings.bloom_trusted
     );
-    let source = RpcBlockLogsSource { network: network.clone(), provider };
-    SharedTipLogs::new(&network, Arc::new(source), settings)
+    let source = RpcBlockLogsSource { network: network_name.to_string(), provider };
+    SharedTipLogs::new(network_name, Arc::new(source), settings)
 }
 
 pub async fn get_chain_id(rpc_url: &str) -> Result<U256, RpcError<TransportErrorKind>> {
@@ -1543,7 +1597,8 @@ impl CreateNetworkProvider {
             )?;
 
             // create the provider
-            let provider = create_client_with_shared_tip_logs(
+            let provider = create_client_for_network(
+                &network.name,
                 &provider_url,
                 network.chain_id,
                 network.compute_units_per_second,
