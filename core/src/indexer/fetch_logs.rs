@@ -4313,3 +4313,7 @@ mod tests {
 #[cfg(test)]
 #[path = "indexed_filter_tests.rs"]
 mod indexed_filter_tests;
+
+#[cfg(test)]
+#[path = "log_ordering_tests.rs"]
+mod log_ordering_tests;

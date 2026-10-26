@@ -762,6 +762,17 @@ impl JsonRpcCachedProvider {
         provider
     }
 
+    #[cfg(test)]
+    pub fn mock_with_asserter_and_address_filtering(
+        chain_id: u64,
+        filtering: AddressFiltering,
+    ) -> (Arc<Self>, Asserter) {
+        let (mut provider, asserter) = Self::mock_with_asserter(chain_id);
+        Arc::get_mut(&mut provider).expect("fresh fixture owns its provider").address_filtering =
+            Some(filtering);
+        (provider, asserter)
+    }
+
     /// Creates a mock provider backed by alloy's [`Asserter`] transport.
     ///
     /// Push canned JSON-RPC responses into the returned [`Asserter`] before
@@ -1033,6 +1044,7 @@ pub mod mock {
         blocks: Vec<Arc<AnyRpcBlock>>,
         block_number: U64,
         block_fetch_error: Option<String>,
+        block_batches: Option<std::sync::Mutex<std::collections::VecDeque<Vec<AnyRpcBlock>>>>,
         receipts: Vec<AnyTransactionReceipt>,
         traces: Vec<LocalizedTransactionTrace>,
         shared_tip_logs: Option<Arc<SharedTipLogs>>,
@@ -1047,6 +1059,7 @@ pub mod mock {
                 blocks: vec![],
                 block_number: U64::ZERO,
                 block_fetch_error: None,
+                block_batches: None,
                 receipts: vec![],
                 traces: vec![],
                 shared_tip_logs: None,
@@ -1070,6 +1083,13 @@ pub mod mock {
 
         pub fn with_blocks(mut self, blocks: Vec<AnyRpcBlock>) -> Self {
             self.blocks = blocks.into_iter().map(Arc::new).collect();
+            self
+        }
+
+        /// Return exact header batches in order; exhaustion is an error so a
+        /// regression cannot silently loop forever on an empty fixture response.
+        pub fn with_block_batches(mut self, batches: Vec<Vec<AnyRpcBlock>>) -> Self {
+            self.block_batches = Some(std::sync::Mutex::new(batches.into_iter().collect()));
             self
         }
 
@@ -1162,6 +1182,11 @@ pub mod mock {
         ) -> Result<Vec<AnyRpcBlock>, ProviderError> {
             if let Some(message) = &self.block_fetch_error {
                 return Err(ProviderError::CustomError(message.clone()));
+            }
+            if let Some(batches) = &self.block_batches {
+                return batches.lock().expect("scripted header batches").pop_front().ok_or_else(
+                    || ProviderError::CustomError("scripted header batches exhausted".into()),
+                );
             }
             use std::collections::HashSet;
             let requested: HashSet<u64> = block_numbers.iter().map(|n| n.to::<u64>()).collect();

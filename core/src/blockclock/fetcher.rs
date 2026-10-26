@@ -558,4 +558,40 @@ mod tests {
         assert_eq!(*samples.first().unwrap(), 1000);
         assert_eq!(*samples.last().unwrap(), 2000);
     }
+    #[tokio::test]
+    async fn partial_timestamp_enrichment_preserves_input_order() {
+        let provider = Arc::new(MockChainProvider::new(1).with_block_batches(vec![
+            vec![make_block(100, 1000), make_block(200, 2000)],
+            vec![make_block(500, 5000)],
+        ]));
+        let logs = vec![make_log(100, None), make_log(200, None), make_log(500, None)];
+        let result =
+            BlockFetcher::new(Some(1.0), provider).attach_log_timestamps(logs).await.unwrap();
+        assert_eq!(
+            result.iter().map(|log| (log.block_number, log.block_timestamp)).collect::<Vec<_>>(),
+            vec![(Some(100), Some(1000)), (Some(200), Some(2000)), (Some(500), Some(5000))]
+        );
+    }
+
+    #[tokio::test]
+    async fn timestamp_enrichment_preserves_preexisting_values_on_the_same_block() {
+        let fetcher = BlockFetcher::new(Some(1.0), provider_with_blocks(vec![(100, 2000)]));
+        let result = fetcher
+            .attach_log_timestamps(vec![make_log(100, Some(1000)), make_log(100, None)])
+            .await
+            .unwrap();
+        assert_eq!(
+            result.iter().map(|log| log.block_timestamp).collect::<Vec<_>>(),
+            vec![Some(1000), Some(2000)]
+        );
+    }
+
+    #[tokio::test]
+    async fn timestamp_enrichment_reports_no_progress_before_retrying_missing_headers() {
+        let provider = Arc::new(MockChainProvider::new(1).with_block_batches(vec![vec![]]));
+        let result = BlockFetcher::new(Some(1.0), provider)
+            .attach_log_timestamps(vec![make_log(100, None)])
+            .await;
+        assert!(matches!(result,Err(BlockFetcherError::MissingBlockInRange(_,block)) if block==U64::from(100)),"no progress must report the unresolved block without another recursive request: {result:?}");
+    }
 }
