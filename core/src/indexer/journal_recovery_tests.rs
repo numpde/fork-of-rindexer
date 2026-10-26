@@ -344,3 +344,54 @@ async fn postgres_cross_chain_journal_rollback_keeps_the_unaffected_network_cont
     drop(callback);
     fixture.finish().await;
 }
+
+#[tokio::test]
+async fn postgres_cross_chain_recalculation_waits_for_another_networks_in_flight_application() {
+    let fixture = fixture("max", "uint64", true).await;
+    let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+    for (block, value) in [(90, 5), (100, 10)] {
+        callback(vec![at(&fixture, "ethereum", block, B256::repeat_byte(block as u8), value)])
+            .await
+            .unwrap();
+    }
+    let controller = client(&fixture.url).await;
+    let mut connection = controller.raw_connection().await.unwrap();
+    let control = connection.transaction().await.unwrap();
+    control.execute("SELECT pg_advisory_xact_lock(8675309)", &[]).await.unwrap();
+    fixture.client.batch_execute(&format!(
+        "CREATE FUNCTION pause_other_application() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN IF NEW.network = 'other' THEN PERFORM pg_advisory_xact_lock(8675309); END IF; RETURN NEW; END $$;
+         CREATE TRIGGER pause_other BEFORE INSERT ON {} FOR EACH ROW EXECUTE FUNCTION pause_other_application()",
+        fixture.params.sql_event_table_name)).await.unwrap();
+    let other = at(&fixture, "other", 200, B256::repeat_byte(200), 20);
+    let other_callback = callback.clone();
+    let application = tokio::spawn(async move { other_callback(vec![other]).await });
+    let fixture_ref = &fixture;
+    let wait_for = |kind: &'static str| async move {
+        tokio::time::timeout(Duration::from_secs(10),async {
+            loop {
+                let waiting: bool = fixture_ref.admin.query_one(
+                    "SELECT EXISTS (SELECT 1 FROM pg_locks l JOIN pg_stat_activity a USING (pid)
+                     WHERE a.datname = $2 AND NOT l.granted
+                       AND (($1 = 'application' AND l.locktype = 'advisory')
+                         OR ($1 = 'recovery' AND l.locktype IN ('relation','transactionid'))))",&[&kind, &fixture_ref.database]).await.unwrap().get(0);
+                if waiting { break }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await
+    };
+    wait_for("application")
+        .await
+        .expect("B pauses after its derived effect and journal, before COMMIT");
+    let (_, observed) = tokio::join!(rollback(&fixture, SetAction::Max, true), async {
+        let observed = wait_for("recovery").await;
+        control.commit().await.unwrap();
+        observed
+    });
+    observed.expect("A waits for B before selecting surviving contributions");
+    application.await.unwrap().unwrap();
+    assert_eq!(amount(&fixture).await, "20");
+    drop(connection);
+    drop(callback);
+    fixture.finish().await;
+}

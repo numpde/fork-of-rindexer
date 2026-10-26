@@ -27,6 +27,7 @@
 
 ### Bug fixes
 -------------------------------------------------
+- fix: rolling back a `cross_chain: true` table now invalidates only the reorganizing network's journal entries; shared aggregates retain unaffected networks' canonical contributions and wait for concurrent applications before recalculation.
 - fix: custom-table `update` and `delete` operations now enforce `if`/`filter` predicates containing `@column` references in PostgreSQL, including mixed event/table predicates.
 - fix: PostgreSQL derived `set`, `max` and `min` operations now bind typed recovery values, preserve full `uint256`/`int256` precision and nonnumeric `set` values in JSONB, and abort the application transaction when required journal insertion fails. Rebuild existing derived state and `rindexer_internal.derived_op_log` with the current schema before resuming.
 - fix: reorg-enabled historical indexing now captures its recovery tail before writes and keeps detection active until queued callbacks finish, including dependency-ordered events. The persisted original headers survive the historical/live handoff and restart, allowing orphaned raw events and receipts to be replaced. Previously untracked historical tails need a reviewed rebuild; upgrading cannot recover missing original header evidence.

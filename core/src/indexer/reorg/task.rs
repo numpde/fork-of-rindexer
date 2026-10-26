@@ -1280,17 +1280,36 @@ impl ReorgTask {
             }
 
             let network_filter = self.network_filter(dt.cross_chain);
+            if dt.cross_chain {
+                if let Some(pg) = pg {
+                    // Other networks have independent writer barriers. Wait for
+                    // their forward effects and journals before taking the
+                    // recalculation snapshot, then hold writers until commit.
+                    pg.batch_execute(&format!(
+                        "LOCK TABLE {} IN SHARE ROW EXCLUSIVE MODE",
+                        dt.full_table_name
+                    ))
+                    .await
+                    .with_context(|| {
+                        format!("Cannot isolate shared journal recovery for {}", dt.full_table_name)
+                    })?;
+                }
+            }
+
+            // Source history belongs to its network even when the resulting row
+            // combines networks. Their block heights are independent fork boundaries.
+            let source_network_filter = self.network_filter(false);
 
             // Delete journal entries in the reorg range
             let pg_delete = format!(
                 "DELETE FROM rindexer_internal.derived_op_log \
                  WHERE derived_table = '{}' AND block_number >= {}{}",
-                dt.full_table_name, self.fork_point, network_filter,
+                dt.full_table_name, self.fork_point, source_network_filter,
             );
             let ch_delete = format!(
                 "ALTER TABLE rindexer_internal.derived_op_log DELETE \
                  WHERE derived_table = '{}' AND block_number >= {}{} SETTINGS mutations_sync = 1",
-                dt.full_table_name, self.fork_point, network_filter,
+                dt.full_table_name, self.fork_point, source_network_filter,
             );
 
             if let Some(pg) = pg {
