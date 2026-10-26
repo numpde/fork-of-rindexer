@@ -1634,3 +1634,6 @@ async fn postgres_sequence_positions_reject_indices_outside_the_packed_bounds_be
         fixture.finish().await;
     }
 }
+
+#[path = "historical_handoff_tests.rs"]
+mod historical_handoff_tests;
