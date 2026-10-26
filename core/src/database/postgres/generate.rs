@@ -53,11 +53,11 @@ pub fn generate_derived_op_log_table_sql() -> String {
         network VARCHAR(50) NOT NULL,
         where_key VARCHAR(500) NOT NULL,
         column_name VARCHAR(100) NOT NULL,
-        value NUMERIC NOT NULL,
+        value JSONB NOT NULL,
         row_metadata JSONB NOT NULL DEFAULT '{}',
         block_number BIGINT NOT NULL,
-        tx_index INTEGER NOT NULL,
-        log_index INTEGER NOT NULL
+        tx_index BIGINT NOT NULL,
+        log_index BIGINT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_derived_op_log_reorg
         ON rindexer_internal.derived_op_log (derived_table, column_name, where_key, block_number);"#

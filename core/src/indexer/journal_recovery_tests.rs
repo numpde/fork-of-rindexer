@@ -179,3 +179,100 @@ async fn postgres_required_journal_failure_aborts_every_application_effect_and_r
     drop(callback);
     fixture.finish().await;
 }
+
+#[tokio::test]
+async fn postgres_journal_preserves_full_width_signed_and_unsigned_values() {
+    use alloy::{dyn_abi::DynSolValue, primitives::I256};
+    for signed in [false, true] {
+        let fixture = fixture(
+            if signed { "min" } else { "max" },
+            if signed { "int256" } else { "uint256" },
+            false,
+        )
+        .await;
+        let unsigned = (U256::from(1) << 240) + U256::from(123);
+        let old = if signed {
+            DynSolValue::Int(I256::MIN + I256::from_raw(U256::from(123)), 256)
+        } else {
+            DynSolValue::Uint(unsigned, 256)
+        };
+        let orphan = if signed {
+            DynSolValue::Int(I256::MIN, 256)
+        } else {
+            DynSolValue::Uint(U256::MAX, 256)
+        };
+        let expected = if signed {
+            (I256::MIN + I256::from_raw(U256::from(123))).to_string()
+        } else {
+            unsigned.to_string()
+        };
+        let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+        for (block, value) in [(99, old), (100, orphan)] {
+            let mut event = at(&fixture, "ethereum", block, B256::repeat_byte(block as u8), 1);
+            event.log.inner.data = alloy::primitives::LogData::new_unchecked(
+                event.log.topics().to_vec(),
+                value.abi_encode().into(),
+            );
+            callback(vec![event]).await.unwrap();
+        }
+        rollback(&fixture, if signed { SetAction::Min } else { SetAction::Max }, false).await;
+        assert_eq!(amount(&fixture).await, expected);
+        drop(callback);
+        fixture.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn postgres_journal_restores_boolean_address_and_string_set_values() {
+    use alloy::{dyn_abi::DynSolValue, primitives::Address};
+    for (kind, old, orphan, expected) in [
+        ("bool", DynSolValue::Bool(false), DynSolValue::Bool(true), "false".to_string()),
+        (
+            "address",
+            DynSolValue::Address(Address::repeat_byte(1)),
+            DynSolValue::Address(Address::repeat_byte(2)),
+            format!("{:#x}", Address::repeat_byte(1)),
+        ),
+        (
+            "string",
+            DynSolValue::String("O'Brien".into()),
+            DynSolValue::String("Orphan".into()),
+            "O'Brien".to_string(),
+        ),
+    ] {
+        let fixture = fixture("set", kind, false).await;
+        let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+        for (block, value) in [(99, old), (100, orphan)] {
+            let mut event = at(&fixture, "ethereum", block, B256::repeat_byte(block as u8), 1);
+            event.log.inner.data = alloy::primitives::LogData::new_unchecked(
+                event.log.topics().to_vec(),
+                value.abi_encode().into(),
+            );
+            callback(vec![event]).await.unwrap();
+        }
+        rollback(&fixture, SetAction::Set, false).await;
+        assert_eq!(amount(&fixture).await, expected);
+        drop(callback);
+        fixture.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn postgres_journal_rollback_removes_a_row_created_only_by_the_orphan() {
+    let fixture = fixture("max", "uint256", false).await;
+    let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+    callback(vec![at(&fixture, "ethereum", 100, B256::repeat_byte(100), 1000)]).await.unwrap();
+    rollback(&fixture, SetAction::Max, false).await;
+    let count: i64 = fixture
+        .client
+        .query_one(
+            &format!("SELECT count(*) FROM {}", fixture.params.tables[0].full_table_name),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(count, 0);
+    drop(callback);
+    fixture.finish().await;
+}

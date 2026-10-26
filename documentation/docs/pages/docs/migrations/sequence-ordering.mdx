@@ -52,7 +52,8 @@ Fresh databases need no data migration. The YAML fields and defaults are unchang
 ## Recovery journals and row provenance
 
 PostgreSQL `rindexer_internal.derived_op_log` now also stores `row_metadata` as
-`JSONB`. Each input records its sequence, block number and hash, transaction hash,
+`JSONB`, and `value` is now JSONB rather than numeric-only. Transaction and log
+indices are `BIGINT` to accommodate the full supported 32-bit range. Each input records its sequence, block number and hash, transaction hash,
 contract address, and timestamp when configured. Recovery restores that metadata
 from the latest surviving canonical input before accepting replacement events.
 Transaction and log indices come from the packed sequence rather than absent
@@ -68,3 +69,13 @@ ClickHouse reorg recovery with derived `set`, `max`, or `min` operations is now
 rejected at startup. Its existing numeric journal cannot preserve exact values
 and complete row provenance. Move these operations to PostgreSQL before enabling
 reorg recovery for them.
+
+Required PostgreSQL journal writes now share the transaction containing their
+forward effects. A failed journal insert fails the callback and leaves its raw
+rows, derived effects, receipt and progress uncommitted in the PostgreSQL atomic
+path. Retry after repairing the reported database or schema error.
+
+Journal payloads are encoded through typed PostgreSQL parameters. JSON conversion
+happens in PostgreSQL, preserving the exact decimal values of `uint256` and
+`int256`; nonnumeric `set` values (including addresses, strings and booleans) retain
+their types and are restored using the target table's row type.

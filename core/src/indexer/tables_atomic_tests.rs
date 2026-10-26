@@ -1,6 +1,6 @@
 //! Docker-backed tests for the atomic write path of the no-code Postgres arm:
 //! [`prepare_table_operations`] (no database access), [`apply_table_operations`] in
-//! [`PgWriteMode::Tx`] (table operations plus their reorg-journal savepoints),
+//! [`PgWriteMode::Tx`] (table operations plus their required reorg journal),
 //! [`PostgresClient::insert_bulk_with_cursor_in`] (raw event rows plus the
 //! `last_synced_block` cursor) and `COMMIT`, all on one pooled connection. That is the
 //! lower-level effect-staging primitives used by `no_code_callback`. These tests
@@ -15,7 +15,7 @@
 //! - a process killed between the last statement and `COMMIT` (the production incident
 //!   shape) is a plain rollback, and the replay applies once;
 //! - the shutdown flag stops `prepare`, never a transaction that already began;
-//! - a journal INSERT failure is contained by its savepoint and the batch still commits;
+//! - a required journal INSERT failure rolls back the complete batch;
 //! - insert-only tables (binary COPY) and set-only tables (sequence guard) keep their
 //!   semantics inside the transaction;
 //! - a pool of one connection is enough (no nested checkout between BEGIN and COMMIT);
@@ -499,7 +499,7 @@ async fn prepare<'t>(
 }
 
 /// Everything the arm stages between BEGIN and COMMIT: table operations with their
-/// journal savepoints, then the raw rows and the cursor.
+/// required journals, then the raw rows and the cursor.
 async fn stage_in_tx(
     tx: &PgTransaction<'_>,
     prepared: &PreparedTableOps<'_>,
@@ -1178,10 +1178,9 @@ async fn rows_cursor_table_ops_and_journal_commit_together() {
     );
 }
 
-/// The journal INSERT runs under a savepoint: when it fails the savepoint is rolled back,
-/// the failure is logged, and the batch (table rows, raw rows, cursor) still commits.
+/// A required journal failure leaves table rows, raw rows and progress uncommitted.
 #[tokio::test]
-async fn journal_failure_under_savepoint_does_not_abort_batch() {
+async fn journal_failure_aborts_batch() {
     let harness = Harness::start("savepoint", "Transfer", None).await;
     let last_seen = harness.runtime(set_last_block_table());
     harness.create_table(&last_seen).await;
@@ -1200,15 +1199,14 @@ async fn journal_failure_under_savepoint_does_not_abort_batch() {
     let table = last_seen.full_table_name.clone();
     let tables = [last_seen];
 
-    let advance = harness
+    harness
         .run_batch(&tables, "Transfer", &events)
         .await
-        .expect("a failing journal INSERT must not fail the batch");
-    assert!(matches!(advance, CursorAdvance::Advanced { updated_rows: 1 }), "got {advance:?}");
-    assert_eq!(harness.count(&table).await, 3, "table rows must commit");
-    assert_eq!(harness.raw_count().await, events.len() as i64, "raw rows must commit");
-    assert_eq!(harness.cursor_block().await, Some(to_block(&events) as i64), "cursor must advance");
-    assert_eq!(harness.journal_count().await, 0, "the rejected journal rows must not exist");
+        .expect_err("a required journal failure must abort the batch");
+    assert_eq!(harness.count(&table).await, 0);
+    assert_eq!(harness.raw_count().await, 0);
+    assert_eq!(harness.cursor_block().await, Some(0));
+    assert_eq!(harness.journal_count().await, 0);
 }
 
 /// An insert-only table is written with binary COPY inside the transaction. A failure

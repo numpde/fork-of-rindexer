@@ -1320,9 +1320,25 @@ impl ReorgTask {
 
                 // --- Postgres recalculation ---
                 if let Some(pg) = pg {
+                    // A row created only by orphaned inputs has no canonical state
+                    // to restore. Do not leave its last orphaned aggregate behind.
+                    let delete = format!(
+                        "DELETE FROM {} AS dt WHERE dt.rindexer_block_number >= {}{} \
+                         AND NOT EXISTS (SELECT 1 FROM rindexer_internal.derived_op_log sub \
+                             WHERE sub.derived_table = '{}'{} AND {})",
+                        dt.full_table_name,
+                        self.fork_point,
+                        network_join,
+                        dt.full_table_name,
+                        network_filter,
+                        Self::journal_where_key_join(&jc.where_columns, "dt", "sub"),
+                    );
+                    pg.batch_execute(&delete).await.with_context(|| {
+                        format!("Cannot remove orphan-only journal row from {}", dt.full_table_name)
+                    })?;
                     let update_sql = if matches!(jc.action, SetAction::Set) {
                         format!(
-                            "UPDATE {} AS dt SET {} = sub.value \
+                            "UPDATE {} AS dt SET {} = (jsonb_populate_record(dt, jsonb_build_object('{}', sub.value))).{} \
                              FROM ( \
                                  SELECT DISTINCT ON (where_key) where_key, value \
                                  FROM rindexer_internal.derived_op_log \
@@ -1330,15 +1346,15 @@ impl ReorgTask {
                                  ORDER BY where_key, block_number DESC, tx_index DESC, log_index DESC \
                              ) sub \
                              WHERE {} {}",
-                            dt.full_table_name, jc.derived_column,
+                            dt.full_table_name, jc.derived_column, jc.derived_column, jc.derived_column,
                             dt.full_table_name, jc.derived_column, network_filter,
                             Self::journal_where_key_join(&jc.where_columns, "dt", "sub"),
                             network_join,
                         )
                     } else {
                         let agg_fn = match jc.action {
-                            SetAction::Max => "MAX(value)",
-                            SetAction::Min => "MIN(value)",
+                            SetAction::Max => "MAX((value #>> '{}')::numeric)",
+                            SetAction::Min => "MIN((value #>> '{}')::numeric)",
                             _ => continue,
                         };
                         format!(
@@ -1495,7 +1511,7 @@ impl ReorgTask {
     /// string concatenation on the derived table side.
     fn journal_where_key_join(where_columns: &[String], dt_alias: &str, sub_alias: &str) -> String {
         if where_columns.is_empty() {
-            return format!("{}.network = {}.where_key", dt_alias, sub_alias);
+            return "TRUE".to_string();
         }
 
         let concat_parts: Vec<String> = where_columns

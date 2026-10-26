@@ -929,8 +929,8 @@ impl ToSql for EthereumSqlTypeWrapper {
             }
             EthereumSqlTypeWrapper::I256Numeric(value) => {
                 let is_negative = value.is_negative();
-                let abs_value: U256 =
-                    if is_negative { value.abs().into_raw() } else { value.into_raw() };
+                // The magnitude of I256::MIN fits in U256, but not in I256.
+                let abs_value = value.unsigned_abs();
                 Self::write_u256_numeric_to_postgres(abs_value, is_negative, out)
             }
             EthereumSqlTypeWrapper::I256Nullable(value) => {

@@ -409,7 +409,8 @@ impl TestEnv {
                  network VARCHAR(50) NOT NULL,
                  where_key VARCHAR(500) NOT NULL,
                  column_name VARCHAR(100) NOT NULL,
-                 value NUMERIC NOT NULL,
+                 value JSONB NOT NULL,
+                 row_metadata JSONB NOT NULL DEFAULT '{}',
                  block_number BIGINT NOT NULL,
                  tx_index INTEGER NOT NULL,
                  log_index INTEGER NOT NULL
@@ -3129,7 +3130,7 @@ async fn test_reorg_journal_max_recalculation() {
         pg.execute(
             "INSERT INTO rindexer_internal.derived_op_log \
              (derived_table, network, where_key, column_name, value, block_number, tx_index, log_index) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+             VALUES ($1, $2, $3, $4, to_jsonb($5::numeric), $6, $7, $8)",
             &[
                 &"test_schema.trade_stats", &network, &where_key.as_str(), &"max_trade",
                 &rust_decimal::Decimal::from(value), &(block as i64), &0i32, &0i32,
@@ -3239,7 +3240,7 @@ async fn test_reorg_journal_set_recalculation() {
         pg.execute(
             "INSERT INTO rindexer_internal.derived_op_log \
              (derived_table, network, where_key, column_name, value, block_number, tx_index, log_index) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+             VALUES ($1, $2, $3, $4, to_jsonb($5::numeric), $6, $7, $8)",
             &[
                 &"test_schema.last_price", &network, &where_key.as_str(), &"price",
                 &rust_decimal::Decimal::from(value), &(block as i64), &tx_idx, &0i32,
@@ -3441,7 +3442,7 @@ async fn test_reorg_journal_min_recalculation() {
         pg.execute(
             "INSERT INTO rindexer_internal.derived_op_log \
              (derived_table, network, where_key, column_name, value, block_number, tx_index, log_index) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+             VALUES ($1, $2, $3, $4, to_jsonb($5::numeric), $6, $7, $8)",
             &[
                 &"test_schema.min_tracker", &network, &where_key.as_str(), &"min_value",
                 &rust_decimal::Decimal::from(value), &(block as i64), &0i32, &0i32,
@@ -3556,7 +3557,7 @@ async fn test_reorg_mixed_reversible_and_journal() {
         pg.execute(
             "INSERT INTO rindexer_internal.derived_op_log \
              (derived_table, network, where_key, column_name, value, block_number, tx_index, log_index) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+             VALUES ($1, $2, $3, $4, to_jsonb($5::numeric), $6, $7, $8)",
             &[
                 &"test_schema.mixed_stats", &network, &where_key.as_str(), &"max_trade",
                 &rust_decimal::Decimal::from(value), &(block as i64), &0i32, &0i32,
@@ -4360,7 +4361,7 @@ async fn test_reorg_two_events_same_table_journal() {
         pg.execute(
             "INSERT INTO rindexer_internal.derived_op_log \
              (derived_table, network, where_key, column_name, value, block_number, tx_index, log_index) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+             VALUES ($1, $2, $3, $4, to_jsonb($5::numeric), $6, $7, $8)",
             &[
                 &"test_schema.trade_extremes", &network, &where_key.as_str(), &"max_trade",
                 &rust_decimal::Decimal::from(value), &(block as i64), &0i32, &0i32,
@@ -4375,7 +4376,7 @@ async fn test_reorg_two_events_same_table_journal() {
         pg.execute(
             "INSERT INTO rindexer_internal.derived_op_log \
              (derived_table, network, where_key, column_name, value, block_number, tx_index, log_index) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+             VALUES ($1, $2, $3, $4, to_jsonb($5::numeric), $6, $7, $8)",
             &[
                 &"test_schema.trade_extremes", &network, &where_key.as_str(), &"min_trade",
                 &rust_decimal::Decimal::from(value), &(block as i64), &0i32, &0i32,

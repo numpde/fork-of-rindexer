@@ -3850,8 +3850,11 @@ pub(crate) async fn apply_table_operations(
 
         // Execute the operation
         if let Some(postgres) = postgres {
+            let mut connection =
+                postgres.raw_connection().await.map_err(|error| error.to_string())?;
+            let tx = connection.transaction().await.map_err(|error| pg_error_to_string(&error))?;
             execute_postgres_operation(
-                PgWriteMode::Eager(postgres),
+                PgWriteMode::Tx(&tx),
                 &op.table.full_table_name,
                 &op.table.table,
                 op.operation,
@@ -3861,8 +3864,9 @@ pub(crate) async fn apply_table_operations(
             .await?;
 
             // Journal non-reversible operations (Set/Max/Min) for reorg recalculation
-            journal_non_reversible_ops(postgres, &op.table.full_table_name, op.operation, &op.rows)
-                .await;
+            journal_non_reversible_ops(&tx, &op.table.full_table_name, op.operation, &op.rows)
+                .await?;
+            tx.commit().await.map_err(|error| pg_error_to_string(&error))?;
         }
 
         if let Some(clickhouse) = &clickhouse {
@@ -3916,8 +3920,7 @@ async fn apply_table_operations_in_tx(
         )
         .await?;
 
-        journal_non_reversible_ops_in_tx(tx, &op.table.full_table_name, op.operation, &op.rows)
-            .await?;
+        journal_non_reversible_ops(tx, &op.table.full_table_name, op.operation, &op.rows).await?;
     }
 
     Ok(())
@@ -4760,89 +4763,99 @@ fn journal_row_metadata(row: &TableRowData) -> serde_json::Value {
     serde_json::Value::Object(metadata)
 }
 
-/// Builds the Postgres `rindexer_internal.derived_op_log` INSERT for non-reversible
-/// (Set/Max/Min) operations, or `None` when there is nothing to journal.
-/// Batches all rows into a single statement.
-fn build_journal_sql(
-    derived_table: &str,
-    operation: &TableOperation,
-    rows: &[TableRowData],
-) -> Option<String> {
-    let values = collect_journal_values(derived_table, operation, rows, "''");
-    if values.is_empty() {
-        return None;
+/// One parameterized journal INSERT, bounded below PostgreSQL's parameter limit.
+#[derive(Default)]
+struct JournalInsert {
+    values: Vec<String>,
+    parameters: Vec<EthereumSqlTypeWrapper>,
+}
+
+impl JournalInsert {
+    fn bind(&mut self, value: EthereumSqlTypeWrapper) -> String {
+        let sql_type = value.to_type();
+        self.parameters.push(value);
+        format!("${}::{}", self.parameters.len(), sql_type.name())
     }
 
-    let mut statements = Vec::new();
-    for row in rows {
-        let values =
-            collect_journal_values(derived_table, operation, std::slice::from_ref(row), "''");
-        if values.is_empty() {
-            continue;
+    async fn execute(self, tx: &PgTransaction<'_>, table: &str) -> Result<(), String> {
+        if self.values.is_empty() {
+            return Ok(());
         }
-        let metadata = journal_row_metadata(row).to_string().replace('\'', "''");
-        let values = values
-            .iter()
-            .map(|value| format!("{}, '{}'::jsonb)", &value[..value.len() - 1], metadata))
-            .collect::<Vec<_>>();
-        statements.push(format!(
+        let sql = format!(
             "INSERT INTO rindexer_internal.derived_op_log \
-             (derived_table, network, where_key, column_name, value, block_number, tx_index, log_index, row_metadata) \
-             VALUES {}", values.join(", ")));
+             (derived_table, network, column_name, block_number, tx_index, log_index, row_metadata, value, where_key) \
+             VALUES {}", self.values.join(", "));
+        let parameters = self
+            .parameters
+            .iter()
+            .map(|value| value as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect::<Vec<_>>();
+        let result =
+            tx.execute(&sql, &parameters).await.map_err(|error| pg_error_to_string(&error));
+        result.map(|_| ()).map_err(|error| format!(
+            "Cannot record required recovery history for {table}: {error}. The application cannot commit without its journal. Existing installations must rebuild derived state and the journal with the current schema before resuming."
+        ))
     }
-    Some(statements.join(";"))
 }
 
-/// Journal non-reversible (Set/Max/Min) operations to Postgres `rindexer_internal.derived_op_log`.
-/// Autocommit on its own pool checkout; a failure is logged and swallowed.
+/// Values and keys use their PostgreSQL encoders. Server-side JSON conversion
+/// preserves full numeric precision and also represents string, address and bool set values.
 async fn journal_non_reversible_ops(
-    postgres: &PostgresClient,
-    derived_table: &str,
-    operation: &TableOperation,
-    rows: &[TableRowData],
-) {
-    let Some(sql) = build_journal_sql(derived_table, operation, rows) else {
-        return;
-    };
-
-    if let Err(e) = postgres.batch_execute(&sql).await {
-        tracing::error!(
-            table = %derived_table,
-            "Failed to journal non-reversible ops: {:?}", e
-        );
-    }
-}
-
-/// Journals non-reversible operations inside the caller's transaction, under a SQL savepoint.
-///
-/// Only the INSERT is best-effort: on failure it is logged with the eager path's text and
-/// rolled back to the savepoint so the batch continues. An error from `SAVEPOINT`,
-/// `ROLLBACK TO` or `RELEASE` propagates because the transaction is unusable after it.
-/// Separate round trips on purpose: in one simple-query string a failing INSERT would
-/// stop before `RELEASE` and leave the transaction aborted. One savepoint per operation,
-/// released on both paths: `ROLLBACK TO` keeps the savepoint defined, and a stale one
-/// would nest the next operation's `SAVEPOINT` one subtransaction deeper.
-async fn journal_non_reversible_ops_in_tx(
     tx: &PgTransaction<'_>,
     derived_table: &str,
     operation: &TableOperation,
     rows: &[TableRowData],
 ) -> Result<(), String> {
-    let Some(sql) = build_journal_sql(derived_table, operation, rows) else {
+    if !matches!(operation.operation_type, OperationType::Upsert | OperationType::Update) {
         return Ok(());
-    };
-
-    tx.batch_execute("SAVEPOINT rindexer_journal").await.map_err(|e| pg_error_to_string(&e))?;
-    if let Err(e) = tx.batch_execute(&sql).await {
-        tracing::error!(
-            table = %derived_table,
-            "Failed to journal non-reversible ops: {:?}", e
-        );
-        tx.batch_execute("ROLLBACK TO SAVEPOINT rindexer_journal")
-            .await
-            .map_err(|e| pg_error_to_string(&e))?;
     }
-    tx.batch_execute("RELEASE SAVEPOINT rindexer_journal").await.map_err(|e| pg_error_to_string(&e))
+    let mut keys = operation.where_clause.keys().collect::<Vec<_>>();
+    keys.sort();
+    let mut insert = JournalInsert::default();
+    for row in rows {
+        let (block, tx_index, log_index) = extract_row_metadata(row).ok_or_else(|| {
+            format!("Cannot journal {derived_table}: prepared input has no event position")
+        })?;
+        for column in operation.set.iter().filter(|column| column.action.reverse().is_none()) {
+            let value = row.columns.get(&column.column).ok_or_else(|| {
+                format!(
+                    "Cannot journal {derived_table}.{}: prepared input has no required value",
+                    column.column
+                )
+            })?;
+            if insert.parameters.len() + 8 + keys.len() > 32_000 {
+                std::mem::take(&mut insert).execute(tx, derived_table).await?;
+            }
+            let mut values = vec![
+                insert.bind(EthereumSqlTypeWrapper::String(derived_table.to_string())),
+                insert.bind(EthereumSqlTypeWrapper::String(row.network.clone())),
+                insert.bind(EthereumSqlTypeWrapper::String(column.column.clone())),
+                insert.bind(EthereumSqlTypeWrapper::U64BigInt(block)),
+                insert.bind(EthereumSqlTypeWrapper::U64BigInt(tx_index)),
+                insert.bind(EthereumSqlTypeWrapper::U64BigInt(log_index)),
+                insert.bind(EthereumSqlTypeWrapper::JSONB(journal_row_metadata(row))),
+            ];
+            let value = insert.bind(value.clone());
+            values.push(format!("COALESCE(to_jsonb({value}), 'null'::jsonb)"));
+            let mut key_parts = Vec::new();
+            for key in &keys {
+                let value = row.columns.get(key.as_str()).ok_or_else(|| {
+                    format!("Cannot journal {derived_table}: prepared input has no key {key}")
+                })?;
+                let parameter = insert.bind(value.clone());
+                let prefix = if key_parts.is_empty() { "" } else { "," };
+                key_parts
+                    .push(format!("'{prefix}{}=' || {parameter}::text", key.replace('\'', "''")));
+            }
+            values.push(if key_parts.is_empty() {
+                "''".to_string()
+            } else {
+                key_parts.join(" || ")
+            });
+            insert.values.push(format!("({})", values.join(", ")));
+        }
+    }
+    insert.execute(tx, derived_table).await
 }
 
 /// Journal non-reversible (Set/Max/Min) operations to ClickHouse `rindexer_internal.derived_op_log`.
