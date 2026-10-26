@@ -1666,3 +1666,6 @@ mod subscription_cursor_tests;
 
 #[path = "schema_override_tests.rs"]
 mod schema_override_tests;
+
+#[path = "table_timestamp_tests.rs"]
+mod table_timestamp_tests;
