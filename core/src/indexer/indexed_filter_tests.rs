@@ -97,3 +97,45 @@ fn shared_tip_indexed_alternatives_match_the_same_union_without_duplicate_delive
         );
     }
 }
+
+#[test]
+fn hypersync_indexed_alternatives_keep_topic_positions_independent() {
+    for address_scoped in [false, true] {
+        let addresses = address_scoped.then(|| vec![Address::repeat_byte(7)]);
+        let query = crate::hypersync::build_log_query(&filter(address_scoped), addresses, 100, 100)
+            .unwrap();
+        assert_eq!((query.from_block, query.to_block), (100, Some(101)));
+        assert_eq!(query.logs.len(), 2, "archive must receive both OR alternatives");
+        let outgoing = &query.logs[0].include;
+        let incoming = &query.logs[1].include;
+        assert_eq!(outgoing.topics[1].len(), 1);
+        assert!(
+            incoming.topics[1].is_empty(),
+            "incoming predicate cannot require an outgoing match too"
+        );
+        assert_eq!(incoming.topics[2].len(), 1);
+        assert_eq!(
+            serde_json::to_value(&outgoing.topics[1]).unwrap(),
+            serde_json::to_value(&incoming.topics[2]).unwrap()
+        );
+        assert_eq!(outgoing.address.len(), usize::from(address_scoped));
+        assert_eq!(incoming.address.len(), usize::from(address_scoped));
+    }
+}
+
+#[test]
+fn alternative_merge_keeps_replacement_removed_and_unidentifiable_logs() {
+    let original = log(1, 11, 11);
+    let mut removed = original.clone();
+    removed.removed = true;
+    let mut replacement = original.clone();
+    replacement.block_hash = Some(B256::repeat_byte(101));
+    let mut unidentified = original.clone();
+    unidentified.block_hash = None;
+    let mut logs =
+        vec![original.clone(), original, removed, replacement, unidentified.clone(), unidentified];
+    crate::helpers::merge_log_alternatives(&mut logs);
+    assert_eq!(logs.len(), 5, "only the proven identical canonical event may be collapsed");
+    assert_eq!(logs.iter().filter(|log| log.removed).count(), 1);
+    assert_eq!(logs.iter().filter(|log| log.block_hash.is_none()).count(), 2);
+}

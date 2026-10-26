@@ -659,44 +659,51 @@ impl JsonRpcCachedProvider {
 
         let addresses = event_filter.contract_addresses().await;
 
-        let base_filter = Filter::new()
-            .event_signature(event_filter.event_signature())
-            .topic1(event_filter.topic1())
-            .topic2(event_filter.topic2())
-            .topic3(event_filter.topic3())
-            .from_block(event_filter.from_block())
-            .to_block(event_filter.to_block());
-
-        let logs = match addresses {
-            // no addresses, which means nothing to get
-            // different rpc providers implement an empty array differently,
-            // therefore, we assume an empty addresses array means no events to fetch
-            Some(addresses) if addresses.is_empty() => Ok(vec![]),
-            Some(addresses) => match self.address_filtering {
-                Some(AddressFiltering::InMemory) => {
-                    self.get_logs_for_address_in_memory(&base_filter, addresses).await
-                }
-                Some(AddressFiltering::MaxAddressPerGetLogsRequest(
-                    max_address_per_get_logs_request,
-                )) => {
-                    self.get_logs_for_address_in_batches(
-                        &base_filter,
-                        addresses,
-                        max_address_per_get_logs_request,
-                    )
-                    .await
-                }
-                None => {
-                    self.get_logs_for_address_in_batches(
-                        &base_filter,
-                        addresses,
-                        DEFAULT_RPC_SUPPORTED_ACCOUNT_FILTERS,
-                    )
-                    .await
-                }
-            },
-            None => Ok(self.provider.get_logs(&base_filter).await?),
-        };
+        let logs = async {
+            if addresses.as_ref().is_some_and(HashSet::is_empty) {
+                return Ok(vec![]);
+            }
+            let mut logs = Vec::new();
+            for topics in event_filter.topic_sets() {
+                let base_filter = Filter::new()
+                    .event_signature(event_filter.event_signature())
+                    .topic1(topics[1].clone())
+                    .topic2(topics[2].clone())
+                    .topic3(topics[3].clone())
+                    .from_block(event_filter.from_block())
+                    .to_block(event_filter.to_block());
+                let fetched = match addresses.clone() {
+                    Some(addresses) => match self.address_filtering {
+                        Some(AddressFiltering::InMemory) => {
+                            self.get_logs_for_address_in_memory(&base_filter, addresses).await?
+                        }
+                        Some(AddressFiltering::MaxAddressPerGetLogsRequest(chunk_size)) => {
+                            self.get_logs_for_address_in_batches(
+                                &base_filter,
+                                addresses,
+                                chunk_size,
+                            )
+                            .await?
+                        }
+                        None => {
+                            self.get_logs_for_address_in_batches(
+                                &base_filter,
+                                addresses,
+                                DEFAULT_RPC_SUPPORTED_ACCOUNT_FILTERS,
+                            )
+                            .await?
+                        }
+                    },
+                    None => self.provider.get_logs(&base_filter).await?,
+                };
+                logs.extend(fetched);
+            }
+            if event_filter.topic_sets().len() > 1 {
+                crate::helpers::merge_log_alternatives(&mut logs);
+            }
+            Ok(logs)
+        }
+        .await;
 
         // Record RPC metrics
         let duration = start.elapsed().as_secs_f64();

@@ -159,6 +159,60 @@ pub async fn create_hypersync_provider(
     }))
 }
 
+pub(crate) fn build_log_query(
+    event_filter: &RindexerEventFilter,
+    addresses: Option<Vec<Address>>,
+    from_block: u64,
+    to_block: u64,
+) -> Result<Query, ProviderError> {
+    let map_err =
+        |error: anyhow::Error| ProviderError::CustomError(format!("hypersync: {error:#}"));
+    let filters = event_filter
+        .topic_sets()
+        .iter()
+        .map(|topics| {
+            let mut filter =
+                LogFilter::all().and_topic0([event_filter.event_signature().0]).map_err(map_err)?;
+            if let Some(addresses) = &addresses {
+                filter = filter
+                    .and_address(addresses.iter().map(|address| address.0 .0))
+                    .map_err(map_err)?;
+            }
+            for (index, topic) in topics.iter().enumerate().skip(1) {
+                let values = topic.iter().map(|topic| topic.0).collect::<Vec<_>>();
+                if !values.is_empty() {
+                    filter = match index {
+                        1 => filter.and_topic1(values),
+                        2 => filter.and_topic2(values),
+                        _ => filter.and_topic3(values),
+                    }
+                    .map_err(map_err)?;
+                }
+            }
+            Ok(filter)
+        })
+        .collect::<Result<Vec<_>, ProviderError>>()?;
+    Ok(Query::new()
+        .from_block(from_block)
+        .to_block_excl(to_block + 1)
+        .where_logs(hypersync_client::net_types::types::AnyOf::any(filters))
+        .select_log_fields([
+            LogField::Removed,
+            LogField::LogIndex,
+            LogField::TransactionIndex,
+            LogField::TransactionHash,
+            LogField::BlockHash,
+            LogField::BlockNumber,
+            LogField::Address,
+            LogField::Data,
+            LogField::Topic0,
+            LogField::Topic1,
+            LogField::Topic2,
+            LogField::Topic3,
+        ])
+        .select_block_fields([BlockField::Number, BlockField::Timestamp]))
+}
+
 impl HypersyncProvider {
     /// Whether the HyperSync archive has fully ingested `to_block`.
     ///
@@ -198,50 +252,10 @@ impl HypersyncProvider {
     ) -> Result<Vec<Log>, ProviderError> {
         let map_err = |e: anyhow::Error| ProviderError::CustomError(format!("hypersync: {e:#}"));
 
-        let mut log_filter =
-            LogFilter::all().and_topic0([event_filter.event_signature().0]).map_err(map_err)?;
-
-        if let Some(addresses) = addresses {
-            log_filter =
-                log_filter.and_address(addresses.into_iter().map(|a| a.0 .0)).map_err(map_err)?;
+        if event_filter.topic_sets().is_empty() || addresses.as_ref().is_some_and(Vec::is_empty) {
+            return Ok(vec![]);
         }
-
-        for (idx, topic) in [event_filter.topic1(), event_filter.topic2(), event_filter.topic3()]
-            .into_iter()
-            .enumerate()
-        {
-            let values: Vec<[u8; 32]> = topic.iter().map(|t| t.0).collect();
-            if !values.is_empty() {
-                log_filter = match idx {
-                    0 => log_filter.and_topic1(values),
-                    1 => log_filter.and_topic2(values),
-                    _ => log_filter.and_topic3(values),
-                }
-                .map_err(map_err)?;
-            }
-        }
-
-        // Joined block numbers + timestamps let us stamp `block_timestamp` on each log,
-        // which lets the block clock skip its `eth_getBlockByNumber` batches entirely.
-        let query = Query::new()
-            .from_block(from_block)
-            .to_block_excl(to_block + 1)
-            .where_logs(log_filter)
-            .select_log_fields([
-                LogField::Removed,
-                LogField::LogIndex,
-                LogField::TransactionIndex,
-                LogField::TransactionHash,
-                LogField::BlockHash,
-                LogField::BlockNumber,
-                LogField::Address,
-                LogField::Data,
-                LogField::Topic0,
-                LogField::Topic1,
-                LogField::Topic2,
-                LogField::Topic3,
-            ])
-            .select_block_fields([BlockField::Number, BlockField::Timestamp]);
+        let query = build_log_query(event_filter, addresses, from_block, to_block)?;
 
         // `collect_arrow` paginates internally until the full requested range is covered,
         // so a successful return always means complete coverage of [from_block, to_block].
@@ -301,8 +315,11 @@ impl HypersyncProvider {
 
         // rindexer tracks sync progress off the last log's block number and handlers
         // assume chain order, so guarantee (block_number, log_index) ordering.
-        logs.sort_by_key(|log| (log.block_number, log.log_index));
-
+        if event_filter.topic_sets().len() > 1 {
+            crate::helpers::merge_log_alternatives(&mut logs);
+        } else {
+            logs.sort_by_key(|log| (log.block_number, log.log_index));
+        }
         Ok(logs)
     }
 }

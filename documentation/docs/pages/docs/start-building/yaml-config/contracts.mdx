@@ -358,6 +358,29 @@ contracts: // [!code focus]
                - 0x0338ce5020c447f7e668dc2ef778025ce398266b // [!code focus]
 ```
 
+For the same event, separate `indexed_filters` entries are OR alternatives.
+Positions inside one entry are combined with AND; values listed within a position
+are combined with OR. For example, a wallet's outgoing **or** incoming transfers use:
+
+```yaml
+indexed_filters:
+  - event_name: Transfer
+    indexed_1: ["0xd87b8e0db0cf9cbf9963c035a6ad72d614e37fd5"]
+  - event_name: Transfer
+    indexed_2: ["0xd87b8e0db0cf9cbf9963c035a6ad72d614e37fd5"]
+```
+
+A self-transfer matches both alternatives and is delivered once. RPC fetching
+must complete every alternative before handing the range to processing;
+HyperSync and shared-tip fetching use the same OR semantics. Filters for other
+event names do not constrain this event. This also applies to address-scoped and
+factory-discovered contract indexing.
+
+Older versions could omit alternatives after the first. To recover previously
+missed history, use a reviewed replay of the affected range and coordinate its
+progress and application receipts; see [PostgreSQL event replay](/docs/migrations/postgres-event-replay).
+Upgrading does not automatically replay earlier blocks.
+
 ### start_block
 
 The block to start indexing from, you can use the deployed block if you wish to get everything.

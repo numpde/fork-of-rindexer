@@ -600,21 +600,32 @@ pub fn filter_logs_for_stream(
     addresses: &Option<HashSet<Address>>,
     filter: &RindexerEventFilter,
 ) -> Vec<Log> {
-    let rpc_filter = Filter::new()
-        .event_signature(filter.event_signature())
-        .topic1(filter.topic1())
-        .topic2(filter.topic2())
-        .topic3(filter.topic3())
-        .from_block(filter.from_block())
-        .to_block(filter.to_block());
-    let rpc_filter = match addresses {
-        Some(addresses) if addresses.is_empty() => return Vec::new(),
-        Some(addresses) => {
-            rpc_filter.address(ValueOrArray::Array(addresses.iter().copied().collect()))
-        }
-        None => rpc_filter,
-    };
-    logs.iter().filter(|log| rpc_filter.rpc_matches(log)).cloned().collect()
+    if addresses.as_ref().is_some_and(HashSet::is_empty) {
+        return Vec::new();
+    }
+    let filters = filter
+        .topic_sets()
+        .iter()
+        .map(|topics| {
+            let rpc_filter = Filter::new()
+                .event_signature(filter.event_signature())
+                .topic1(topics[1].clone())
+                .topic2(topics[2].clone())
+                .topic3(topics[3].clone())
+                .from_block(filter.from_block())
+                .to_block(filter.to_block());
+            match addresses {
+                Some(addresses) => {
+                    rpc_filter.address(ValueOrArray::Array(addresses.iter().copied().collect()))
+                }
+                None => rpc_filter,
+            }
+        })
+        .collect::<Vec<_>>();
+    logs.iter()
+        .filter(|log| filters.iter().any(|filter| filter.rpc_matches(log)))
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]
@@ -1176,7 +1187,10 @@ mod tests {
             RindexerEventFilter::new_filter(
                 &topic0,
                 "Ev",
-                &FilterDetails { events: ValueOrArray::Value("Ev".to_string()), indexed_filters },
+                &FilterDetails {
+                    events: ValueOrArray::Value("Ev".to_string()),
+                    indexed_filters: indexed_filters.map(|filter| vec![filter]),
+                },
                 block,
                 block,
             )

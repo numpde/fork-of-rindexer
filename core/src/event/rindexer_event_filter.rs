@@ -23,7 +23,7 @@ pub enum BuildRindexerFilterError {
 pub struct SimpleEventFilter {
     pub address: Option<ValueOrArray<Address>>,
     pub topic_id: B256,
-    pub topics: [Topic; 4],
+    pub topics: Vec<[Topic; 4]>,
     pub current_block: U64,
     pub next_block: U64,
 }
@@ -60,7 +60,7 @@ pub struct FactoryFilter {
     pub network: String,
 
     pub topic_id: B256,
-    pub topics: [Topic; 4],
+    pub topics: Vec<[Topic; 4]>,
 
     pub clickhouse: Option<Arc<ClickhouseClient>>,
     pub postgres: Option<Arc<PostgresClient>>,
@@ -138,16 +138,10 @@ impl RindexerEventFilter {
         current_block: U64,
         next_block: U64,
     ) -> Result<RindexerEventFilter, BuildRindexerFilterError> {
-        let index_filter = address_details.indexed_filters.iter().find_map(|indexed_filters| {
-            indexed_filters.iter().find(|&n| n.event_name == event_name)
-        });
-
         Ok(RindexerEventFilter::Filter(SimpleEventFilter {
             address: Some(address_details.address.clone()),
             topic_id: *topic_id,
-            topics: index_filter
-                .map(|indexed_filter| indexed_filter.clone().into())
-                .unwrap_or_default(),
+            topics: Self::indexed_topics(event_name, address_details.indexed_filters.as_deref()),
             current_block,
             next_block,
         }))
@@ -155,7 +149,7 @@ impl RindexerEventFilter {
 
     pub fn new_filter(
         topic_id: &B256,
-        _: &str,
+        event_name: &str,
         filter_details: &FilterDetails,
         current_block: U64,
         next_block: U64,
@@ -163,11 +157,7 @@ impl RindexerEventFilter {
         Ok(RindexerEventFilter::Filter(SimpleEventFilter {
             address: None,
             topic_id: *topic_id,
-            topics: filter_details
-                .clone()
-                .indexed_filters
-                .map(|indexed_filter| indexed_filter.clone().into())
-                .unwrap_or_default(),
+            topics: Self::indexed_topics(event_name, filter_details.indexed_filters.as_deref()),
             current_block,
             next_block,
         }))
@@ -181,28 +171,45 @@ impl RindexerEventFilter {
         }
     }
 
+    pub(crate) fn indexed_topics(
+        event_name: &str,
+        filters: Option<&[crate::manifest::contract::EventInputIndexedFilters]>,
+    ) -> Vec<[Topic; 4]> {
+        let topics = filters
+            .into_iter()
+            .flatten()
+            .filter(|filter| filter.event_name == event_name)
+            .cloned()
+            .map(Into::into)
+            .collect::<Vec<_>>();
+        if topics.is_empty() {
+            vec![Default::default()]
+        } else {
+            topics
+        }
+    }
+
+    /// Each set is an AND across topic positions; sets are OR alternatives.
+    pub fn topic_sets(&self) -> &[[Topic; 4]] {
+        match self {
+            Self::Address(filter) | Self::Filter(filter) => &filter.topics,
+            Self::Factory(filter) => &filter.topics,
+        }
+    }
+
+    /// The first alternative's topic. Fetchers must use `topic_sets` for the full union.
     pub fn topic1(&self) -> Topic {
-        match self {
-            RindexerEventFilter::Address(filter) => filter.topics[1].clone(),
-            RindexerEventFilter::Filter(filter) => filter.topics[1].clone(),
-            RindexerEventFilter::Factory(filter) => filter.topics[1].clone(),
-        }
+        self.topic_sets().first().map(|topics| topics[1].clone()).unwrap_or_default()
     }
 
+    /// The first alternative's topic. Fetchers must use `topic_sets` for the full union.
     pub fn topic2(&self) -> Topic {
-        match self {
-            RindexerEventFilter::Address(filter) => filter.topics[2].clone(),
-            RindexerEventFilter::Filter(filter) => filter.topics[2].clone(),
-            RindexerEventFilter::Factory(filter) => filter.topics[2].clone(),
-        }
+        self.topic_sets().first().map(|topics| topics[2].clone()).unwrap_or_default()
     }
 
+    /// The first alternative's topic. Fetchers must use `topic_sets` for the full union.
     pub fn topic3(&self) -> Topic {
-        match self {
-            RindexerEventFilter::Address(filter) => filter.topics[3].clone(),
-            RindexerEventFilter::Filter(filter) => filter.topics[3].clone(),
-            RindexerEventFilter::Factory(filter) => filter.topics[3].clone(),
-        }
+        self.topic_sets().first().map(|topics| topics[3].clone()).unwrap_or_default()
     }
 
     pub fn to_block(&self) -> U64 {
@@ -257,7 +264,7 @@ impl RindexerEventFilter {
         RindexerEventFilter::Filter(SimpleEventFilter {
             address: None,
             topic_id: B256::ZERO,
-            topics: Default::default(),
+            topics: vec![Default::default()],
             current_block: U64::ZERO,
             next_block: U64::ZERO,
         })
@@ -309,7 +316,7 @@ mod tests {
         let f = RindexerEventFilter::Address(SimpleEventFilter {
             address: None,
             topic_id,
-            topics: Default::default(),
+            topics: vec![Default::default()],
             current_block: U64::ZERO,
             next_block: U64::ZERO,
         });
@@ -322,7 +329,7 @@ mod tests {
         let f = RindexerEventFilter::Filter(SimpleEventFilter {
             address: None,
             topic_id,
-            topics: Default::default(),
+            topics: vec![Default::default()],
             current_block: U64::ZERO,
             next_block: U64::ZERO,
         });
@@ -336,7 +343,7 @@ mod tests {
         let f = RindexerEventFilter::Filter(SimpleEventFilter {
             address: None,
             topic_id: B256::ZERO,
-            topics: Default::default(),
+            topics: vec![Default::default()],
             current_block: U64::from(42u64),
             next_block: U64::from(100u64),
         });
@@ -348,7 +355,7 @@ mod tests {
         let f = RindexerEventFilter::Filter(SimpleEventFilter {
             address: None,
             topic_id: B256::ZERO,
-            topics: Default::default(),
+            topics: vec![Default::default()],
             current_block: U64::from(42u64),
             next_block: U64::from(100u64),
         });
@@ -376,7 +383,7 @@ mod tests {
         let f = RindexerEventFilter::Filter(SimpleEventFilter {
             address: None,
             topic_id: B256::ZERO,
-            topics: Default::default(),
+            topics: vec![Default::default()],
             current_block: U64::ZERO,
             next_block: U64::from(999u64),
         });
@@ -389,7 +396,7 @@ mod tests {
         let f = RindexerEventFilter::Filter(SimpleEventFilter {
             address: None,
             topic_id: B256::ZERO,
-            topics: Default::default(),
+            topics: vec![Default::default()],
             current_block: U64::from(7u64),
             next_block: U64::ZERO,
         });
@@ -402,7 +409,7 @@ mod tests {
         let f = RindexerEventFilter::Address(SimpleEventFilter {
             address: None,
             topic_id: B256::ZERO,
-            topics: Default::default(),
+            topics: vec![Default::default()],
             current_block: U64::ZERO,
             next_block: U64::ZERO,
         });
@@ -437,7 +444,7 @@ mod tests {
         let f = RindexerEventFilter::Filter(SimpleEventFilter {
             address: Some(ValueOrArray::Value(addr)),
             topic_id: B256::ZERO,
-            topics: Default::default(),
+            topics: vec![Default::default()],
             current_block: U64::ZERO,
             next_block: U64::ZERO,
         });
@@ -453,7 +460,7 @@ mod tests {
         let f = RindexerEventFilter::Filter(SimpleEventFilter {
             address: Some(ValueOrArray::Array(vec![addr1, addr2])),
             topic_id: B256::ZERO,
-            topics: Default::default(),
+            topics: vec![Default::default()],
             current_block: U64::ZERO,
             next_block: U64::ZERO,
         });

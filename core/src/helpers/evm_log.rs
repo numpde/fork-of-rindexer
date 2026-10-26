@@ -142,3 +142,18 @@ pub fn halved_block_number(to_block: U64, from_block: U64) -> U64 {
     let halved_range = (to_block - from_block) / U64::from(2);
     from_block + halved_range
 }
+
+/// Combine successful alternative queries without changing Ethereum event identity.
+/// Hashes distinguish replacement history; removed notifications remain separate.
+pub(crate) fn merge_log_alternatives(logs: &mut Vec<alloy::rpc::types::Log>) {
+    logs.sort_by_key(|log| (log.block_number, log.transaction_index, log.log_index));
+    let mut seen = std::collections::HashSet::new();
+    logs.retain(|log| match (log.block_hash, log.transaction_hash, log.log_index) {
+        (Some(block), Some(transaction), Some(index)) => {
+            seen.insert((block, transaction, index, log.removed))
+        }
+        // Missing identity must reach the normal input validator, never disappear
+        // as an apparent duplicate of another malformed response.
+        _ => true,
+    });
+}

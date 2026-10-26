@@ -2,6 +2,7 @@
 
 ### Breaking changes
 -------------------------------------------------
+- breaking: handwritten `SimpleEventFilter.topics` and `FactoryFilter.topics` values must now be vectors of topic-position arrays; use `vec![old_topics]` for a single predicate. `FilterDetails.indexed_filters` now accepts the complete filter vector; wrap an existing singleton in `vec![filter]`. Fetch integrations must use `topic_sets()` for the full OR union; `topic1()`/`topic2()`/`topic3()` expose only its first alternative. YAML keys and single-filter behavior are unchanged.
 - breaking: table-state `@column` conditions now fail manifest validation with ClickHouse, `insert`, or reorg-enabled table networks. Use PostgreSQL `upsert`/`update`/`delete` with reorg handling disabled, or replace the condition with an event-only predicate; the unsupported paths previously dropped guards or could not recover their decisions.
 - breaking: PostgreSQL reorg journals now retain each event's sequence and row provenance, store typed values as JSONB, and use BIGINT transaction/log indices. Rebuild existing derived tables and `rindexer_internal.derived_op_log` from canonical history before resuming; old journals cannot restore this missing metadata. ClickHouse reorg configurations using derived `set`, `max` or `min` operations now fail at startup because their journals cannot restore exact values and provenance; use PostgreSQL for those operations.
 - breaking: handwritten callers of `native_block_channel` and `native_transfer_block_fetch` must pass the inclusive first unfinished block, rather than the last completed block. Convert saved progress exactly once with checked addition; a fresh start at genesis passes zero directly. YAML `native_transfers.networks[].start_block` remains inclusive and needs no configuration change.
@@ -27,6 +28,7 @@
 
 ### Bug fixes
 -------------------------------------------------
+- fix: all same-event `indexed_filters` alternatives now participate in RPC, shared-tip and HyperSync log fetching; overlapping alternatives deliver each canonical log once, and a failed alternative fails the whole RPC range.
 - fix: live indexing with nonzero `reorg_safe_distance` now retries unfinished safe blocks after transient RPC failures instead of stalling behind a reduced retry ceiling ([#484](https://github.com/joshstevens19/rindexer/pull/484)).
 - fix: rolling back a `cross_chain: true` table now invalidates only the reorganizing network's journal entries; shared aggregates retain unaffected networks' canonical contributions and wait for concurrent applications before recalculation.
 - fix: custom-table `update` and `delete` operations now enforce `if`/`filter` predicates containing `@column` references in PostgreSQL, including mixed event/table predicates.
