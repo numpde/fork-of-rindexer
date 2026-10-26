@@ -307,7 +307,9 @@ async fn start_server(
     skip_node_alias_plugin: bool,
 ) -> Result<Child, String> {
     Command::new(rindexer_graphql_exe)
-        .arg(connection_string)
+        // Scope this credential to the child instead of exposing it through argv
+        // or mutating the parent's environment shared with indexing tasks.
+        .env("RINDEXER_GRAPHQL_DATABASE_URL", connection_string)
         .arg(schemas)
         .arg(port.to_string())
         // graphql_limit

@@ -1,3 +1,28 @@
+const args = process.argv.slice(2);
+const connectionString = process.env.RINDEXER_GRAPHQL_DATABASE_URL;
+delete process.env.RINDEXER_GRAPHQL_DATABASE_URL;
+
+if (/^postgres(?:ql)?:\/\//i.test((args[0] || "").trimStart())) {
+    console.error("Cannot start GraphQL server: database URLs are not accepted in command-line arguments. Supply RINDEXER_GRAPHQL_DATABASE_URL in the child environment.");
+    process.exit(1);
+}
+if (!connectionString || !connectionString.trim()) {
+    console.error("Cannot start GraphQL server: RINDEXER_GRAPHQL_DATABASE_URL is missing or empty. Supply the database URL in the child environment before launching the server.");
+    process.exit(1);
+}
+if (args.length < 4 || args.length > 7) {
+    console.error("Cannot start GraphQL server: expected schemas and server options. Usage: rindexer-graphql <schemas> <port> <page_limit> <timeout> [<filterOnlyOnIndexedColumns> <disableAdvancedFilters> <skipNodeAliasPlugin>]; supply the database URL through RINDEXER_GRAPHQL_DATABASE_URL.");
+    process.exit(1);
+}
+
+const schemas = args[0].split(",");
+const port = parseInt(args[1]);
+let graphqlPageLimit = parseInt(args[2]);
+let graphqlTimeout = parseInt(args[3]);
+let filterOnlyOnIndexedColumns = args[4] === "true";
+let disableAdvancedFilters = args[5] === "true";
+let skipNodeAliasPlugin = args[6] === "true";
+
 const express = require('express')
 const cors = require('cors')
 const { postgraphile } = require("postgraphile");
@@ -5,22 +30,6 @@ const { makeWrapResolversPlugin } = require("graphile-utils");
 const PgSimplifyInflectorPlugin = require("@graphile-contrib/pg-simplify-inflector");
 const ConnectionFilterPlugin = require("postgraphile-plugin-connection-filter");
 const { PgNodeAliasPostGraphile } = require("graphile-build-pg");
-
-const args = process.argv.slice(2);
-
-if (args.length < 5) {
-    console.error("Usage: postgraphile <connectionString> <schemas> <port> <page_limit> <timeout> <filterOnlyOnIndexedColumns> <disableAdvancedFilters> <skipNodeAliasPlugin>");
-    process.exit(1);
-}
-
-const connectionString = args[0];
-const schemas = args[1].split(",");
-const port = parseInt(args[2]);
-let graphqlPageLimit = parseInt(args[3]);
-let graphqlTimeout = parseInt(args[4]);
-let filterOnlyOnIndexedColumns = args[5] === "true";
-let disableAdvancedFilters = args[6] === "true";
-let skipNodeAliasPlugin = args[7] === "true";
 
 const byteaToHex = makeWrapResolversPlugin(
     (context) => {

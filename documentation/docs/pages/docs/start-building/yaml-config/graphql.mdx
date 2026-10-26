@@ -105,3 +105,23 @@ graphql:
   filter_only_on_indexed_columns: true // [!code focus]
 ```
 
+
+
+## Direct GraphQL executable launchers
+
+Normal `rindexer` launches continue to use the existing PostgreSQL settings,
+including `DATABASE_URL`. The launcher automatically passes the connection URL
+to its GraphQL child without putting it in process arguments. No new YAML field
+or parent environment setting is required.
+
+Scripts that invoke the embedded GraphQL executable directly must now set
+`RINDEXER_GRAPHQL_DATABASE_URL` for that child and remove the old first positional
+connection URL. The positional arguments are now `schemas`, `port`, `page_limit`,
+`timeout`, followed by the optional `filterOnlyOnIndexedColumns`,
+`disableAdvancedFilters` and `skipNodeAliasPlugin` booleans. Missing/empty child
+credentials and positional database URLs stop startup before database setup;
+startup usage messages identify the required channel without echoing the URL.
+
+The Node entrypoint removes this extra environment value after reading it.
+This change removes credential exposure through command-line arguments; it
+does not replace normal protection of database credentials and process access.

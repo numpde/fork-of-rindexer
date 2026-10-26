@@ -53,7 +53,7 @@ test('entrypoint reads credentials from the child environment and preserves publ
 });
 
 test('entrypoint rejects absent or empty credentials without accepting a positional fallback', () => {
-    for (const environment of [{}, { RINDEXER_GRAPHQL_DATABASE_URL: '' }, { RINDEXER_GRAPHQL_DATABASE_URL: '   ' }]) {
+    for (const environment of [{}, { DATABASE_URL: sentinel }, { RINDEXER_GRAPHQL_DATABASE_URL: '' }, { RINDEXER_GRAPHQL_DATABASE_URL: '   ' }]) {
         const result = runEntrypoint(publicArguments, environment);
         assert.equal(result.exitCode, 1);
         assert.equal(result.database, undefined);
