@@ -82,6 +82,35 @@ impl ReorgCoordinator {
         self
     }
 
+    /// Capture the recovery tail before any backfill writes can be admitted.
+    pub(crate) async fn seed_history(&mut self, first_configured: u64) -> anyhow::Result<()> {
+        if !self.window.is_empty() {
+            return Ok(());
+        }
+        let provider =
+            self.provider.as_ref().context("Cannot initialize reorg history without a provider")?;
+        let tip = provider.get_block_number().await?;
+        let end = tip.to::<u64>();
+        let start = end
+            .saturating_sub(self.window.capacity().saturating_sub(1) as u64)
+            .max(first_configured);
+        if start > end {
+            return Ok(());
+        }
+        let numbers = (start..=end).map(U64::from).collect::<Vec<_>>();
+        let blocks = super::fetch_canonical_headers(provider.as_ref(), &numbers).await?;
+        for block in blocks {
+            self.persist_and_maybe_prune(
+                block.header.number,
+                block.header.hash,
+                block.header.parent_hash,
+            )
+            .await?;
+            self.window.insert(block.header.number, block.header.hash, block.header.parent_hash);
+        }
+        Ok(())
+    }
+
     /// Called on each new block during live indexing.
     /// Returns `Some(ReorgTask)` if a reorg is detected, `None` otherwise.
     pub async fn on_new_block(

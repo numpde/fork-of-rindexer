@@ -90,6 +90,56 @@ pub fn fetch_logs_stream(
             current_filter = current_filter.set_from_block(U64::from(resume_from));
         }
 
+        let monitor_stop = CancellationToken::new();
+        let _monitor_lifetime = monitor_stop.clone().drop_guard();
+        let monitor = reorg_coordinator.clone().map(|coordinator| {
+            let config = config.clone();
+            let traces = trace_registry.clone();
+            let stop = monitor_stop.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = stop.cancelled() => break,
+                        _ = config.cancel_token().cancelled() => break,
+                        _ = tokio::time::sleep(Duration::from_millis(200)) => {},
+                    }
+                    if !is_running() {
+                        break;
+                    }
+                    let network = config.network_contract();
+                    let Ok(Some(head)) = network.cached_provider.get_latest_block().await else {
+                        continue;
+                    };
+                    let registry = config.registry();
+                    let postgres = config.postgres();
+                    let clickhouse = config.clickhouse();
+                    let ctx = ReorgContext {
+                        postgres: postgres.as_deref(),
+                        clickhouse: clickhouse.as_ref(),
+                        registry: Some(&registry),
+                        trace_registry: traces.as_deref(),
+                    };
+                    let mut guard = coordinator.lock().await;
+                    if let Err(error) = detect_and_handle_reorg(
+                        &mut guard,
+                        head.header.number,
+                        head.header.hash,
+                        head.header.parent_hash,
+                        &config.info_log_name(),
+                        &ctx,
+                    )
+                    .await
+                    {
+                        error!(
+                            "{} - Historical reorg recovery failed: {}",
+                            config.info_log_name(),
+                            error
+                        );
+                    }
+                }
+            })
+        });
+
         let snapshot_to_block = current_filter.to_block();
         let from_block = current_filter.from_block();
 
@@ -264,60 +314,89 @@ pub fn fetch_logs_stream(
             }
         }
 
-        loop {
-            let (reorg_generation, rewind) = reorgs.snapshot();
-            if let Some(resume_from) = rewind {
-                current_filter = current_filter
-                    .set_from_block(U64::from(resume_from))
-                    .set_to_block(snapshot_to_block);
-            }
-            if current_filter.from_block() > snapshot_to_block {
-                break;
-            }
-            if !is_running() || config.cancel_token().is_cancelled() || tx.is_closed() {
-                break;
-            }
+        'historical: loop {
+            loop {
+                let (reorg_generation, rewind) = reorgs.snapshot();
+                if let Some(resume_from) = rewind {
+                    current_filter = current_filter
+                        .set_from_block(U64::from(resume_from))
+                        .set_to_block(snapshot_to_block);
+                }
+                if current_filter.from_block() > snapshot_to_block {
+                    break;
+                }
+                if !is_running() || config.cancel_token().is_cancelled() || tx.is_closed() {
+                    break;
+                }
 
-            let result = fetch_historic_logs_stream(
-                config.timestamps(),
-                config.network_contract().block_clock.clone(),
-                &config.network_contract().cached_provider,
-                &tx,
-                &config.topic_id(),
-                current_filter.clone(),
-                max_block_range_limitation,
-                snapshot_to_block,
-                &config.info_log_name(),
-                reorg_generation,
-            )
-            .await;
+                let result = fetch_historic_logs_stream(
+                    config.timestamps(),
+                    config.network_contract().block_clock.clone(),
+                    &config.network_contract().cached_provider,
+                    &tx,
+                    &config.topic_id(),
+                    current_filter.clone(),
+                    max_block_range_limitation,
+                    snapshot_to_block,
+                    &config.info_log_name(),
+                    reorg_generation,
+                )
+                .await;
 
-            // This check can be very noisy. We want to only sample this warning to notify
-            // the user, rather than warn on every log fetch.
-            if let Some(range) = max_block_range_limitation {
-                if range.to::<u64>() < 5000 && random_ratio(1, 20) {
-                    warn!(
+                // This check can be very noisy. We want to only sample this warning to notify
+                // the user, rather than warn on every log fetch.
+                if let Some(range) = max_block_range_limitation {
+                    if range.to::<u64>() < 5000 && random_ratio(1, 20) {
+                        warn!(
                         "{} - RPC PROVIDER IS SLOW - Slow indexing mode enabled, max block range limitation: {} blocks - we advise using a faster provider who can predict the next block ranges.",
                         &config.info_log_name(),
                         range
                     );
+                    }
+                }
+
+                if let Some(result) = result {
+                    // Useful for occasionally breaking out of temporary limitations or parsing errors
+                    // that lock down to a `1` block limitation. Returns back to the original
+                    let new_max_block_range_limitation = if random_bool(0.10) {
+                        original_max_limit
+                    } else {
+                        result.max_block_range_limitation
+                    };
+
+                    current_filter = result.next;
+                    max_block_range_limitation = new_max_block_range_limitation;
+                } else {
+                    break;
                 }
             }
 
-            if let Some(result) = result {
-                // Useful for occasionally breaking out of temporary limitations or parsing errors
-                // that lock down to a `1` block limitation. Returns back to the original
-                let new_max_block_range_limitation = if random_bool(0.10) {
-                    original_max_limit
-                } else {
-                    result.max_block_range_limitation
-                };
-
-                current_filter = result.next;
-                max_block_range_limitation = new_max_block_range_limitation;
-            } else {
+            if monitor.is_none() {
                 break;
             }
+            loop {
+                if !is_running() || config.cancel_token().is_cancelled() || tx.is_closed() {
+                    break 'historical;
+                }
+                let (_, rewind) = reorgs.snapshot();
+                if let Some(first) = rewind {
+                    current_filter = current_filter
+                        .set_from_block(U64::from(first))
+                        .set_to_block(snapshot_to_block);
+                    continue 'historical;
+                }
+                if reorgs
+                    .first_unfinished()
+                    .is_some_and(|first| first > snapshot_to_block.to::<u64>())
+                {
+                    break 'historical;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        monitor_stop.cancel();
+        if let Some(monitor) = monitor {
+            let _ = monitor.await;
         }
 
         info!(

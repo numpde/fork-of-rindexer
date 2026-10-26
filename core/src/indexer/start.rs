@@ -944,13 +944,8 @@ pub(super) async fn start_indexing_contract_events(
     let reorg_persistence =
         Arc::new(ReorgBlockHashPersistence::new(postgres.clone(), clickhouse.clone()));
 
-    // Build one ReorgCoordinator per network (shared across all events on that network).
-    // The first non-blocking event on each network takes ownership; subsequent events get None.
-    //
-    // Startup reorg validation MUST run before any indexing begins — including the
-    // historical phase — so that stale checkpoints are corrected before events are
-    // fetched.  Coordinators are only kept for live indexing; when we are in the
-    // historical-only pass they are dropped after validation.
+    // Every phase shares a network coordinator. Its original recovery tail must
+    // be persisted before historical writes, then survive the live handoff.
     let mut network_coordinators: HashMap<String, Arc<Mutex<ReorgCoordinator>>> = HashMap::new();
     for (network_name, (reorg_config, chain_id)) in &reorg_configs {
         let window_size = reorg_config
@@ -1013,14 +1008,26 @@ pub(super) async fn start_indexing_contract_events(
                 .map_err(StartIndexingError::ReorgRecovery)?;
             }
 
-            // Keep the coordinator in the map so non-blocking tasks (contract events
-            // and native-transfer fetchers) can share it during live indexing. In a
-            // pure historical pass the coordinator served its purpose (startup
-            // validation) and can be dropped.
-            if !no_live_indexing_forced {
-                network_coordinators
-                    .insert(network_name.clone(), Arc::new(Mutex::new(coordinator)));
-            }
+            let first_configured = registry
+                .events
+                .iter()
+                .flat_map(|event| event.contract.details.iter())
+                .filter(|detail| &detail.network == network_name)
+                .map(|detail| detail.start_block.map_or(0, |number| number.to::<u64>()))
+                .chain(
+                    trace_registry
+                        .events
+                        .iter()
+                        .flat_map(|event| event.trace_information.details.iter())
+                        .filter(|detail| &detail.network == network_name)
+                        .map(|detail| detail.start_block.map_or(0, |number| number.to::<u64>())),
+                )
+                .min()
+                .unwrap_or(0);
+            coordinator.seed_history(first_configured).await
+                .with_context(|| format!("Cannot start indexing network {network_name}: initial recovery history could not be captured"))
+                .map_err(StartIndexingError::ReorgRecovery)?;
+            network_coordinators.insert(network_name.clone(), Arc::new(Mutex::new(coordinator)));
         }
     }
 
@@ -1189,13 +1196,9 @@ pub(super) async fn start_indexing_contract_events(
             // ALL event tables for the network, so reorg rollbacks cover every table
             // regardless of which task drives detection. The Mutex serializes
             // `on_new_block`/`handle_reorg` calls so concurrent detection is idempotent.
-            let reorg_coordinator =
-                if event_processing_config.live_indexing() && !no_live_indexing_forced {
-                    let network_name = event_processing_config.network_contract().network.clone();
-                    network_coordinators.get(&network_name).cloned()
-                } else {
-                    None
-                };
+            let reorg_coordinator = network_coordinators
+                .get(&event_processing_config.network_contract().network)
+                .cloned();
 
             let process_event = tokio::spawn(process_non_blocking_event(
                 event_processing_config,
@@ -1206,120 +1209,13 @@ pub(super) async fn start_indexing_contract_events(
         }
     }
 
-    // Build per-network reorg coordinators for dependency events.
-    // Any coordinators left over in network_coordinators (not consumed by non-blocking events)
-    // are available for dependency events. Build new ones for networks only used in dependencies.
-    if !no_live_indexing_forced {
-        // Collect all networks needed by dependency events
-        let dep_networks: std::collections::HashSet<String> = dependency_event_processing_configs
-            .iter()
-            .flat_map(|dep| {
-                dep.events_config
-                    .iter()
-                    .filter(|e| e.live_indexing())
-                    .map(|e| e.network_contract().network.clone())
-            })
-            .collect();
-
-        // Build coordinators for networks that weren't already consumed
-        let mut dep_coordinators: HashMap<String, Arc<Mutex<ReorgCoordinator>>> = HashMap::new();
-        for network_name in &dep_networks {
-            // Share the network's coordinator if one already exists
-            if let Some(coord) = network_coordinators.get(network_name).cloned() {
-                dep_coordinators.insert(network_name.clone(), coord);
-                continue;
-            }
-
-            // Otherwise build a fresh one
-            if let Some((reorg_config, chain_id)) = reorg_configs.get(network_name) {
-                let window_size = reorg_config
-                    .window_size
-                    .unwrap_or_else(|| 2 * reorg_safe_distance_for_chain(*chain_id) as usize);
-                let event_tables =
-                    network_event_tables.get(network_name).cloned().unwrap_or_default();
-
-                let window = reorg_persistence.load(network_name, window_size).await
-            .with_context(|| format!("Cannot start indexing network {network_name}: persisted reorg window could not be loaded"))
-                .map_err(StartIndexingError::ReorgRecovery)?;
-                info!(
-                    "Dependency events - Loaded {} blocks into reorg window for network {}",
-                    window.len(),
-                    network_name
-                );
-
-                // Get a provider from any dependency event config for this network.
-                // Fall back to the trace registry so native-transfer-only networks still
-                // have a provider available when this branch is reached.
-                let provider = dependency_event_processing_configs
-                    .iter()
-                    .flat_map(|dep| dep.events_config.iter())
-                    .find(|e| e.network_contract().network == *network_name)
-                    .map(|e| e.network_contract().cached_provider.clone())
-                    .or_else(|| find_provider_in_trace_registry(&trace_registry, network_name));
-
-                if let Some(provider) = provider {
-                    let derived_tables =
-                        network_derived_tables.get(network_name).cloned().unwrap_or_default();
-                    let rollback_plan =
-                        network_rollback_plans.get(network_name).cloned().unwrap_or_default();
-                    let streams_clients = collect_streams_clients_for_network(
-                        &registry,
-                        &trace_registry,
-                        network_name,
-                    );
-                    register_network_reorg_distance_on_streams(
-                        manifest,
-                        network_name,
-                        *chain_id,
-                        &streams_clients,
-                    );
-
-                    let mut coordinator = ReorgCoordinator::new(
-                        network_name.clone(),
-                        window,
-                        Arc::clone(&reorg_persistence),
-                        provider,
-                        event_tables,
-                        derived_tables,
-                        streams_clients,
-                    )?
-                    .with_rollback_plan(rollback_plan);
-
-                    if let Some(startup_task) = coordinator.validate_on_startup().await
-                .with_context(|| format!("Cannot start indexing network {network_name}: canonical reorg history could not be validated"))
-                .map_err(StartIndexingError::ReorgRecovery)? {
-                warn!("Dependency events - Startup reorg detected on {} (fork_point: {}, depth: {}). Executing rollback.", network_name, startup_task.fork_point, startup_task.detection_point.saturating_sub(startup_task.fork_point) + 1);
-                let reorg_ctx = ReorgContext {
-                    postgres: postgres.as_deref(), clickhouse: clickhouse.as_ref(),
-                    registry: Some(&registry), trace_registry: Some(&trace_registry),
-                };
-                coordinator.handle_reorg(startup_task, &reorg_ctx).await
-                    .with_context(|| format!("Cannot start indexing network {network_name}: startup reorg rollback did not complete"))
-                .map_err(StartIndexingError::ReorgRecovery)?;
-            }
-
-                    let shared = Arc::new(Mutex::new(coordinator));
-                    dep_coordinators.insert(network_name.clone(), shared.clone());
-                    // Also share with the non-blocking network map so any native-transfer
-                    // task running on this network can reach the same coordinator.
-                    network_coordinators.insert(network_name.clone(), shared);
-                }
-            }
-        }
-
-        // Inject per-network coordinators into each dependency config group
-        for dep_config in &mut dependency_event_processing_configs {
-            let networks: std::collections::HashSet<String> = dep_config
-                .events_config
-                .iter()
-                .filter(|e| e.live_indexing())
-                .map(|e| e.network_contract().network.clone())
-                .collect();
-
-            for network_name in networks {
-                if let Some(coord) = dep_coordinators.remove(&network_name) {
-                    dep_config.reorg_coordinators.insert(network_name, coord);
-                }
+    // Dependency groups use the same validated, seeded network owner as every
+    // other stream; a second coordinator would split recovery history and locks.
+    for dep_config in &mut dependency_event_processing_configs {
+        for event in &dep_config.events_config {
+            let network = &event.network_contract().network;
+            if let Some(coordinator) = network_coordinators.get(network) {
+                dep_config.reorg_coordinators.insert(network.clone(), coordinator.clone());
             }
         }
     }
@@ -1439,11 +1335,8 @@ async fn start_indexing(
     // reorg coordinator: without one, buffered events would never flush and
     // would silently pile up until the process restarts.
     //
-    // During the historical leg of a historical+live run the coordinator map
-    // is intentionally empty (it's rebuilt for the live leg), so validating
-    // here would reject every finalized config. Defer to the live leg in that
-    // case; historical-only runs (no live leg to follow) validate now because
-    // no future pass will.
+    // Historical delivery does not flush live finalized buffers. Validate their
+    // live targets when that phase starts; historical-only runs validate now.
     if !no_live_indexing_forced || !manifest.has_any_live_indexing() {
         validate_finalized_delivery_targets(manifest, &network_coordinators)?;
     }

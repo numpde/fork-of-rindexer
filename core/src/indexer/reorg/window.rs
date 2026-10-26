@@ -31,6 +31,10 @@ impl BlockChainWindow {
         self.entries.len()
     }
 
+    pub(crate) fn capacity(&self) -> usize {
+        self.max_window_size
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }

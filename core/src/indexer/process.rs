@@ -77,14 +77,14 @@ pub async fn process_non_blocking_event(
 
 /// Processes historical logs for a blocking event that has dependencies.
 /// This function waits for the indexing to complete before returning.
-pub async fn process_blocking_event_historical_data(
+async fn process_blocking_event_historical_data(
     config: Arc<EventProcessingConfig>,
+    reorg_coordinator: Option<Arc<Mutex<ReorgCoordinator>>>,
+    trace_registry: Option<Arc<TraceCallbackRegistry>>,
 ) -> Result<(), Box<ProviderError>> {
     debug!("{} - Processing blocking event historical data", config.info_log_name());
 
-    // Historical data processing does not use reorg coordinator — reorgs are only
-    // handled during live indexing.
-    process_event_logs(config, true, true, None, None).await?;
+    process_event_logs(config, true, true, reorg_coordinator, trace_registry).await?;
 
     Ok(())
 }
@@ -402,10 +402,16 @@ async fn process_contract_events_with_dependencies(
             for event_processing_config in event_processing_configs {
                 let task = tokio::spawn({
                     let live_indexing_events = Arc::clone(&live_indexing_events);
+                    let coordinator = reorg_coordinators
+                        .get(&event_processing_config.network_contract().network)
+                        .cloned();
+                    let traces = trace_registry.clone();
                     async move {
-                        process_blocking_event_historical_data(Arc::clone(
-                            &event_processing_config,
-                        ))
+                        process_blocking_event_historical_data(
+                            Arc::clone(&event_processing_config),
+                            coordinator,
+                            Some(traces),
+                        )
                         .await?;
 
                         if event_processing_config.live_indexing() {
