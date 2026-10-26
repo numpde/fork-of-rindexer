@@ -8,6 +8,10 @@ use serde_json::Value;
 #[path = "template_amount_tests.rs"]
 mod template_amount_tests;
 
+#[cfg(test)]
+#[path = "template_literal_tests.rs"]
+mod template_literal_tests;
+
 #[derive(Debug, Clone)]
 pub struct Template {
     value: String,
