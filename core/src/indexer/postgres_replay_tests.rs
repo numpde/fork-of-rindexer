@@ -1669,3 +1669,6 @@ mod schema_override_tests;
 
 #[path = "table_timestamp_tests.rs"]
 mod table_timestamp_tests;
+
+#[path = "raw_column_collision_tests.rs"]
+mod raw_column_collision_tests;
