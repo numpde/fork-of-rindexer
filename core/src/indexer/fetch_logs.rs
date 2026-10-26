@@ -4309,3 +4309,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "indexed_filter_tests.rs"]
+mod indexed_filter_tests;
