@@ -3477,6 +3477,35 @@ pub(crate) struct PreparedTableOps<'t> {
     pub(crate) ops: Vec<PreparedOperation<'t>>,
 }
 
+fn condition_needs_block_timestamp(condition: &str) -> bool {
+    let Ok(expression) = parse_filter_expression(condition) else {
+        return false;
+    };
+    let mut needed = false;
+    expression.visit_variables(&mut |variable| {
+        needed |= variable.source() == crate::event::VariableSource::Event
+            && variable.base_name() == "rindexer_block_timestamp";
+    });
+    needed
+}
+
+fn value_needs_block_timestamp(value: &str) -> bool {
+    if is_conditional_value(value) {
+        if let Ok((condition, when_true, when_false)) = parse_conditional_value(value) {
+            return condition_needs_block_timestamp(&condition)
+                || value_needs_block_timestamp(&when_true)
+                || value_needs_block_timestamp(&when_false);
+        }
+    }
+    // Value templates and call arguments use dollar-prefixed references.
+    // Match the whole name so plain text and similarly named ABI fields do not
+    // acquire a timestamp dependency merely by mentioning this metadata name.
+    value.split('$').skip(1).any(|reference| {
+        reference.split(|character: char| !character.is_alphanumeric() && character != '_').next()
+            == Some("rindexer_block_timestamp")
+    })
+}
+
 /// Resolves the rows of every table operation for a batch of events.
 ///
 /// Does the RPC work (block timestamps, `$call` / `$call_static` via Multicall3), the
@@ -3505,34 +3534,49 @@ pub(crate) async fn prepare_table_operations<'t>(
         return Err("Shutdown requested".to_string());
     }
 
-    // Check if any table needs timestamps and prefetch them in batch
-    let any_table_needs_timestamp = tables.iter().any(|t| {
-        let handles_event = t.table.events.iter().any(|e| e.event == event_name);
-        if !handles_event {
-            return false;
+    let needs_timestamp_value = |value: &str| {
+        if value.contains("$constant(") {
+            events_data.iter().any(|(_, network, _)| {
+                resolve_all_constants_in_value(value, constants, network)
+                    .is_some_and(|resolved| value_needs_block_timestamp(&resolved))
+            })
+        } else {
+            value_needs_block_timestamp(value)
         }
-        // Built-in timestamp column enabled
-        if t.table.timestamp {
-            return true;
-        }
-        // Column mapping references $rindexer_block_timestamp (custom column using the
-        // built-in metadata). Without prefetch, this resolves to NULL when the RPC doesn't
-        // include blockTimestamp in eth_getLogs responses.
-        t.table.events.iter().any(|e| {
-            e.event == event_name
-                && e.operations.iter().any(|op| {
-                    op.where_clause.values().any(|v| v.contains("rindexer_block_timestamp"))
-                        || op
-                            .set
-                            .iter()
-                            .any(|s| s.effective_value().contains("rindexer_block_timestamp"))
-                })
+    };
+    let needs_timestamps = tables.iter().any(|table| {
+        table.table.events.iter().any(|event| {
+            event.event == event_name
+                && (table.table.timestamp
+                    || event.operations.iter().any(|operation| {
+                        operation.where_clause.values().any(|value| needs_timestamp_value(value))
+                            || operation
+                                .set
+                                .iter()
+                                .any(|column| needs_timestamp_value(column.effective_value()))
+                            || operation.condition().is_some_and(condition_needs_block_timestamp)
+                    }))
         })
     });
-
-    if any_table_needs_timestamp {
+    // Resolve one metadata snapshot before conditions, calls or row construction.
+    // A cache entry alone cannot help expressions that consume TxMetadata.
+    let hydrated_events = if needs_timestamps
+        && events_data.iter().any(|(_, _, metadata)| metadata.block_timestamp.is_none())
+    {
         prefetch_block_timestamps(events_data, &providers, true).await;
-    }
+        let mut hydrated = events_data.to_vec();
+        for (_, network, metadata) in &mut hydrated {
+            if metadata.block_timestamp.is_none() {
+                let timestamp = get_cached_block_timestamp(network, metadata.block_number, metadata.block_hash)
+                    .await.ok_or_else(|| format!("Cannot resolve required timestamp for {event_name} on {network}, block {} ({:#x}): provider prefetch supplied no matching header; table operations were not prepared", metadata.block_number, metadata.block_hash))?;
+                metadata.block_timestamp = Some(U256::from(timestamp));
+            }
+        }
+        Some(hydrated)
+    } else {
+        None
+    };
+    let events_data = hydrated_events.as_deref().unwrap_or(events_data);
 
     // Check if any table has $call or $call_static patterns and prefetch using Multicall3
     let any_table_has_calls = tables.iter().any(|t| {

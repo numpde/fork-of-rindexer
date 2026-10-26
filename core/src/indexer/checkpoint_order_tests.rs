@@ -142,7 +142,10 @@ impl Fixture {
     }
 
     fn cursor_path(&self) -> PathBuf {
-        self.directory.path().join("cursor/Contract/last-synced-blocks/contract-ethereum-value.txt")
+        self.directory.path().join("cursor/Contract/last-synced-blocks").join(format!(
+            "contract-ethereum-value-{}.txt",
+            self.config.network_contract().cursor_key()
+        ))
     }
 
     fn cursor(&self) -> String {
