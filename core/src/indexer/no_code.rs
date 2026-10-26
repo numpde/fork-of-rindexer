@@ -451,15 +451,14 @@ async fn apply_postgres_events(
         .zip(&new_events)
         .filter_map(|(row, is_new)| is_new.then_some(row.as_slice()))
         .collect();
-    if rows.is_empty() {
-        return Ok(0);
-    }
+    // A duplicate event can still complete a different subscription's range.
+    // Keep its cursor commit even when shared receipts suppress every effect.
     let table_events: Vec<_> = table_events
         .iter()
         .zip(&new_events)
         .filter_map(|(event, is_new)| is_new.then_some(event.clone()))
         .collect();
-    let prepared = if params.tables.is_empty() {
+    let prepared = if params.tables.is_empty() || rows.is_empty() {
         PreparedTableOps { ops: vec![] }
     } else {
         prepare_table_operations(
@@ -585,6 +584,7 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
                         first.found_in_request.from_block,
                         first.found_in_request.to_block,
                         first.tx_information.network.clone(),
+                        first.found_in_request.cursor_key.clone(),
                     ))
                 }
                 CallbackResult::Trace(event) => event.iter().find_map(|result| match result {
@@ -592,12 +592,13 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
                         found_in_request.from_block,
                         found_in_request.to_block,
                         tx_information.network.clone(),
+                        found_in_request.cursor_key.clone(),
                     )),
                     TraceResult::Block { .. } => None,
                 }),
             };
 
-            let (from_block, to_block, network) = match batch_meta {
+            let (from_block, to_block, network, cursor_key) = match batch_meta {
                 Some(meta) => meta,
                 None => {
                     debug!(
@@ -610,6 +611,14 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
                     return Ok(());
                 }
             };
+
+            let mixed_cursor = match &results {
+                CallbackResult::Event(events) => events.iter().any(|event| event.found_in_request.cursor_key != cursor_key),
+                CallbackResult::Trace(traces) => traces.iter().any(|trace| trace.metadata().0.cursor_key != cursor_key),
+            };
+            if mixed_cursor {
+                return Err(CallbackError::Permanent("Cannot apply a callback batch containing different subscription cursors; split it by subscription before retrying. This attempt made no writes".to_string()));
+            }
 
             let mut indexed_count = 0;
             let mut sql_bulk_data: Vec<Vec<EthereumSqlTypeWrapper>> = Vec::new();
@@ -788,6 +797,7 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
                     let cursor = atomic_pg_cursor.then(|| {
                         let schema = generate_indexer_contract_schema_name(&params.indexer_name, &params.contract_name);
                         BulkCursorUpdate {
+                            cursor_key: cursor_key.clone(),
                             internal_table_name: generate_internal_event_table_name(&schema, &params.event_info.name),
                             network: network.clone(), to_block: to_block.to(),
                         }

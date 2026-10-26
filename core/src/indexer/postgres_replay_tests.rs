@@ -353,7 +353,7 @@ impl Fixture {
             .await
             .unwrap()
             .get(0);
-        let position = self.client.query_one(&format!("SELECT last_synced_block::text FROM rindexer_internal.{cursor} WHERE network = 'ethereum'"), &[]).await.unwrap().get(0);
+        let position = self.client.query_one(&format!("SELECT max(last_synced_block)::text FROM rindexer_internal.{cursor} WHERE network = 'ethereum'"), &[]).await.unwrap().get(0);
         (count, amount, position)
     }
 

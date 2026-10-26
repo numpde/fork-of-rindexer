@@ -248,10 +248,11 @@ fn generate_internal_event_table_clickhouse(
             r#"
                 CREATE TABLE IF NOT EXISTS {} (
                     "network" String,
+                    "cursor_key" String DEFAULT '__event__',
                     "last_synced_block" UInt64
                 )
                     ENGINE = ReplacingMergeTree(last_synced_block)
-                    ORDER BY network;"#,
+                    ORDER BY (network,cursor_key);"#,
             table_name
         );
 

@@ -646,7 +646,9 @@ impl Harness {
                        "tx_hash" TEXT NOT NULL
                    );
                    CREATE TABLE rindexer_internal.{cursor_table} (
-                       "network" TEXT PRIMARY KEY,
+                       "network" TEXT,
+                       "cursor_key" TEXT DEFAULT '__event__',
+                       PRIMARY KEY (network,cursor_key),
                        "last_synced_block" NUMERIC NOT NULL
                    );
                    INSERT INTO rindexer_internal.{cursor_table} VALUES ('{NETWORK}', 0);"#,
@@ -678,6 +680,7 @@ impl Harness {
 
     fn cursor(&self, to_block: u64) -> BulkCursorUpdate {
         BulkCursorUpdate {
+            cursor_key: crate::event::cursor::NETWORK_CURSOR_KEY.to_string(),
             internal_table_name: self.cursor_table.clone(),
             network: NETWORK.to_string(),
             to_block,

@@ -157,3 +157,38 @@ proxy withholds a COMMIT response only after the server commits; the test reads
 the database independently before retrying. Native upstream execution is
 `cargo nextest run -p rindexer --lib -E 'test(/postgres_replay_tests::/)'`, with Docker
 available for Testcontainers.
+
+## Independent subscription cursors
+
+Each contract `details` query now owns its checkpoint within its event/network.
+The key includes the configured addresses or factory/filter scope, indexed-filter
+alternatives and `start_block`. Reordering equivalent alternatives keeps the key;
+changing coverage creates a new key. Extending `end_block` keeps the completed
+prefix. Application receipts remain shared between subscriptions, so overlapping
+queries do not repeat PostgreSQL effects.
+
+Stop all writers and back up storage before upgrading. PostgreSQL startup adds
+`cursor_key` to each internal event checkpoint table and changes its primary key
+to `(network, cursor_key)`. Existing rows retain `__event__`; their network-wide
+maximum is not copied into new contract subscriptions because it cannot prove
+that each query completed. Contract queries restart from their configured start.
+Existing history must have complete application receipts for replay to be safe;
+otherwise rebuild raw events, derived tables, journals, receipts and checkpoints
+from trusted history together. Native-transfer cursors keep their existing scope.
+
+Existing ClickHouse event checkpoint tables require a reviewed rebuild with
+`cursor_key String DEFAULT '__event__'` and `ORDER BY (network, cursor_key)`.
+Startup rejects an incompatible sorting key before admitting that subscription.
+Do not assign legacy progress to every new key: replay or rebuild the affected
+range, including downstream effects that do not have PostgreSQL replay receipts.
+CSV and stream-only contract checkpoints now have query-key suffixes and do not
+adopt the previous shared file. Their replay can repeat external deliveries;
+reconcile those consumers before restarting. Native checkpoint filenames remain
+unchanged.
+
+Handwritten Rust `LogFoundInRequest`, `BulkCursorUpdate` and `SyncConfig` literals
+must supply `cursor_key`. For contract work use `NetworkContract::cursor_key()`
+from the same configured subscription that fetched the range; native requests use
+`"__event__"`. Do not mix subscriptions in one no-code callback batch.
+`get_last_synced_block_number` now returns `Result<Option<U64>, String>`;
+propagate read failures rather than treating them as missing progress.

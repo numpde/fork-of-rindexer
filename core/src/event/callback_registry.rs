@@ -104,6 +104,8 @@ pub trait HasTxInformation {
 
 #[derive(Debug, Clone)]
 pub struct LogFoundInRequest {
+    /// Stable subscription identity, shared with its startup and checkpoint writers.
+    pub cursor_key: String,
     pub from_block: U64,
     pub to_block: U64,
 }
@@ -155,7 +157,11 @@ impl EventResult {
             log: log.clone(),
             decoded_data: network_contract.decode_log(log.inner),
             tx_information,
-            found_in_request: LogFoundInRequest { from_block: start_block, to_block: end_block },
+            found_in_request: LogFoundInRequest {
+                cursor_key: network_contract.cursor_key(),
+                from_block: start_block,
+                to_block: end_block,
+            },
         })
     }
 
@@ -407,7 +413,7 @@ pub enum TraceResult {
 }
 
 impl TraceResult {
-    fn metadata(&self) -> (&LogFoundInRequest, &TxInformation) {
+    pub(crate) fn metadata(&self) -> (&LogFoundInRequest, &TxInformation) {
         match self {
             Self::NativeTransfer { found_in_request, tx_information, .. }
             | Self::Block { found_in_request, tx_information, .. } => {
@@ -449,7 +455,11 @@ impl TraceResult {
                 transaction_index: trace.transaction_position.unwrap_or(0),
                 log_index: U256::from(0),
             },
-            found_in_request: LogFoundInRequest { from_block: start_block, to_block: end_block },
+            found_in_request: LogFoundInRequest {
+                cursor_key: crate::event::cursor::NETWORK_CURSOR_KEY.to_string(),
+                from_block: start_block,
+                to_block: end_block,
+            },
         }
     }
 
@@ -501,7 +511,11 @@ impl TraceResult {
                 transaction_index,
                 log_index: U256::from(0),
             },
-            found_in_request: LogFoundInRequest { from_block: start_block, to_block: end_block },
+            found_in_request: LogFoundInRequest {
+                cursor_key: crate::event::cursor::NETWORK_CURSOR_KEY.to_string(),
+                from_block: start_block,
+                to_block: end_block,
+            },
         })
     }
 
@@ -528,7 +542,11 @@ impl TraceResult {
                 log_index: U256::from(0),
             },
             block: Box::new(block),
-            found_in_request: LogFoundInRequest { from_block: start_block, to_block: end_block },
+            found_in_request: LogFoundInRequest {
+                cursor_key: crate::event::cursor::NETWORK_CURSOR_KEY.to_string(),
+                from_block: start_block,
+                to_block: end_block,
+            },
         }
     }
 }
@@ -1049,7 +1067,11 @@ mod tests {
     }
 
     fn test_found_in_request(from_block: u64, to_block: u64) -> LogFoundInRequest {
-        LogFoundInRequest { from_block: U64::from(from_block), to_block: U64::from(to_block) }
+        LogFoundInRequest {
+            cursor_key: crate::event::cursor::NETWORK_CURSOR_KEY.to_string(),
+            from_block: U64::from(from_block),
+            to_block: U64::from(to_block),
+        }
     }
 
     //Minimal valid json for alloy::network::AnyRpcBlock deserialization

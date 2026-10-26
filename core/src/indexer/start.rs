@@ -152,8 +152,12 @@ async fn get_start_end_block(
         }
     }
 
+    crate::indexer::last_synced::initialize_subscription_cursor(&config)
+        .await
+        .map_err(StartIndexingError::UnknownError)?;
     let last_known_start_block = if manifest_start_block.is_some() {
-        let last_synced_block = get_last_synced_block_number(config).await;
+        let last_synced_block =
+            get_last_synced_block_number(config).await.map_err(StartIndexingError::UnknownError)?;
 
         if let Some(value) = last_synced_block {
             let start_from = value + U64::from(1);
@@ -264,6 +268,7 @@ pub(crate) async fn start_indexing_traces(
                 contract_name: &first_event.contract_name,
                 event_name: &first_event.event_name,
                 network: &network_name,
+                cursor_key: crate::event::cursor::NETWORK_CURSOR_KEY,
             };
 
             let (start_block, end_block, indexing_distance_from_head) = get_start_end_block(
@@ -795,6 +800,7 @@ pub(super) async fn start_indexing_contract_events(
                     contract_name: &event.contract.name,
                     event_name: &event.event_name,
                     network: &network_contract.network,
+                    cursor_key: &network_contract.cursor_key(),
                 };
 
                 let result = get_start_end_block(
@@ -858,7 +864,13 @@ pub(super) async fn start_indexing_contract_events(
                 &event.event_name,
             )?
         };
+        // Query details share raw history and derived effects. Register rollback
+        // once per source event/network, while rewinding every subscription cursor.
+        let mut registered_networks = std::collections::HashSet::new();
         for network_contract in event.contract.details.iter() {
+            if !registered_networks.insert(&network_contract.network) {
+                continue;
+            }
             let schema =
                 generate_indexer_contract_schema_name(&event.indexer_name, &event.contract.name);
             let table_name = camel_to_snake(&event.event_name);
@@ -1605,6 +1617,7 @@ contracts:
             contract_name: "test_contract",
             event_name: "test_event",
             network: "ethereum",
+            cursor_key: crate::event::cursor::NETWORK_CURSOR_KEY,
         }
     }
 

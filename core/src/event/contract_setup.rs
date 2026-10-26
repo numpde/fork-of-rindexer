@@ -37,6 +37,10 @@ pub struct NetworkContract {
 }
 
 impl NetworkContract {
+    pub fn cursor_key(&self) -> String {
+        super::cursor::subscription_key(&self.indexing_contract_setup, self.start_block)
+    }
+
     pub fn decode_log(&self, log: Log) -> Arc<dyn Any + Send + Sync> {
         (self.decoder)(log.topics().to_vec(), log.data.data)
     }

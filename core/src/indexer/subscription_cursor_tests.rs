@@ -20,7 +20,7 @@ use alloy::{
 };
 use tokio::sync::Notify;
 
-async fn run_subscriptions(fixture: &Fixture, fail_second: bool) {
+async fn run_subscriptions(fixture: &Fixture, fail_second: bool) -> Vec<String> {
     let apply = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
     let first_committed = Arc::new(Notify::new());
     let callback: EventCallbackType = Arc::new(move |events| {
@@ -72,6 +72,8 @@ async fn run_subscriptions(fixture: &Fixture, fail_second: bool) {
         serde_json::from_value(json!({"name":"Replay","project_type":"no-code","contracts":[],
         "networks":[{"name":"ethereum","chain_id":1,"rpc":"http://unused.invalid"}]}))
         .unwrap();
+    let keys =
+        registry.events[0].contract.details.iter().map(NetworkContract::cursor_key).collect();
     let registry = registry.complete();
     let progress = IndexingEventsProgressState::monitor(&registry.events, &[], None).await;
     let (handles, _, _, _, _) = crate::indexer::start::start_indexing_contract_events(
@@ -103,6 +105,7 @@ async fn run_subscriptions(fixture: &Fixture, fail_second: bool) {
     } else {
         assert!(results.iter().all(Result::is_ok));
     }
+    keys
 }
 
 #[tokio::test]
@@ -113,7 +116,16 @@ async fn postgres_restart_resumes_each_filtered_subscription_without_losing_or_r
         {"name":"value","type":"uint256","indexed":false}
     ]});
     let fixture = Fixture::with_event(definition, "Contract").await;
-    run_subscriptions(&fixture, true).await;
+    let keys = run_subscriptions(&fixture, true).await;
+    let schema = generate_indexer_contract_schema_name(
+        &fixture.params.indexer_name,
+        &fixture.params.contract_name,
+    );
+    let table = generate_internal_event_table_name(&schema, &fixture.params.event_info.name);
+    for (key, expected) in keys.iter().zip(["100", "0"]) {
+        let actual: String = fixture.client.query_one(&format!("SELECT last_synced_block::text FROM rindexer_internal.{table} WHERE network='ethereum' AND cursor_key=$1"), &[key]).await.unwrap().get(0);
+        assert_eq!(actual, expected, "each subscription owns its durable prefix");
+    }
     let before = fixture.position().await;
     assert_eq!(before.0, 1, "A committed before B failed");
     assert_eq!(before.1, "10");
@@ -131,5 +143,76 @@ async fn postgres_restart_resumes_each_filtered_subscription_without_losing_or_r
         .unwrap()
         .get(0);
     assert_eq!(receipts, 2);
+    for key in &keys {
+        let actual: String = fixture.client.query_one(&format!("SELECT last_synced_block::text FROM rindexer_internal.{table} WHERE network='ethereum' AND cursor_key=$1"), &[key]).await.unwrap().get(0);
+        assert_eq!(actual, "100");
+    }
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_legacy_progress_is_not_adopted_and_rollback_rewinds_all_query_keys() {
+    let fixture = Fixture::new().await;
+    let schema = generate_indexer_contract_schema_name(
+        &fixture.params.indexer_name,
+        &fixture.params.contract_name,
+    );
+    let table = generate_internal_event_table_name(&schema, &fixture.params.event_info.name);
+    fixture.client.batch_execute(&format!("DROP TABLE rindexer_internal.{table}; CREATE TABLE rindexer_internal.{table} (network TEXT PRIMARY KEY,last_synced_block NUMERIC); INSERT INTO rindexer_internal.{table} VALUES ('ethereum',900)")).await.unwrap();
+    let ddl = generate_tables_for_indexer_sql(fixture._directory.path(), &fixture.indexer, false)
+        .unwrap();
+    fixture.client.batch_execute(ddl.as_str()).await.unwrap();
+    fixture.client.batch_execute(ddl.as_str()).await.unwrap();
+    // Model independently completed prefixes and another unaffected network.
+    fixture.client.batch_execute(&format!("INSERT INTO rindexer_internal.{table} (network,cursor_key,last_synced_block) VALUES ('ethereum','v1:a',100),('ethereum','v1:b',80),('other','v1:a',200)")).await.unwrap();
+    let legacy: String = fixture.client.query_one(&format!("SELECT last_synced_block::text FROM rindexer_internal.{table} WHERE network='ethereum' AND cursor_key='__event__'"), &[]).await.unwrap().get(0);
+    assert_eq!(legacy, "900", "migration retains history without copying it into subscriptions");
+    fixture
+        .client
+        .reorg_rollback_transaction(&[], "ethereum", 98, 100, &[], &[&table])
+        .await
+        .unwrap();
+    let rows = fixture.client.query(&format!("SELECT network,cursor_key,last_synced_block::text FROM rindexer_internal.{table} ORDER BY network,cursor_key"), &[]).await.unwrap();
+    let actual: Vec<(String, String, String)> =
+        rows.iter().map(|row| (row.get(0), row.get(1), row.get(2))).collect();
+    assert_eq!(
+        actual,
+        vec![
+            ("ethereum".into(), "__event__".into(), "97".into()),
+            ("ethereum".into(), "v1:a".into(), "97".into()),
+            ("ethereum".into(), "v1:b".into(), "80".into()),
+            ("other".into(), "v1:a".into(), "200".into())
+        ]
+    );
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_overlapping_subscriptions_share_receipts_but_advance_separate_cursors() {
+    let fixture = Fixture::new().await;
+    let schema = generate_indexer_contract_schema_name(
+        &fixture.params.indexer_name,
+        &fixture.params.contract_name,
+    );
+    let table = generate_internal_event_table_name(&schema, &fixture.params.event_info.name);
+    fixture.client.batch_execute(&format!("INSERT INTO rindexer_internal.{table} (network,cursor_key,last_synced_block) VALUES ('ethereum','v1:a',0),('ethereum','v1:b',0)")).await.unwrap();
+    let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+    for key in ["v1:a", "v1:b"] {
+        let mut events = fixture.events(&[10]);
+        events[0].found_in_request.cursor_key = key.into();
+        callback(events).await.unwrap();
+    }
+    let position = fixture.position().await;
+    assert_eq!((position.0, position.1), (1, "10".into()));
+    let rows = fixture.client.query(&format!("SELECT last_synced_block::text FROM rindexer_internal.{table} WHERE cursor_key IN ('v1:a','v1:b')"), &[]).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| row.get::<_, String>(0) == position.2));
+    let receipts: i64 = fixture
+        .client
+        .query_one("SELECT count(*) FROM rindexer_internal.event_applications", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(receipts, 1);
     fixture.finish().await;
 }

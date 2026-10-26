@@ -253,17 +253,25 @@ impl ClickhouseClient {
         // re-index from the rewound block regardless of whether later steps completed.
         let rewind_block = fork_point.saturating_sub(1);
         for table in checkpoint_tables {
+            #[derive(clickhouse::Row, serde::Deserialize)]
+            struct Cursor {
+                cursor_key: String,
+                last_synced_block: u64,
+            }
+            let cursors = self.query_all::<Cursor>(&format!("SELECT cursor_key,last_synced_block FROM rindexer_internal.{table} FINAL WHERE network = '{network}'")).await?;
             let delete_sql = format!(
                 "ALTER TABLE rindexer_internal.{} DELETE WHERE network = '{}' SETTINGS mutations_sync = 1",
                 table, network
             );
             self.execute(&delete_sql).await?;
 
-            let insert_sql = format!(
-                "INSERT INTO rindexer_internal.{} (network, last_synced_block) VALUES ('{}', {})",
-                table, network, rewind_block
-            );
-            self.execute(&insert_sql).await?;
+            for cursor in cursors {
+                let insert_sql = format!(
+                    "INSERT INTO rindexer_internal.{table} (network,cursor_key,last_synced_block) VALUES ('{network}','{}',{})",
+                    cursor.cursor_key, cursor.last_synced_block.min(rewind_block)
+                );
+                self.execute(&insert_sql).await?;
+            }
         }
 
         // Step 2: Count affected rows and collect tx hashes before deletion.

@@ -356,6 +356,10 @@ pub(crate) async fn replay_lagging_buffer_after_rollback(
     let old_generation = buffered.reorg_generation;
     let schema = generate_indexer_contract_schema_name(indexer_name, "Contract");
     let checkpoint = generate_internal_event_table_name(&schema, "Value");
+    let cursor_key = fixture.config.network_contract().cursor_key();
+    // This fixture enters below startup: seed the subscription's durable prefix
+    // explicitly rather than relying on the unrelated legacy network cursor.
+    postgres.execute(&format!("INSERT INTO rindexer_internal.{checkpoint} (network,cursor_key,last_synced_block) VALUES ('ethereum',$1,80)"), &[&cursor_key]).await.unwrap();
     let mut coordinator = ReorgCoordinator::new(
         "ethereum".to_string(),
         BlockChainWindow::try_new(20).unwrap(),
@@ -421,7 +425,7 @@ pub(crate) async fn replay_lagging_buffer_after_rollback(
         .await
         .unwrap();
         if stale {
-            let cursor: String = postgres.query_one(&format!("SELECT last_synced_block::text FROM rindexer_internal.{checkpoint} WHERE network = 'ethereum'"), &[]).await.unwrap().get(0);
+            let cursor: String = postgres.query_one(&format!("SELECT last_synced_block::text FROM rindexer_internal.{checkpoint} WHERE network = 'ethereum' AND cursor_key=$1"), &[&cursor_key]).await.unwrap().get(0);
             assert_eq!(cursor, "80", "discarded work cannot advance durable progress");
         }
     }

@@ -30,8 +30,8 @@ async fn setup() -> (testcontainers::ContainerAsync<Postgres>, PostgresClient) {
         .batch_execute(&format!(
             r#"CREATE TABLE {EVENT_TABLE} ("value" NUMERIC NOT NULL);
                CREATE SCHEMA rindexer_internal;
-               CREATE TABLE rindexer_internal.{CURSOR_TABLE} ("network" TEXT PRIMARY KEY, "last_synced_block" NUMERIC);
-               INSERT INTO rindexer_internal.{CURSOR_TABLE} VALUES ('{NETWORK}', 0);"#
+               CREATE TABLE rindexer_internal.{CURSOR_TABLE} ("network" TEXT, "cursor_key" TEXT DEFAULT '__event__', "last_synced_block" NUMERIC, PRIMARY KEY (network,cursor_key));
+               INSERT INTO rindexer_internal.{CURSOR_TABLE} (network,last_synced_block) VALUES ('{NETWORK}', 0);"#
         ))
         .await
         .expect("failed to create test tables");
@@ -45,6 +45,7 @@ fn rows(n: u64) -> Vec<Vec<EthereumSqlTypeWrapper>> {
 
 fn cursor(to_block: u64) -> BulkCursorUpdate {
     BulkCursorUpdate {
+        cursor_key: "__event__".to_string(),
         internal_table_name: CURSOR_TABLE.to_string(),
         network: NETWORK.to_string(),
         to_block,
@@ -120,6 +121,7 @@ async fn failed_cursor_update_rolls_back_the_event_batch() {
     // batch insert succeeded inside the transaction — the whole commit must
     // roll back, leaving neither rows nor cursor (the atomicity contract).
     let broken = BulkCursorUpdate {
+        cursor_key: "__event__".to_string(),
         internal_table_name: "does_not_exist".to_string(),
         network: NETWORK.to_string(),
         to_block: 300,
@@ -146,6 +148,7 @@ async fn missing_cursor_row_rolls_back_while_cursor_ahead_commits() {
     // roll back and error loudly — committing rows whose cursor can never
     // advance would re-index from the manifest start forever.
     let other_network = BulkCursorUpdate {
+        cursor_key: "__event__".to_string(),
         internal_table_name: CURSOR_TABLE.to_string(),
         network: "base".to_string(),
         to_block: 100,

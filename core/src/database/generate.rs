@@ -92,12 +92,31 @@ fn generate_internal_event_table_sql(
         let table_name = generate_internal_event_table_name(schema_name, &event_info.name);
 
         let create_table_query = format!(
-            r#"CREATE TABLE IF NOT EXISTS rindexer_internal.{table_name} ("network" TEXT PRIMARY KEY, "last_synced_block" NUMERIC);"#
+            r#"CREATE TABLE IF NOT EXISTS rindexer_internal.{table_name} (
+                network TEXT NOT NULL,
+                cursor_key TEXT NOT NULL DEFAULT '__event__',
+                last_synced_block NUMERIC,
+                PRIMARY KEY (network,cursor_key)
+            );
+            ALTER TABLE rindexer_internal.{table_name} ADD COLUMN IF NOT EXISTS cursor_key TEXT NOT NULL DEFAULT '__event__';
+            DO $cursor_migration$
+            DECLARE old_key TEXT;
+            BEGIN
+                SELECT conname INTO old_key FROM pg_constraint
+                WHERE conrelid = 'rindexer_internal.{table_name}'::regclass AND contype = 'p'
+                  AND replace(pg_get_constraintdef(oid),' ','') <> 'PRIMARYKEY(network,cursor_key)';
+                IF old_key IS NOT NULL THEN
+                    EXECUTE format('ALTER TABLE rindexer_internal.{table_name} DROP CONSTRAINT %I',old_key);
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'rindexer_internal.{table_name}'::regclass AND contype = 'p') THEN
+                    ALTER TABLE rindexer_internal.{table_name} ADD PRIMARY KEY (network,cursor_key);
+                END IF;
+            END $cursor_migration$;"#
         );
 
         let insert_queries = networks.iter().map(|network| {
             format!(
-                r#"INSERT INTO rindexer_internal.{table_name} ("network", "last_synced_block") VALUES ('{network}', 0) ON CONFLICT ("network") DO NOTHING;"#,
+                r#"INSERT INTO rindexer_internal.{table_name} ("network", "last_synced_block") VALUES ('{network}', 0) ON CONFLICT ("network", "cursor_key") DO NOTHING;"#,
             )
         }).collect::<Vec<_>>().join("\n");
 

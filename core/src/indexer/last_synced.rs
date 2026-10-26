@@ -33,9 +33,15 @@ async fn get_last_synced_block_number_file(
     contract_name: &str,
     network: &str,
     event_name: &str,
+    cursor_key: &str,
 ) -> Result<Option<U64>, UpdateLastSyncedBlockNumberFile> {
-    let file_path =
-        build_last_synced_block_number_file(full_path, contract_name, network, event_name);
+    let file_path = build_last_synced_block_number_file(
+        full_path,
+        contract_name,
+        network,
+        event_name,
+        cursor_key,
+    );
 
     let path = Path::new(&file_path);
 
@@ -66,13 +72,22 @@ fn build_last_synced_block_number_file(
     contract_name: &str,
     network: &str,
     event_name: &str,
+    cursor_key: &str,
 ) -> String {
-    let path = full_path.join(contract_name).join("last-synced-blocks").join(format!(
-        "{}-{}-{}.txt",
+    let filename = format!(
+        "{}-{}-{}",
         contract_name.to_lowercase(),
         network.to_lowercase(),
         event_name.to_lowercase()
-    ));
+    );
+    // Preserve the native pipeline's historical filename. Contract subscriptions
+    // never read that shared file because it cannot prove their own completeness.
+    let filename = if cursor_key == crate::event::cursor::NETWORK_CURSOR_KEY {
+        format!("{filename}.txt")
+    } else {
+        format!("{filename}-{cursor_key}.txt")
+    };
+    let path = full_path.join(contract_name).join("last-synced-blocks").join(filename);
 
     path.to_string_lossy().into_owned()
 }
@@ -88,75 +103,68 @@ pub struct SyncConfig<'a> {
     pub contract_name: &'a str,
     pub event_name: &'a str,
     pub network: &'a str,
+    pub cursor_key: &'a str,
 }
 
-pub async fn get_last_synced_block_number(config: SyncConfig<'_>) -> Option<U64> {
-    // 1. Database storage takes priority (matches write-side priority in
-    //    update_progress_and_last_synced_task which uses postgres > clickhouse > csv > stream)
+/// Seed only this query's cursor. A legacy network maximum cannot establish
+/// completeness for any one independently scheduled manifest detail.
+pub(crate) async fn initialize_subscription_cursor(config: &SyncConfig<'_>) -> Result<(), String> {
+    let schema = generate_indexer_contract_schema_name(config.indexer_name, config.contract_name);
+    if let Some(postgres) = config.postgres {
+        let table = generate_internal_event_table_name(&schema, config.event_name);
+        postgres.execute(&format!("INSERT INTO rindexer_internal.{table} (network,cursor_key,last_synced_block) VALUES ($1,$2,0) ON CONFLICT (network,cursor_key) DO NOTHING"), &[&config.network,&config.cursor_key]).await.map_err(|error| format!("Cannot initialize subscription cursor {table}/{}: {error}. Apply the reviewed cursor schema migration before indexing; no subscription progress was inferred from a legacy maximum",config.cursor_key))?;
+    } else if let Some(clickhouse) = config.clickhouse {
+        #[derive(Row, Deserialize)]
+        struct Cursor {
+            count: u64,
+        }
+        let table = generate_internal_event_table_name_no_shorten(&schema, config.event_name);
+        #[derive(Row, Deserialize)]
+        struct SortingKey {
+            sorting_key: String,
+        }
+        let sorting = clickhouse.query_one::<SortingKey>(&format!("SELECT sorting_key FROM system.tables WHERE database = 'rindexer_internal' AND name = '{table}'")).await.map_err(|error| format!("Cannot inspect ClickHouse cursor table {table}: {error}"))?;
+        if sorting
+            .sorting_key
+            .replace(' ', "")
+            .trim_start_matches("tuple")
+            .trim_start_matches('(')
+            .trim_end_matches(')')
+            != "network,cursor_key"
+        {
+            return Err(format!("Cannot resume ClickHouse cursor table {table}: sorting key is {}. Rebuild the cursor table with ORDER BY (network,cursor_key) before indexing; a network-only key merges independent subscriptions", sorting.sorting_key));
+        }
+        let row = clickhouse.query_one::<Cursor>(&format!("SELECT count() AS count FROM rindexer_internal.{table} FINAL WHERE network = '{}' AND cursor_key = '{}'",config.network,config.cursor_key)).await.map_err(|error| format!("Cannot initialize subscription cursor {table}/{}: {error}. Existing ClickHouse cursor tables require a reviewed rebuild with ORDER BY (network,cursor_key) before indexing",config.cursor_key))?;
+        if row.count == 0 {
+            clickhouse.execute(&format!("INSERT INTO rindexer_internal.{table} (network,cursor_key,last_synced_block) VALUES ('{}','{}',0)",config.network,config.cursor_key)).await.map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
 
-    // Query Postgres for last synced block
+pub async fn get_last_synced_block_number(config: SyncConfig<'_>) -> Result<Option<U64>, String> {
     if let Some(postgres) = config.postgres {
         let schema =
             generate_indexer_contract_schema_name(config.indexer_name, config.contract_name);
-        let table_name = generate_internal_event_table_name(&schema, config.event_name);
-        let query = format!(
-            "SELECT last_synced_block FROM rindexer_internal.{table_name} WHERE network = $1"
-        );
-
-        return match postgres.query_one(&query, &[&config.network]).await {
-            Ok(row) => {
-                let result: Decimal = row.get("last_synced_block");
-                let parsed =
-                    U64::from_str(&result.to_string()).expect("Failed to parse last_synced_block");
-                if parsed.is_zero() {
-                    None
-                } else {
-                    Some(parsed)
-                }
-            }
-            Err(e) => {
-                error!("Error fetching last synced block: {:?}", e);
-                None
-            }
-        };
+        let table = generate_internal_event_table_name(&schema, config.event_name);
+        let row = postgres.query_one(&format!("SELECT last_synced_block::text FROM rindexer_internal.{table} WHERE network = $1 AND cursor_key = $2"), &[&config.network, &config.cursor_key]).await.map_err(|error| format!("Cannot read subscription cursor {table}/{}: {error}",config.cursor_key))?;
+        let value: String = row.get(0);
+        let value = U64::from_str(&value).map_err(|error| {
+            format!("Cannot parse subscription cursor {table}/{}: {error}", config.cursor_key)
+        })?;
+        return Ok((!value.is_zero()).then_some(value));
     }
-
-    // Query ClickHouse for last synced block
     if let Some(clickhouse) = config.clickhouse {
         #[derive(Row, Deserialize)]
         struct LastBlock {
             last_synced_block: u64,
         }
-
         let schema =
             generate_indexer_contract_schema_name(config.indexer_name, config.contract_name);
-        let table_name = generate_internal_event_table_name_no_shorten(&schema, config.event_name);
-        let query = format!(
-            "SELECT last_synced_block FROM rindexer_internal.{table_name} FINAL WHERE network = '{}'",
-            config.network
-        );
-
-        let row = clickhouse.query_one::<LastBlock>(&query).await;
-
-        return match row {
-            Ok(row) => {
-                let result = row.last_synced_block.to_string();
-                let parsed =
-                    U64::from_str(&result.to_string()).expect("Failed to parse last_synced_block");
-
-                if parsed.is_zero() {
-                    None
-                } else {
-                    Some(parsed)
-                }
-            }
-            Err(e) => {
-                error!("Error fetching last synced block: {:?}", e);
-                None
-            }
-        };
+        let table = generate_internal_event_table_name_no_shorten(&schema, config.event_name);
+        let row = clickhouse.query_one::<LastBlock>(&format!("SELECT last_synced_block FROM rindexer_internal.{table} FINAL WHERE network = '{}' AND cursor_key = '{}'",config.network,config.cursor_key)).await.map_err(|error| format!("Cannot read subscription cursor {table}/{}: {error}",config.cursor_key))?;
+        return Ok((row.last_synced_block != 0).then(|| U64::from(row.last_synced_block)));
     }
-
     // 2. File-based fallbacks (only when no database storage is configured)
 
     // Check CSV file for last seen block
@@ -169,19 +177,20 @@ pub async fn get_last_synced_block_number(config: SyncConfig<'_>) -> Option<U64>
                 config.contract_name,
                 config.network,
                 config.event_name,
+                config.cursor_key,
             )
             .await
             {
                 if let Some(value) = result {
                     if value.is_zero() {
-                        return None;
+                        return Ok(None);
                     }
                 }
 
-                result
+                Ok(result)
             } else {
                 error!("Error fetching last synced block from CSV");
-                None
+                Err("Cannot read CSV subscription cursor".to_string())
             };
         }
     }
@@ -200,25 +209,25 @@ pub async fn get_last_synced_block_number(config: SyncConfig<'_>) -> Option<U64>
             config.contract_name,
             config.network,
             config.event_name,
+            config.cursor_key,
         )
         .await
         {
             if let Some(value) = result {
                 if value.is_zero() {
-                    return None;
+                    return Ok(None);
                 }
             }
 
-            result
+            Ok(result)
         } else {
             error!("Error fetching last synced block from stream");
-            None
+            Err("Cannot read stream subscription cursor".to_string())
         };
     }
 
-    None
+    Ok(None)
 }
-
 #[derive(thiserror::Error, Debug)]
 pub enum UpdateLastSyncedBlockNumberFile {
     #[error("File IO error: {0}")]
@@ -234,12 +243,24 @@ async fn update_last_synced_block_number_for_file(
     event_name: &str,
     full_path: &Path,
     to_block: U64,
+    cursor_key: &str,
 ) -> Result<(), UpdateLastSyncedBlockNumberFile> {
-    let file_path =
-        build_last_synced_block_number_file(full_path, contract_name, network, event_name);
+    let file_path = build_last_synced_block_number_file(
+        full_path,
+        contract_name,
+        network,
+        event_name,
+        cursor_key,
+    );
 
-    let last_block =
-        get_last_synced_block_number_file(full_path, contract_name, network, event_name).await?;
+    let last_block = get_last_synced_block_number_file(
+        full_path,
+        contract_name,
+        network,
+        event_name,
+        cursor_key,
+    )
+    .await?;
 
     let to_block_higher_then_last_block =
         if let Some(last_block_value) = last_block { to_block > last_block_value } else { true };
@@ -315,8 +336,9 @@ pub async fn update_progress_and_last_synced_task(
             generate_indexer_contract_schema_name(&config.indexer_name(), &config.contract_name());
         let table_name = generate_internal_event_table_name(&schema, &config.event_name());
         let network = &config.network_contract().network;
+        let cursor_key = config.network_contract().cursor_key();
         let query = format!(
-            "UPDATE rindexer_internal.{table_name} SET last_synced_block = {to_block} WHERE network = '{network}' AND {to_block} > last_synced_block;
+            "UPDATE rindexer_internal.{table_name} SET last_synced_block = {to_block} WHERE network = '{network}' AND cursor_key = '{cursor_key}' AND {to_block} > last_synced_block;
              UPDATE rindexer_internal.latest_block SET block = {latest} WHERE network = '{network}' AND {latest} > block;"
         );
 
@@ -331,9 +353,10 @@ pub async fn update_progress_and_last_synced_task(
         let table_name =
             generate_internal_event_table_name_no_shorten(&schema, &config.event_name());
         let network = &config.network_contract().network;
+        let cursor_key = config.network_contract().cursor_key();
         let query = format!(
             r#"
-            INSERT INTO rindexer_internal.{table_name} (network, last_synced_block) VALUES ('{network}', {to_block});
+            INSERT INTO rindexer_internal.{table_name} (network, cursor_key, last_synced_block) VALUES ('{network}', '{cursor_key}', {to_block});
             INSERT INTO rindexer_internal.latest_block (network, block) VALUES ('{network}', {latest});
             "#
         );
@@ -352,6 +375,7 @@ pub async fn update_progress_and_last_synced_task(
                 panic!("failed to get full path {}", config.project_path().display())
             }),
             to_block,
+            &config.network_contract().cursor_key(),
         )
         .await
         {
@@ -371,6 +395,7 @@ pub async fn update_progress_and_last_synced_task(
             &config.event_name(),
             &full_path,
             to_block,
+            &config.network_contract().cursor_key(),
         )
         .await
         {
@@ -409,10 +434,17 @@ pub async fn evm_trace_update_progress_and_last_synced_task(
             generate_indexer_contract_schema_name(&config.indexer_name, &config.contract_name);
         let table_name = generate_internal_event_table_name(&schema, "native_transfer");
         let query = format!(
-                "UPDATE rindexer_internal.{table_name} SET last_synced_block = $1 WHERE network = $2 AND $1 > last_synced_block"
+                "UPDATE rindexer_internal.{table_name} SET last_synced_block = $1 WHERE network = $2 AND cursor_key = $3 AND $1 > last_synced_block"
             );
         let result = postgres
-            .execute(&query, &[&EthereumSqlTypeWrapper::U64(to_block.to()), &config.network])
+            .execute(
+                &query,
+                &[
+                    &EthereumSqlTypeWrapper::U64(to_block.to()),
+                    &config.network,
+                    &crate::event::cursor::NETWORK_CURSOR_KEY,
+                ],
+            )
             .await;
 
         if let Err(e) = result {
@@ -429,6 +461,7 @@ pub async fn evm_trace_update_progress_and_last_synced_task(
                 panic!("failed to get full path {}", config.project_path.display())
             }),
             to_block,
+            crate::event::cursor::NETWORK_CURSOR_KEY,
         )
         .await
         {
@@ -448,6 +481,7 @@ pub async fn evm_trace_update_progress_and_last_synced_task(
             &config.event_name,
             &full_path,
             to_block,
+            crate::event::cursor::NETWORK_CURSOR_KEY,
         )
         .await
         {
@@ -490,7 +524,10 @@ pub async fn get_last_synced_cron_block(config: CronSyncConfig<'_>) -> Option<U6
             "SELECT last_synced_block FROM rindexer_internal.{table_name} WHERE network = $1"
         );
 
-        return match postgres.query_one(&query, &[&config.network]).await {
+        return match postgres
+            .query_one(&query, &[&config.network, &crate::event::cursor::NETWORK_CURSOR_KEY])
+            .await
+        {
             Ok(row) => {
                 let result: Decimal = row.get("last_synced_block");
                 let parsed =
@@ -616,6 +653,7 @@ mod tests {
             "UserOperationEvent",
             &full_path,
             U64::from(2235535),
+            crate::event::cursor::NETWORK_CURSOR_KEY,
         )
         .await
         .unwrap();
@@ -640,6 +678,7 @@ mod tests {
             "UserOperationEvent",
             &full_path,
             U64::from(20),
+            crate::event::cursor::NETWORK_CURSOR_KEY,
         )
         .await
         .unwrap();
@@ -649,6 +688,7 @@ mod tests {
             "UserOperationEvent",
             &full_path,
             U64::from(10),
+            crate::event::cursor::NETWORK_CURSOR_KEY,
         )
         .await
         .unwrap();

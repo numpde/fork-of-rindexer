@@ -111,6 +111,7 @@ pub enum BulkInsertPostgresError {
 /// Cursor advance committed atomically with a bulk event insert — the
 /// `rindexer_internal.{internal_table_name}` last-synced tracker for one network.
 pub struct BulkCursorUpdate {
+    pub cursor_key: String,
     pub internal_table_name: String,
     pub network: String,
     pub to_block: u64,
@@ -482,13 +483,17 @@ impl PostgresClient {
         // Same statement + binding shape as update_progress_and_last_synced_task,
         // monotonic guard included, but inside the caller's transaction.
         let cursor_query = format!(
-            "UPDATE rindexer_internal.{} SET last_synced_block = $1 WHERE network = $2 AND $1 > last_synced_block",
+            "UPDATE rindexer_internal.{} SET last_synced_block = $1 WHERE network = $2 AND cursor_key = $3 AND $1 > last_synced_block",
             cursor.internal_table_name
         );
         let cursor_rows = transaction
             .execute(
                 &cursor_query,
-                &[&EthereumSqlTypeWrapper::U64(cursor.to_block), &cursor.network],
+                &[
+                    &EthereumSqlTypeWrapper::U64(cursor.to_block),
+                    &cursor.network,
+                    &cursor.cursor_key,
+                ],
             )
             .await
             .map_err(|e| pg_error_to_string(&e))?;
@@ -505,16 +510,16 @@ impl PostgresClient {
         //    monotonic guard correctly refuses to rewind. The rows must still
         //    commit (they were never inserted), so this cannot error: the batch
         //    would retry forever against a cursor that stays ahead.
-        //  - row missing: the seeded (network, 0) row is gone / setup never ran.
+        //  - row missing: the seeded subscription row is gone / setup never ran.
         //    Committing rows while no cursor can ever advance would restart
         //    indexing from the manifest start forever (duplicate storm), so
         //    fail loudly and let the caller's drop roll everything back.
         let probe = format!(
-            "SELECT last_synced_block::TEXT FROM rindexer_internal.{} WHERE network = $1",
+            "SELECT last_synced_block::TEXT FROM rindexer_internal.{} WHERE network = $1 AND cursor_key = $2",
             cursor.internal_table_name
         );
         let row = transaction
-            .query_opt(&probe, &[&cursor.network])
+            .query_opt(&probe, &[&cursor.network, &cursor.cursor_key])
             .await
             .map_err(|e| pg_error_to_string(&e))?;
         match row {
@@ -523,10 +528,11 @@ impl PostgresClient {
                 Ok(CursorAdvance::AlreadyAhead { current })
             }
             None => Err(format!(
-                "ATOMIC-CURSOR: no cursor row for network={} in rindexer_internal.{} — \
+                "ATOMIC-CURSOR: no cursor row for network={} subscription={} in rindexer_internal.{} — \
                  seeded row missing, rolling back {} rows for {} (cursor could never \
                  advance; committing would re-index from the manifest start forever)",
                 cursor.network,
+                cursor.cursor_key,
                 cursor.internal_table_name,
                 postgres_bulk_data.len(),
                 table_name

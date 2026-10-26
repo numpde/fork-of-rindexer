@@ -88,7 +88,11 @@ pub(super) fn event(params: &NoCodeCallbackParams, index: u64) -> EventResult {
             log_index: U256::from(index),
             transaction_index: index,
         },
-        found_in_request: LogFoundInRequest { from_block: U64::from(2), to_block: U64::from(2) },
+        found_in_request: LogFoundInRequest {
+            cursor_key: crate::event::cursor::NETWORK_CURSOR_KEY.to_string(),
+            from_block: U64::from(2),
+            to_block: U64::from(2),
+        },
     }
 }
 
