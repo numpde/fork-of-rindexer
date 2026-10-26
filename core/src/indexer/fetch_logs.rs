@@ -2863,6 +2863,43 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn live_retry_recovers_at_the_safe_head_after_a_transient_rpc_error() {
+        for safe_distance in [0u64, 1, 3] {
+            let tip = 603;
+            let required_block = tip - safe_distance;
+            let cancel_token = CancellationToken::new();
+            let ranges = Arc::new(StdMutex::new(Vec::new()));
+            let provider = Arc::new(
+                RecordingLiveProvider::new(
+                    MockChainProvider::new(1).with_blocks(vec![make_block(tip)]),
+                    ranges.clone(),
+                    cancel_token.clone(),
+                )
+                .with_transient_first_logs_error(),
+            );
+            let block_clock = BlockClock::new(None, None, provider.clone());
+            let (tx, mut rx) = mpsc::channel(4);
+            tokio::time::timeout(Duration::from_secs(2), live_indexing_stream(
+                crate::indexer::reorg::subscribe_reorgs("safe-head-retry"),
+                false, block_clock, provider, &tx, U64::from(required_block - 1),
+                &B256::ZERO, &U64::from(safe_distance),
+                RindexerEventFilter::empty_for_test().set_from_block(U64::from(required_block)).set_to_block(U64::from(required_block)),
+                "safe-head-retry", "safe-head-retry", true, None, cancel_token,
+                None, None, None, &EventCallbackRegistry::default(), None,
+            )).await.unwrap_or_else(|_| panic!("safe distance {safe_distance}: a recovered RPC must retry the unfinished safe block without a restart"));
+            assert_eq!(
+                ranges.lock().unwrap().as_slice(),
+                &[(required_block, required_block), (required_block, required_block)]
+            );
+            let delivered = rx.try_recv().expect("successful retry must be delivered").unwrap();
+            assert_eq!(
+                (delivered.from_block.to::<u64>(), delivered.to_block.to::<u64>()),
+                (required_block, required_block)
+            );
+        }
+    }
+
     // --- shared tip logs: live-loop tests ---
 
     #[tokio::test(start_paused = true)]
