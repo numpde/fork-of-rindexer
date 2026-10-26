@@ -343,6 +343,19 @@ mod tests {
     }
 
     #[test]
+    fn provider_metric_labels_are_threaded_through_rpc_and_shadow_initializers() {
+        for rpc in ["http://localhost:8545", "https://shadow.example/rpc"] {
+            let mut network = test_network("rollup_archive", 42161);
+            network.rpc = rpc.to_string();
+            let code = generate_network_lazy_provider_code(&network).to_string();
+            assert!(
+                code.contains("\"rollup_archive\""),
+                "the provider initializer must receive the configured metric label: {code}"
+            );
+        }
+    }
+
+    #[test]
     fn generated_networks_imports_chain_provider() {
         let networks = vec![test_network("ethereum", 1)];
         let code = generate_networks_code(&networks).to_string();

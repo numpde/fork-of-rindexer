@@ -1863,3 +1863,7 @@ mod tests {
         assert!(result.is_err(), "expected Err when asserter queue is empty");
     }
 }
+
+#[cfg(test)]
+#[path = "provider_metric_label_tests.rs"]
+mod provider_metric_label_tests;
