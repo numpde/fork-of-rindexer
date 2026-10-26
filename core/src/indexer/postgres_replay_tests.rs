@@ -1663,3 +1663,6 @@ mod table_condition_tests;
 
 #[path = "subscription_cursor_tests.rs"]
 mod subscription_cursor_tests;
+
+#[path = "schema_override_tests.rs"]
+mod schema_override_tests;
