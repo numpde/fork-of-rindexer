@@ -303,6 +303,19 @@ async fn process_event_logs(
         return Err(Box::new(ProviderError::CustomError(reason)));
     }
 
+    // Join admitted work before classifying completion. Live subscriptions
+    // have no successful EOF unless history was forced or stopping was requested.
+    if config.live_indexing()
+        && !force_no_live_indexing
+        && is_running()
+        && !config.cancel_token().is_cancelled()
+    {
+        return Err(Box::new(ProviderError::CustomError(format!(
+            "{} - live logs stream ended unexpectedly for stream {}; no shutdown or cancellation was requested",
+            config.info_log_name(), config.id()
+        ))));
+    }
+
     Ok(())
 }
 

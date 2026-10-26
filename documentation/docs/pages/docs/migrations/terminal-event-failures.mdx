@@ -31,6 +31,25 @@ ranges. Other trace networks and contract-event streams can continue. Earlier
 trace handlers may already have produced effects before a later handler fails;
 stopping the pipeline does not undo those effects.
 
+## Unexpected live producer completion
+
+Contract-event live indexing now returns an indexing-task error when the log
+producer ends without a shutdown or cancellation request. A live subscription
+has no finite completion boundary. Supervisors and Rust callers that previously
+accepted this as success must handle the failure and restart from durable
+progress after investigating the producer's cause.
+
+Already admitted callbacks are joined before completion is classified, and
+successfully committed prefixes remain committed. Existing fetch or callback
+failures retain precedence. Finite indexing, the forced historical leg of a live
+subscription, explicit cancellation and global shutdown still complete normally.
+Replay retains the configured sinks' existing guarantees; this error does not
+undo completed effects or make independent outputs atomic.
+
+The error travels through indexing-task completion and identifies the affected
+stream. The `/health` callback-failure fields described below report retained
+handler failures.
+
 ## Monitoring and recovery
 
 When the engine's health server is enabled, a retained terminal callback failure makes
