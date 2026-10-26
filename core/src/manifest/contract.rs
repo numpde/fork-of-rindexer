@@ -1360,11 +1360,10 @@ impl Contract {
     }
 
     pub fn parse_abi(&self, project_path: &Path) -> Result<String, ParseAbiError> {
-        match &self.abi {
+        let abi_str = match &self.abi {
             StringOrArray::Single(abi_path) => {
                 let full_path = get_full_path(project_path, abi_path)?;
-                let abi_str = fs::read_to_string(full_path)?;
-                Ok(abi_str)
+                fs::read_to_string(full_path)?
             }
             StringOrArray::Multiple(abis) => {
                 let mut unique_entries = HashSet::new();
@@ -1389,10 +1388,34 @@ impl Contract {
                     }
                 }
 
-                let merged_abi_str = serde_json::to_string(&json!(merged_abi_value))?;
-                Ok(merged_abi_str)
+                serde_json::to_string(&json!(merged_abi_value))?
+            }
+        };
+
+        // Selection, raw storage and generated Rust all use event names. Check
+        // the complete merged ABI before any consumer filters away evidence.
+        let items: Vec<crate::abi::ABIItem> = serde_json::from_str(&abi_str)
+            .map_err(|error| ParseAbiError::InvalidAbiFormat(error.to_string()))?;
+        let mut events = HashMap::new();
+        for event in items.iter().filter(|item| item.type_ == "event") {
+            if let Some(previous) = events.insert(&event.name, event) {
+                let signatures = [previous, event]
+                    .iter()
+                    .map(|item| item.format_event_signature())
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| ParseAbiError::InvalidAbiFormat(error.to_string()))?;
+                return Err(ParseAbiError::InvalidAbiFormat(format!(
+                    "cannot load contract '{}': multiple event definitions named '{}': {}. \
+                     Event names must be unique for selection, storage and generated Rust. \
+                     Remove duplicate declarations, or use separate ABI files and uniquely named \
+                     contract entries for overloads; preserve the Solidity event names",
+                    self.name,
+                    event.name,
+                    signatures.join(" and ")
+                )));
             }
         }
+        Ok(abi_str)
     }
 
     pub fn convert_dependency_event_tree_yaml(

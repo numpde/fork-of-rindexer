@@ -529,6 +529,55 @@ contracts: // [!code focus]
       - ./abis/RocketTokenRETH2.abi.json // [!code focus]
 ```
 
+### Repeated event names
+
+Each contract's complete ABI must have unique event names. ABI loading now
+rejects repeated event declarations, including valid Solidity overloads such as
+`Value(uint256)` and `Value(address)`, before startup or Rust code generation.
+`include_events` cannot disambiguate them: rindexer uses names for event
+selection, storage and generated Rust items. The error identifies the contract,
+name and first conflicting pair of signatures
+([#152](https://github.com/joshstevens19/rindexer/issues/152)).
+
+For overloads, create one ABI file per event variant and use distinct contract
+names. Keep each event's original Solidity name and inputs, including `indexed`
+flags. Renaming an event in its ABI changes its topic and will not match the
+original on-chain logs. Retain any other ABI entries required by each contract's
+configuration.
+
+```yaml [rindexer.yaml]
+contracts:
+  - name: AccountV1
+    abi: ./abis/account-v1.json
+    details:
+      - network: ethereum
+        address: "0x0000000000000000000000000000000000000001"
+        start_block: 1
+  - name: AccountV2
+    abi: ./abis/account-v2.json
+    details:
+      - network: ethereum
+        address: "0x0000000000000000000000000000000000000001"
+        start_block: 1
+```
+
+Here each ABI contains one `Lens_Account_MetadataURISet` event variant. The
+contract names give the variants separate storage and generated Rust modules;
+their original signatures still determine which logs match.
+
+For an accidental duplicate, remove the repeated declaration. When merging
+multiple ABI files, identical JSON entries continue to be deduplicated before
+this check. Function overloads remain supported.
+
+**Upgrading:** previously accepted ABIs with repeated event names now fail
+loading. Remove accidental duplicates or split overloaded variants as above.
+Changing contract names changes their storage identities: stop writers and plan
+canonical reindexing of affected raw history, derived state, journals, receipts
+and checkpoints together. Existing data is not moved or repaired automatically.
+Review external sink replay before backfilling. Rust projects must run
+`rindexer codegen typings` and update handler registrations for the new contract
+modules; regenerate handler scaffolding separately if needed.
+
 ## include_events
 
 The events you wish to include for **raw event logging** - each event creates a row in its own table (e.g., `transfer`, `approval`).

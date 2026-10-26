@@ -22,8 +22,10 @@ fn contract(abi: Value) -> Contract {
 
 fn write_abis(dir: &Path) {
     let [first, second] = definitions();
+    let ordinary = json!({"type":"event","name":"Unrelated","inputs":[]});
     for (file, value) in [
-        ("both.json", json!([first, second])),
+        ("both.json", json!([first, second, ordinary])),
+        ("ordinary.json", json!([ordinary])),
         ("first.json", json!([first])),
         ("second.json", json!([second])),
     ] {
@@ -49,16 +51,23 @@ fn overloaded_event_names_fail_during_manifest_loading_in_both_project_modes() {
     let dir = tempfile::tempdir().unwrap();
     write_abis(dir.path());
     for project_type in ["no-code", "rust"] {
-        for abi in [json!("./both.json"), json!(["./first.json", "./second.json"])] {
-            let mut item = serde_json::to_value(contract(abi)).unwrap();
-            // Loading must reject the ambiguity before selection: the Rust struct
-            // generator consumes the complete ABI even when a different event is selected.
-            item["include_events"] = json!(["Unrelated"]);
-            let manifest = json!({"name":"test","project_type":project_type,"networks":[{"name":"ethereum","chain_id":1,"rpc":"http://localhost:8545"}],"contracts":[item]});
-            let path = dir.path().join("rindexer.yaml");
-            fs::write(&path, serde_yaml::to_string(&manifest).unwrap()).unwrap();
-            let error = read_manifest(&path).expect_err("ambiguous ABI must fail before startup");
-            diagnostic(&error.to_string());
+        for abi in
+            [json!("./both.json"), json!(["./first.json", "./second.json", "./ordinary.json"])]
+        {
+            for select_other_event in [false, true] {
+                let mut item = serde_json::to_value(contract(abi.clone())).unwrap();
+                // The Rust struct generator consumes the complete ABI, including
+                // declarations excluded from runtime event selection.
+                if select_other_event {
+                    item["include_events"] = json!(["Unrelated"]);
+                }
+                let manifest = json!({"name":"test","project_type":project_type,"networks":[{"name":"ethereum","chain_id":1,"rpc":"http://localhost:8545"}],"contracts":[item]});
+                let path = dir.path().join("rindexer.yaml");
+                fs::write(&path, serde_yaml::to_string(&manifest).unwrap()).unwrap();
+                let error =
+                    read_manifest(&path).expect_err("ambiguous ABI must fail before startup");
+                diagnostic(&error.to_string());
+            }
         }
     }
 }
@@ -70,12 +79,10 @@ fn overloaded_event_codegen_returns_errors_instead_of_duplicate_items() {
     let contract = contract(json!("./both.json"));
     let storage = Storage::default();
     let bindings = generate_event_bindings(dir.path(), "Test", &contract, false, &storage)
-        .err()
-        .expect("do not return duplicate Rust types or enum variants");
+        .expect_err("do not return duplicate Rust types or enum variants");
     diagnostic(&bindings.to_string());
     let handlers = generate_event_handlers(dir.path(), "Test", false, &contract, &storage)
-        .err()
-        .expect("do not return duplicate handler functions");
+        .expect_err("do not return duplicate handler functions");
     diagnostic(&handlers.to_string());
 }
 
@@ -95,6 +102,7 @@ fn duplicate_event_declarations_fail_before_codegen_too() {
 fn split_contracts_keep_original_event_names_and_selectors() {
     let dir = tempfile::tempdir().unwrap();
     write_abis(dir.path());
+    let mut contracts = Vec::new();
     for (file, name, signature) in [
         ("./first.json", "AccountV1", "Lens_Account_MetadataURISet(string)"),
         ("./second.json", "AccountV2", "Lens_Account_MetadataURISet(string,address)"),
@@ -112,7 +120,12 @@ fn split_contracts_keep_original_event_names_and_selectors() {
                 .to_string();
         assert_eq!(source.matches(&format!("pub struct {EVENT}Result")).count(), 1);
         assert!(source.contains(&events[0].topic_id_as_hex_string()));
+        contracts.push(contract);
     }
+    let manifest = json!({"name":"test","project_type":"no-code","networks":[{"name":"ethereum","chain_id":1,"rpc":"http://localhost:8545"}],"contracts":contracts});
+    let path = dir.path().join("rindexer.yaml");
+    fs::write(&path, serde_yaml::to_string(&manifest).unwrap()).unwrap();
+    assert_eq!(read_manifest(&path).unwrap().contracts.len(), 2);
 }
 
 #[test]
