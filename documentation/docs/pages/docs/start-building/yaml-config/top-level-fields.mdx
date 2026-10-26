@@ -98,6 +98,20 @@ Includes timestamps in all rindexer logs. Any logs with timestamps already inclu
 try to be as efficient as possible when fetching timestamps by first using fixed ranges, then precalculated, and
 lastly fallback to RPC requests when required.
 
+RPC enrichment fills missing timestamps without reordering logs or overwriting
+values already supplied. Partial header responses can be retried while they
+resolve additional blocks. A response that resolves no remaining block returns
+a missing-header error. Historical fetching narrows the range as before, but if
+the unresolved range is already one block, it reports that error and stops the
+stream before live indexing. Transient provider/transport failures still retry.
+Restore access to the required header and restart from unfinished progress.
+
+Address-filtered RPC queries also merge their address chunks in block,
+transaction and log order before historical advancement reads the last log.
+This applies to sequential and parallel history and to a single address chunk.
+Review previously repeated or misordered deliveries with downstream consumers;
+the fix does not automatically replay old output.
+
 Timestamps can also be opted into for specific events. [See more details](/docs/start-building/yaml-config/contracts).
 
 ```yaml [rindexer.yaml]

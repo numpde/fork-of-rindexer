@@ -367,7 +367,13 @@ pub fn fetch_logs_stream(
                     current_filter = result.next;
                     max_block_range_limitation = new_max_block_range_limitation;
                 } else {
-                    break;
+                    // Terminal history cannot certify a live handoff. Retire
+                    // its recovery monitor before closing the producer.
+                    monitor_stop.cancel();
+                    if let Some(monitor) = monitor {
+                        let _ = monitor.await;
+                    }
+                    return;
                 }
             }
 
@@ -525,24 +531,28 @@ async fn fetch_historic_logs_stream<P: ChainProvider>(
             }
 
             if timestamps {
-                if let Ok(logs) = block_clock.attach_log_timestamps(logs).await {
-                    sender.send(Ok(FetchLogsResult {
+                match block_clock.attach_log_timestamps(logs).await {
+                    Ok(logs) => sender.send(Ok(FetchLogsResult {
                         reorg_generation,
                         logs,
                         from_block,
                         to_block,
                         reorg: None,
-                    }));
-                } else {
-                    if from_block == to_block {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    })),
+                    Err(error) => {
+                        let retry_to = halved_block_number(to_block, from_block);
+                        if retry_to >= to_block && error.is_missing_block_in_range() {
+                            sender.send(Err(Box::new(error)));
+                            return None;
+                        }
+                        if from_block == to_block {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                        return Some(ProcessHistoricLogsStreamResult {
+                            next: current_filter.set_from_block(from_block).set_to_block(retry_to),
+                            max_block_range_limitation,
+                        });
                     }
-                    return Some(ProcessHistoricLogsStreamResult {
-                        next: current_filter
-                            .set_from_block(from_block)
-                            .set_to_block(halved_block_number(to_block, from_block)),
-                        max_block_range_limitation,
-                    });
                 }
             } else {
                 sender.send(Ok(FetchLogsResult {
@@ -909,8 +919,13 @@ async fn parallel_worker(
 
         match maybe_result {
             Some(fetch_result) => {
+                if fetch_result.is_err() {
+                    controller.record_error();
+                    results.push(fetch_result);
+                    break;
+                }
                 controller.record_success();
-                results.push(Ok(fetch_result));
+                results.push(fetch_result);
 
                 if results.len() >= MAX_WORKER_RESULTS
                     && tx
@@ -1024,9 +1039,9 @@ fn classify_fetch_error(err: &ProviderError) -> FetchErrorKind {
 }
 
 /// Pure fetch: get_logs + retry logic. No channel interaction.
-/// Returns a three-tuple: (result, next_state, error_kind). `error_kind` is
-/// `Some` iff this call hit a recoverable error, so callers can feed it to
-/// the adaptive concurrency controller.
+/// Returns (result, next_state, error_kind). A terminal range failure is an
+/// error result with no next state; retryable failures supply their next range.
+/// The error kind lets workers update adaptive concurrency after a failed attempt.
 #[allow(clippy::too_many_arguments)]
 async fn fetch_logs_once<P: ChainProvider + ?Sized>(
     timestamps: bool,
@@ -1037,7 +1052,11 @@ async fn fetch_logs_once<P: ChainProvider + ?Sized>(
     snapshot_to_block: U64,
     info_log_name: &str,
     reorg_generation: u64,
-) -> (Option<FetchLogsResult>, Option<ProcessHistoricLogsStreamResult>, Option<FetchErrorKind>) {
+) -> (
+    Option<Result<FetchLogsResult, Box<dyn Error + Send>>>,
+    Option<ProcessHistoricLogsStreamResult>,
+    Option<FetchErrorKind>,
+) {
     let from_block = current_filter.from_block();
     let to_block = current_filter.to_block();
 
@@ -1085,28 +1104,39 @@ async fn fetch_logs_once<P: ChainProvider + ?Sized>(
             }
 
             let result = if timestamps {
-                if let Ok(logs) = block_clock.attach_log_timestamps(logs).await {
-                    Some(FetchLogsResult {
+                match block_clock.attach_log_timestamps(logs).await {
+                    Ok(logs) => Some(Ok(FetchLogsResult {
                         reorg_generation,
                         logs,
                         from_block,
                         to_block,
                         reorg: None,
-                    })
-                } else {
-                    return (
-                        None,
-                        Some(ProcessHistoricLogsStreamResult {
-                            next: current_filter
-                                .set_from_block(from_block)
-                                .set_to_block(halved_block_number(to_block, from_block)),
-                            max_block_range_limitation,
-                        }),
-                        Some(FetchErrorKind::Other),
-                    );
+                    })),
+                    Err(error) => {
+                        let retry_to = halved_block_number(to_block, from_block);
+                        if retry_to >= to_block && error.is_missing_block_in_range() {
+                            return (Some(Err(Box::new(error))), None, Some(FetchErrorKind::Other));
+                        }
+                        return (
+                            None,
+                            Some(ProcessHistoricLogsStreamResult {
+                                next: current_filter
+                                    .set_from_block(from_block)
+                                    .set_to_block(retry_to),
+                                max_block_range_limitation,
+                            }),
+                            Some(FetchErrorKind::Other),
+                        );
+                    }
                 }
             } else {
-                Some(FetchLogsResult { reorg_generation, logs, from_block, to_block, reorg: None })
+                Some(Ok(FetchLogsResult {
+                    reorg_generation,
+                    logs,
+                    from_block,
+                    to_block,
+                    reorg: None,
+                }))
             };
 
             if logs_empty {
@@ -3731,6 +3761,7 @@ mod tests {
             .await
             .0
             .unwrap()
+            .unwrap()
         } else {
             fetch_historic_logs_stream(
                 timestamps,
@@ -4249,8 +4280,9 @@ mod tests {
             let (result, next, kind) =
                 fetch_logs_once(false, &bc, &mock, filter, None, U64::from(500), "test", 0).await;
 
-            let r =
-                result.expect("empty logs still return a result so sink can advance checkpoint");
+            let r = result
+                .expect("empty logs still return a result so sink can advance checkpoint")
+                .expect("empty range fetched successfully");
             assert_eq!(r.from_block, U64::from(100));
             assert_eq!(r.to_block, U64::from(200));
             assert!(r.logs.is_empty());
@@ -4285,7 +4317,7 @@ mod tests {
             let (result, next, _kind) =
                 fetch_logs_once(false, &bc, &mock, filter, None, U64::from(500), "test", 0).await;
 
-            let r = result.expect("should return logs");
+            let r = result.expect("should return logs").expect("range fetched successfully");
             assert_eq!(r.logs.len(), 2);
             assert!(r.reorg.is_none(), "historical fetch must never emit a reorg");
             let next = next.expect("more range remaining");

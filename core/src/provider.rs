@@ -730,7 +730,11 @@ impl JsonRpcCachedProvider {
 
         let chunked_logs = try_join_all(logs_futures).await?;
 
-        Ok(chunked_logs.concat())
+        let mut logs = chunked_logs.concat();
+        // Chunk order follows address grouping, not event order. Historical
+        // callers use the last log to advance their unfinished range.
+        logs.sort_by_key(|log| (log.block_number, log.transaction_index, log.log_index));
+        Ok(logs)
     }
 
     /// Gets all logs for a given filter and then filters by addresses in memory

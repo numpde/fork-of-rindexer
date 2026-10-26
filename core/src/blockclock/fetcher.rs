@@ -172,37 +172,37 @@ impl BlockFetcher {
     /// - Will use local-first compressed "delta run-encoded" block timestamps where possible
     pub async fn attach_log_timestamps(
         &self,
-        logs: Vec<Log>,
+        mut logs: Vec<Log>,
     ) -> Result<Vec<Log>, BlockFetcherError> {
-        let blocks_without_ts = logs
-            .iter()
-            .filter_map(|n| if n.block_timestamp.is_none() { n.block_number } else { None })
-            .collect::<Vec<_>>();
-
-        if blocks_without_ts.is_empty() {
-            return Ok(logs);
-        };
-
-        let timestamps = self.get_blocks(&blocks_without_ts).await?;
-        let (logs_with_ts, logs_without_ts) = logs
-            .into_iter()
-            .map(|mut log| {
-                if let Some(block_number) = log.block_number {
-                    if let Some(timestamp) = timestamps.get(&block_number) {
-                        log.block_timestamp = Some(*timestamp);
-                    }
+        let mut previous_missing_blocks = None;
+        loop {
+            let mut missing = logs
+                .iter()
+                .filter(|log| log.block_timestamp.is_none())
+                .filter_map(|log| log.block_number)
+                .collect::<Vec<_>>();
+            missing.sort_unstable();
+            missing.dedup();
+            if missing.is_empty() {
+                return Ok(logs);
+            }
+            if previous_missing_blocks.as_ref() == Some(&missing) {
+                return Err(BlockFetcherError::MissingBlockInRange(
+                    self.provider.chain(),
+                    U64::from(missing[0]),
+                ));
+            }
+            let timestamps = self.get_blocks(&missing).await?;
+            // Keep the original positions and every resolved value while
+            // partial responses reduce the remaining set of missing headers.
+            for log in &mut logs {
+                if log.block_timestamp.is_none() {
+                    log.block_timestamp =
+                        log.block_number.and_then(|block| timestamps.get(&block).copied());
                 }
-                log
-            })
-            .partition::<Vec<_>, _>(|x| x.block_timestamp.is_some());
-
-        if !logs_without_ts.is_empty() {
-            let mut completed = Box::pin(self.attach_log_timestamps(logs_without_ts)).await?;
-            completed.extend(logs_with_ts);
-            return Ok(completed);
+            }
+            previous_missing_blocks = Some(missing);
         }
-
-        Ok(logs_with_ts)
     }
 }
 

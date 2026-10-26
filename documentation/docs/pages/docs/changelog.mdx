@@ -2,6 +2,7 @@
 
 ### Breaking changes
 -------------------------------------------------
+- breaking: historical `timestamps: true` indexing now reports a missing-header error and stops the affected stream when an unresolved one-block range cannot shrink further; it no longer retries incomplete header responses indefinitely or hands failed history to live indexing. Restore header coverage and restart from unfinished progress. Transient provider failures still retry.
 - breaking: custom-table work that requires `$rindexer_block_timestamp`, including `if`/`filter` conditions and aliased arithmetic, now retries when a matching block timestamp cannot be resolved instead of committing a skipped or defaulted effect. Restore access to the required header and retry; review or rebuild previously affected raw history, derived effects, receipts and progress together.
 - breaking: PostgreSQL custom-table `database` schema names now fail before startup DDL when they are not valid SQL identifiers. Correct the override before restarting; handwritten Rust exhaustive matches on `GenerateTablesForIndexerSqlError` must handle `InvalidCustomTableSchema`.
 - breaking: custom-table `if`/`filter` guards now reject unknown stored `@columns` at manifest validation, including names previously accepted because they matched event fields. Declare the stored column or use `$field` for event data; injected `@network` and `@rindexer_block_timestamp` require a network-scoped table and `timestamp: true`, respectively.
@@ -32,6 +33,7 @@
 
 ### Bug fixes
 -------------------------------------------------
+- fix: address-filtered RPC log responses now merge in block/transaction/log order before historical progress advances, including one-chunk queries. RPC timestamp enrichment fills missing values in place, preserving input order and existing timestamps across partial responses ([#474](https://github.com/joshstevens19/rindexer/pull/474)).
 - fix: timestamp-dependent custom-table conditions, templates and arithmetic now consume resolved event metadata before preparing writes. Existing metadata takes precedence, fallback timestamps must match the event block hash, and quoted condition literals do not trigger timestamp RPC ([#468](https://github.com/joshstevens19/rindexer/pull/468)).
 - fix: PostgreSQL custom-table `database` overrides now select the startup schema and schema-sync destination as well as the write target. Shared declarations schedule identical migrations once, and invalid schema identifiers stop DDL generation. Review data left in the old default schema before restarting; no rows move automatically ([#487](https://github.com/joshstevens19/rindexer/pull/487)).
 - fix: custom-table conditions validate parsed references in their actual event or stored-column namespace; valid `@column` guards and quoted string literals no longer require matching event ABI fields ([#488](https://github.com/joshstevens19/rindexer/pull/488)).
