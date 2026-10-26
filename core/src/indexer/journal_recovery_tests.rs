@@ -13,7 +13,7 @@ use alloy::primitives::{U256, U64};
 async fn fixture(action: &str, value_type: &str, cross_chain: bool) -> Fixture {
     let mut definition = serde_json::to_value(params().event).unwrap();
     definition["inputs"][0]["type"] = json!(value_type);
-    Fixture::with_table(
+    Fixture::with_table_on_networks(
         definition,
         "Contract",
         json!({
@@ -22,6 +22,7 @@ async fn fixture(action: &str, value_type: &str, cross_chain: bool) -> Fixture {
             "events":[{"event":"Value","operations":[{"type":"upsert","where":{"id":"1"},
                 "set":[{"column":"amount","action":action,"value":"$value"}]}]}]
         }),
+        if cross_chain { &["ethereum", "other"] } else { &["ethereum"] },
     )
     .await
 }
@@ -279,6 +280,67 @@ async fn postgres_journal_rollback_removes_a_row_created_only_by_the_orphan() {
         .unwrap()
         .get(0);
     assert_eq!(count, 0);
+    drop(callback);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_cross_chain_journal_rollback_keeps_the_unaffected_network_contribution() {
+    let fixture = fixture("max", "uint64", true).await;
+    let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+    for (network, block, value) in [("ethereum", 90, 5), ("ethereum", 100, 10), ("other", 200, 20)]
+    {
+        let mut event = at(&fixture, network, block, B256::repeat_byte(block as u8), value);
+        if network == "other" {
+            event.tx_information.chain_id = 2;
+        }
+        callback(vec![event]).await.unwrap();
+    }
+    assert_eq!(amount(&fixture).await, "20");
+    rollback(&fixture, SetAction::Max, true).await;
+    let journal: i64 = fixture
+        .client
+        .query_one(
+            "SELECT count(*) FROM rindexer_internal.derived_op_log WHERE network = 'other'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(journal, 1, "A's fork height must not invalidate B's independent source history");
+    assert_eq!(amount(&fixture).await, "20");
+    let raw: i64 = fixture
+        .client
+        .query_one(
+            &format!(
+                "SELECT count(*) FROM {} WHERE network = 'other'",
+                fixture.params.sql_event_table_name
+            ),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let receipts: i64 = fixture
+        .client
+        .query_one(
+            "SELECT count(*) FROM rindexer_internal.event_applications WHERE network = 'other'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!((raw, receipts), (1, 1));
+    let remaining_a: i64 = fixture
+        .client
+        .query_one(
+            "SELECT count(*) FROM rindexer_internal.derived_op_log WHERE network = 'ethereum'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(remaining_a, 1);
     drop(callback);
     fixture.finish().await;
 }

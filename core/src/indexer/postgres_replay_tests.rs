@@ -240,6 +240,15 @@ impl Fixture {
         contract: &str,
         table: serde_json::Value,
     ) -> Self {
+        Self::with_table_on_networks(definition, contract, table, &["ethereum"]).await
+    }
+
+    async fn with_table_on_networks(
+        definition: serde_json::Value,
+        contract: &str,
+        table: serde_json::Value,
+        networks: &[&str],
+    ) -> Self {
         let (admin, container) = postgres_client().await;
         let mut url: url::Url = match container.as_ref() {
             Some(container) => format!(
@@ -273,7 +282,7 @@ impl Fixture {
         let manifest: crate::manifest::core::Manifest = serde_json::from_value(json!({
             "name": "Replay", "project_type": "no-code", "networks": [],
             "contracts": [{"name": contract, "abi": "abi.json", "include_events": [params.event_info.name],
-                "details": [{"network": "ethereum", "address": "0x0000000000000000000000000000000000000000"}],
+                "details": networks.iter().map(|network| json!({"network":network,"address":"0x0000000000000000000000000000000000000000"})).collect::<Vec<_>>(),
                 "tables": [table]
             }]
         })).unwrap();
