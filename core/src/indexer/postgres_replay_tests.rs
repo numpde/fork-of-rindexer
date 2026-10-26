@@ -229,6 +229,17 @@ impl Fixture {
     }
 
     async fn with_event(definition: serde_json::Value, contract: &str) -> Self {
+        Self::with_table(definition.clone(), contract, json!({"name": "totals", "global": true,
+            "columns": [{"name": "amount", "type": "uint256", "default": "0"}],
+            "events": [{"event": definition["name"], "operations": [{"type": "upsert", "set": [{"column": "amount", "action": "add", "value": "$value"}]}]}]
+        })).await
+    }
+
+    async fn with_table(
+        definition: serde_json::Value,
+        contract: &str,
+        table: serde_json::Value,
+    ) -> Self {
         let (admin, container) = postgres_client().await;
         let mut url: url::Url = match container.as_ref() {
             Some(container) => format!(
@@ -263,10 +274,7 @@ impl Fixture {
             "name": "Replay", "project_type": "no-code", "networks": [],
             "contracts": [{"name": contract, "abi": "abi.json", "include_events": [params.event_info.name],
                 "details": [{"network": "ethereum", "address": "0x0000000000000000000000000000000000000000"}],
-                "tables": [{"name": "totals", "global": true,
-                    "columns": [{"name": "amount", "type": "uint256", "default": "0"}],
-                    "events": [{"event": params.event_info.name, "operations": [{"type": "upsert", "set": [{"column": "amount", "action": "add", "value": "$value"}]}]}]
-                }]
+                "tables": [table]
             }]
         })).unwrap();
         let indexer = manifest.to_indexer();
@@ -1637,3 +1645,6 @@ async fn postgres_sequence_positions_reject_indices_outside_the_packed_bounds_be
 
 #[path = "historical_handoff_tests.rs"]
 mod historical_handoff_tests;
+
+#[path = "journal_recovery_tests.rs"]
+mod journal_recovery_tests;
