@@ -16,7 +16,7 @@ async fn guarded_operation(kind: &str) {
             definition["inputs"][0]["type"] = json!("uint64");
             let table = json!({"name":"totals","columns":[{"name":"id","type":"uint64"},{"name":"balance","type":"uint64"}],
                 "events":[{"event":"Value","operations":[{"type":kind,"where":{"id":"1"},"if":condition,
-                    "set": if kind == "delete" {json!([])} else {json!([{"column":"balance","action":"set","value":"$balance"}])}}]}]});
+                    "set": if kind == "delete" {json!([])} else {json!([{"column":"balance","action":"set","value":if kind == "update" && table_reference {"$balance * 2"} else {"$balance"}}])}}]}]});
             let mut fixture = Fixture::with_table(definition, "Contract", table.clone()).await;
             let manifest_path = fixture._directory.path().join("rindexer.yaml");
             std::fs::write(&manifest_path,serde_yaml::to_string(&json!({"name":"Replay","project_type":"no-code",
@@ -70,7 +70,15 @@ async fn guarded_operation(kind: &str) {
                 assert_eq!(rows.len(), 1);
                 assert_eq!(
                     rows[0].get::<_, String>(0),
-                    if guard_true { "50".to_string() } else { original.to_string() },
+                    if guard_true {
+                        if kind == "update" && table_reference {
+                            "100".to_string()
+                        } else {
+                            "50".to_string()
+                        }
+                    } else {
+                        original.to_string()
+                    },
                     "{kind}, table reference={table_reference}, condition={condition}"
                 );
             }
@@ -89,4 +97,46 @@ async fn postgres_update_enforces_table_and_event_conditions() {
 #[tokio::test]
 async fn postgres_delete_enforces_table_and_event_conditions() {
     guarded_operation("delete").await;
+}
+
+#[test]
+fn manifest_rejects_table_state_guards_where_the_backend_or_recovery_cannot_enforce_them() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut definition = serde_json::to_value(params().event).unwrap();
+    definition["inputs"][0]["name"] = json!("balance");
+    definition["inputs"][0]["type"] = json!("uint64");
+    std::fs::write(
+        directory.path().join("abi.json"),
+        serde_json::to_vec(&vec![definition]).unwrap(),
+    )
+    .unwrap();
+    for (kind, clickhouse, reorg, condition, error) in [
+        ("update", false, false, "@balance == 0", None),
+        ("delete", false, false, "@balance == 0", None),
+        ("update", true, false, "@balance == 0", Some("ClickHouse cannot enforce")),
+        ("upsert", false, true, "@balance == 0", Some("cannot be reconstructed by reorg recovery")),
+        ("insert", false, false, "@balance == 0", Some("INSERT cannot enforce")),
+        ("update", true, false, "balance == 0", None),
+        ("upsert", false, true, "balance == 0", None),
+    ] {
+        let path = directory.path().join("rindexer.yaml");
+        let manifest = json!({"name":"GuardValidation","project_type":"no-code",
+            "storage":{"clickhouse":{"enabled":clickhouse}},
+            "networks":[{"name":"ethereum","chain_id":1,"rpc":"http://127.0.0.1:8545","reorg_handling":{"enabled":reorg}}],
+            "contracts":[{"name":"Contract","abi":"abi.json","details":[{"network":"ethereum","address":"0x0000000000000000000000000000000000000000"}],
+                "tables":[{"name":"balances","columns":[{"name":"id","type":"uint64"},{"name":"balance","type":"uint64"}],
+                    "events":[{"event":"Value","operations":[{"type":kind,"where":if kind == "insert" {json!({})} else {json!({"id":"1"})},"if":condition,
+                        "set":if kind == "delete" {json!([])} else {json!([{"column":"id","action":"set","value":"1"},{"column":"balance","action":"set","value":"$balance"}])}}]}]}]}]});
+        std::fs::write(&path, serde_yaml::to_string(&manifest).unwrap()).unwrap();
+        let result = crate::manifest::yaml::read_manifest(&path);
+        match error {
+            Some(reason) => assert!(
+                result.unwrap_err().to_string().contains(reason),
+                "{kind}: expected {reason}"
+            ),
+            None => {
+                result.unwrap();
+            }
+        }
+    }
 }

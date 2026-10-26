@@ -528,17 +528,42 @@ fn validate_manifest(
 
                         // Validate condition expression (from `if` or `filter` field)
                         if let Some(condition_expr) = operation.condition() {
-                            // Validate the expression parses correctly
-                            if let Err(e) = parse_filter_expression(condition_expr) {
-                                return Err(
+                            let expression =
+                                parse_filter_expression(condition_expr).map_err(|error| {
                                     ValidateManifestError::CustomIndexingInvalidConditionExpression(
                                         condition_expr.to_string(),
                                         event_mapping.event.clone(),
                                         table.name.clone(),
                                         contract.name.clone(),
-                                        e.to_string(),
-                                    ),
-                                );
+                                        error.to_string(),
+                                    )
+                                })?;
+                            if expression.has_table_references() {
+                                let unsupported = if manifest.storage.clickhouse_enabled() {
+                                    Some("ClickHouse cannot enforce table-state conditions; use PostgreSQL for @column guards or use an event-only condition")
+                                } else if matches!(
+                                    operation.operation_type,
+                                    crate::manifest::contract::OperationType::Insert
+                                ) {
+                                    Some("INSERT cannot enforce a condition on an existing row; use a guarded UPDATE or DELETE")
+                                } else if contract.details.iter().any(|detail| {
+                                    manifest.networks.iter().any(|network| {
+                                        network.name == detail.network
+                                            && network
+                                                .reorg_handling
+                                                .as_ref()
+                                                .is_some_and(|config| config.enabled)
+                                    })
+                                }) {
+                                    Some("table-state conditions cannot be reconstructed by reorg recovery; use an event-only condition on reorg-enabled tables")
+                                } else {
+                                    None
+                                };
+                                if let Some(reason) = unsupported {
+                                    return Err(ValidateManifestError::CustomIndexingInvalidConditionExpression(
+                                        condition_expr.to_string(), event_mapping.event.clone(), table.name.clone(), contract.name.clone(), reason.to_string(),
+                                    ));
+                                }
                             }
 
                             // Extract and validate variable references in the condition

@@ -39,7 +39,7 @@ pub enum DynamicBatchStatement {
 /// # Arguments
 /// * `mode` - `Eager` commits every chunk in its own transaction; `Tx` stages the
 ///   chunks inside the caller's transaction, which commits or rolls back all of them.
-/// * `custom_where` - Optional SQL WHERE condition for upsert operations.
+/// * `custom_where` - Optional SQL WHERE condition. UPDATE/DELETE use target `am` and input `tp` aliases.
 ///   Used to push conditions with `@table` references to SQL level.
 ///   E.g., `"EXCLUDED.value > token_balances.balance"` to only update if new value is greater.
 pub async fn execute_dynamic_batch_operation(
@@ -482,6 +482,10 @@ pub fn build_batch_statement(
         if let Some(condition) = build_sequence_condition(seq_col, op_type) {
             where_conditions.push(condition);
         }
+    }
+
+    if let Some(condition) = custom_where {
+        where_conditions.push(format!("({condition})"));
     }
 
     query.push_str(&build_where_clause(&where_conditions));

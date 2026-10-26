@@ -201,6 +201,20 @@ impl<'a> Expression<'a> {
         }
     }
 
+    pub(crate) fn visit_variables(&self, visitor: &mut impl FnMut(&ConditionLeft<'a>)) {
+        match self {
+            Self::Condition(condition) => {
+                condition.left.visit_variables(visitor);
+                condition.right.visit_variables(visitor);
+            }
+            Self::Logical { left, right, .. } => {
+                left.visit_variables(visitor);
+                right.visit_variables(visitor);
+            }
+            Self::Not(inner) => inner.visit_variables(visitor),
+        }
+    }
+
     /// Converts this expression to a SQL WHERE clause string.
     /// - Event variables ($var) become EXCLUDED.var (the new values being inserted)
     /// - Table variables (@var) become {table_name}.var (current DB values)
@@ -224,7 +238,7 @@ impl<'a> Expression<'a> {
         Some(self.to_sql_condition_with(&event_variable))
     }
 
-    fn to_sql_condition_with<F>(&self, variable_to_sql: &F) -> String
+    pub(crate) fn to_sql_condition_with<F>(&self, variable_to_sql: &F) -> String
     where
         F: Fn(&ConditionLeft<'_>) -> String,
     {
@@ -259,6 +273,17 @@ impl<'a> Expression<'a> {
 }
 
 impl<'a> ArithmeticExpr<'a> {
+    fn visit_variables(&self, visitor: &mut impl FnMut(&ConditionLeft<'a>)) {
+        match self {
+            Self::Variable(variable) => visitor(variable),
+            Self::Literal(_) => {}
+            Self::Binary { left, right, .. } => {
+                left.visit_variables(visitor);
+                right.visit_variables(visitor);
+            }
+        }
+    }
+
     /// Checks if this arithmetic expression contains any table references.
     pub fn has_table_references(&self) -> bool {
         match self {

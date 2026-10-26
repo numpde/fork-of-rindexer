@@ -1323,8 +1323,16 @@ This is powerful for:
 - Preventing stale data overwrites
 
 :::info[Performance]
-Conditions with `@` table references are pushed to SQL (`WHERE EXCLUDED.value > table.balance`),
-so the database handles the comparison efficiently.
+PostgreSQL evaluates `@column` guards against the existing row for `upsert`,
+`update`, and `delete`. Event references in the same predicate refer to the
+incoming input; a false predicate leaves the existing row unchanged.
+
+These guards require PostgreSQL and reorg handling disabled for the table's
+networks. ClickHouse cannot enforce them, and reorg recovery cannot reconstruct
+state-dependent decisions from raw events. Those configurations now fail during
+manifest validation, as does `insert` with a table-state guard. Use an event-only
+condition where reorg recovery is required. Event-only conditions continue to be
+evaluated before database operations.
 :::
 
 ---

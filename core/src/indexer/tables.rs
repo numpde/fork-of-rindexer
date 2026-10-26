@@ -3593,26 +3593,42 @@ pub(crate) async fn prepare_table_operations<'t>(
             // Track max block per network for this batch of rows
             let mut batch_max_blocks: HashMap<String, u64> = HashMap::new();
 
+            let mut condition_inputs = std::collections::BTreeSet::new();
             // Check if condition has @table references - push to SQL instead of Rust evaluation
-            let (should_filter_in_rust, sql_condition) =
-                if let Some(condition_expr) = operation.condition() {
-                    match parse_filter_expression(condition_expr) {
-                        Ok(expr) => {
-                            if expr.has_table_references() {
-                                let sql = expr.to_sql_condition(&table_runtime.full_table_name);
-                                (false, Some(sql))
-                            } else {
-                                (true, None)
-                            }
-                        }
-                        Err(e) => {
-                            debug!("Failed to parse condition for SQL generation: {}", e);
+            let (should_filter_in_rust, sql_condition) = if let Some(condition_expr) =
+                operation.condition()
+            {
+                match parse_filter_expression(condition_expr) {
+                    Ok(expr) => {
+                        if expr.has_table_references() {
+                            let sql = match operation.operation_type {
+                                    OperationType::Update | OperationType::Delete => {
+                                        expr.visit_variables(&mut |variable| {
+                                            if variable.source() == crate::event::VariableSource::Event {
+                                                condition_inputs.insert(variable.base_name().to_string());
+                                            }
+                                        });
+                                        expr.to_sql_condition_with(&|variable| match variable.source() {
+                                            crate::event::VariableSource::Event => format!("tp.\"{}\"", condition_input_name(variable.base_name())),
+                                            crate::event::VariableSource::Table => format!("am.\"{}\"", variable.base_name()),
+                                        })
+                                    },
+                                    OperationType::Upsert => expr.to_sql_condition(&table_runtime.full_table_name),
+                                    OperationType::Insert => return Err(format!("Cannot apply table-state condition on INSERT into {}: use a guarded UPDATE or DELETE", table_runtime.full_table_name)),
+                                };
+                            (false, Some(sql))
+                        } else {
                             (true, None)
                         }
                     }
-                } else {
-                    (false, None)
-                };
+                    Err(e) => {
+                        debug!("Failed to parse condition for SQL generation: {}", e);
+                        (true, None)
+                    }
+                }
+            } else {
+                (false, None)
+            };
 
             for (log_params, network, tx_metadata) in events_data {
                 // Check for shutdown before resolving each event - exit quickly, nothing written yet
@@ -3690,6 +3706,31 @@ pub(crate) async fn prepare_table_operations<'t>(
                                 columns.insert(set_col.column.clone(), value);
                             }
                         }
+                    }
+
+                    // Guard inputs are separate from stored/set columns: DELETE has
+                    // no SET values, and UPDATE may transform the incoming value.
+                    for field in &condition_inputs {
+                        let value = if let Some(parameter) =
+                            expanded_log_params.iter().find(|parameter| &parameter.name == field)
+                        {
+                            let kind = parameter.value.sol_type_name().as_deref().and_then(ColumnType::from_solidity_type).ok_or_else(|| format!("Cannot evaluate table guard: event field {field} has an unsupported SQL type"))?;
+                            dyn_sol_value_to_wrapper(&parameter.value, &kind)
+                        } else {
+                            let kind = match field.as_str() {
+                                "rindexer_contract_address" => ColumnType::Address,
+                                "rindexer_tx_hash" | "rindexer_block_hash" => ColumnType::Bytes32,
+                                "rindexer_block_timestamp" => ColumnType::Timestamp,
+                                "rindexer_block_number" | "rindexer_tx_index" | "rindexer_log_index" => ColumnType::Uint256,
+                                _ => return Err(format!("Cannot evaluate table guard: incoming field {field} is unavailable")),
+                            };
+                            extract_value_from_event(&format!("${field}"), expanded_log_params, tx_metadata, &kind).ok_or_else(|| format!("Cannot evaluate table guard: required incoming field {field} is unavailable"))?
+                        };
+                        let name = condition_input_name(field);
+                        if table_runtime.table.columns.iter().any(|column| column.name == name) {
+                            return Err(format!("Cannot evaluate table guard in {}: column {name} conflicts with its query input; rename that column", table_runtime.full_table_name));
+                        }
+                        columns.insert(name, value);
                     }
 
                     if !columns.is_empty() {
@@ -3809,6 +3850,11 @@ pub(crate) async fn apply_table_operations(
     clickhouse: Option<Arc<ClickhouseClient>>,
     checkpoint_config: Option<&ProgressCheckpointConfig>,
 ) -> Result<(), String> {
+    if clickhouse.is_some()
+        && prepared.ops.iter().any(|operation| operation.sql_condition.is_some())
+    {
+        return Err("Cannot apply a table-state condition with ClickHouse: use PostgreSQL for @column guards or use an event-only condition".to_string());
+    }
     let postgres = match pg {
         Some(PgWriteMode::Tx(tx)) => {
             if clickhouse.is_some() {
@@ -4054,6 +4100,10 @@ fn operation_type_to_batch_type(op_type: &OperationType) -> BatchOperationType {
     }
 }
 
+fn condition_input_name(field: &str) -> String {
+    crate::database::generate::compact_table_name_if_needed(format!("rindexer_condition_{field}"))
+}
+
 /// Executes a PostgreSQL operation for tables using the batch operations infrastructure.
 ///
 /// # Arguments
@@ -4206,6 +4256,42 @@ async fn execute_postgres_operation(
                 BatchOperationColumnBehavior::Normal,
                 BatchOperationAction::Set,
             ));
+        }
+
+        if matches!(operation.operation_type, OperationType::Update | OperationType::Delete)
+            && sql_where.is_some()
+        {
+            let mut inputs = row
+                .columns
+                .iter()
+                .filter(|(name, _)| {
+                    name.starts_with("rindexer_condition_")
+                        && !table_def.columns.iter().any(|column| &column.name == *name)
+                })
+                .collect::<Vec<_>>();
+            inputs.sort_by_key(|(name, _)| *name);
+            for (name, value) in inputs {
+                use tokio_postgres::types::Type;
+                let kind = match value.to_type() {
+                    Type::BOOL => BatchOperationSqlType::Bool,
+                    Type::INT2 => BatchOperationSqlType::Smallint,
+                    Type::INT4 => BatchOperationSqlType::Integer,
+                    Type::INT8 => BatchOperationSqlType::Bigint,
+                    Type::NUMERIC => BatchOperationSqlType::Numeric,
+                    Type::BYTEA => BatchOperationSqlType::Bytea,
+                    Type::TEXT | Type::VARCHAR | Type::BPCHAR => BatchOperationSqlType::Text,
+                    Type::TIMESTAMPTZ => BatchOperationSqlType::DateTime,
+                    Type::JSONB => BatchOperationSqlType::Jsonb,
+                    kind => return Err(format!("Cannot evaluate table guard input {name}: PostgreSQL type {kind} is unsupported")),
+                };
+                columns.push(DynamicColumnDefinition::new(
+                    name.clone(),
+                    value.clone(),
+                    kind,
+                    BatchOperationColumnBehavior::Normal,
+                    BatchOperationAction::Nothing,
+                ));
+            }
         }
 
         batch_rows.push(columns);
