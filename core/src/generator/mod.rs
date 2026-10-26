@@ -18,3 +18,6 @@ pub(crate) const GENERATED_FILE_HEADER: &str = "\
 
 /// Standard `#![allow]` attributes for generated binding files.
 pub(crate) const GENERATED_ALLOW_ATTRS: &str = "#![allow(non_camel_case_types, clippy::enum_variant_names, clippy::too_many_arguments, clippy::upper_case_acronyms, clippy::type_complexity, dead_code)]";
+
+#[cfg(test)]
+mod ambiguous_event_tests;
