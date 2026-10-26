@@ -18,17 +18,19 @@ pub enum IndexingEventProgressStatus {
     Completed,
 }
 
+// Preserve the public ColoredString return type for existing Rust callers.
+// Message tokens are unstyled; the tracing subscriber owns terminal formatting.
 impl IndexingEventProgressStatus {
     pub fn syncing_log() -> ColoredString {
-        "SYNCING".green()
+        "SYNCING".normal()
     }
 
     pub fn live_log() -> ColoredString {
-        "LIVE".green()
+        "LIVE".normal()
     }
 
     pub fn completed_log() -> ColoredString {
-        "COMPLETED".green()
+        "COMPLETED".normal()
     }
 }
 
