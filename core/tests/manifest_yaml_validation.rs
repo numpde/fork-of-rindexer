@@ -231,3 +231,74 @@ graphql:
     assert!(written.contains("project_type: no-code"));
     assert!(written.contains("port: 4001"));
 }
+
+fn table_condition_manifest(condition: &str, table_options: &str) -> String {
+    base_manifest(
+        r#"      - network: mainnet
+        address: "0x0000000000000000000000000000000000000001"
+        start_block: "1""#,
+        &format!(
+            r#"    tables:
+      - name: balances
+{table_options}
+        columns:
+          - name: holder
+            type: address
+          - name: balance
+            type: uint256
+        events:
+          - event: Transfer
+            operations:
+              - type: upsert
+                where:
+                  holder: $to
+                if: "{condition}"
+                set:
+                  - column: balance
+                    action: set
+                    value: $value
+"#
+        ),
+    )
+}
+
+#[test]
+fn table_conditions_validate_parsed_event_and_stored_references_without_scanning_literals() {
+    let dir = tempfile::tempdir().unwrap();
+    write_abi(dir.path());
+    for (condition, options) in [
+        ("@balance < $value && @holder == $to", ""),
+        ("!(@balance + 1 > value * 2) || from == to", ""),
+        ("@holder != @holder", ""),
+        ("@rindexer_sequence_id < $rindexer_block_number", ""),
+        ("@network == 'mainnet' && 'Token A' != 'Token B'", ""),
+        ("'Token A' != 'Token B' && $value > 0", ""),
+        ("@rindexer_block_timestamp > 0", "        timestamp: true"),
+    ] {
+        fs::write(manifest_path(dir.path()), table_condition_manifest(condition, options)).unwrap();
+        read_manifest(&manifest_path(dir.path()))
+            .unwrap_or_else(|error| panic!("{condition}: {error}"));
+    }
+}
+
+#[test]
+fn table_conditions_reject_unknown_references_in_their_actual_namespace() {
+    let dir = tempfile::tempdir().unwrap();
+    write_abi(dir.path());
+    for (condition, options, message) in [
+        ("@missing == 1", "", "Custom indexing field 'missing'"),
+        ("$missing == 1", "", "Custom indexing event field '$missing'"),
+        ("@value == 1", "", "Custom indexing field 'value'"),
+        ("$balance == 1", "", "Custom indexing event field '$balance'"),
+        ("value > 0 && !(1 + @missing < 2)", "", "Custom indexing field 'missing'"),
+        ("@balance < 1 + $missing", "", "Custom indexing event field '$missing'"),
+        ("@rindexer_tx_index == 1", "", "Custom indexing field 'rindexer_tx_index'"),
+        ("@rindexer_block_timestamp > 0", "", "Custom indexing field 'rindexer_block_timestamp'"),
+        ("@network == 'mainnet'", "        cross_chain: true", "Custom indexing field 'network'"),
+        ("@rindexer_id > 0", "", "Custom indexing field 'rindexer_id'"),
+    ] {
+        fs::write(manifest_path(dir.path()), table_condition_manifest(condition, options)).unwrap();
+        let error = read_manifest(&manifest_path(dir.path())).unwrap_err().to_string();
+        assert!(error.contains(message), "{condition}: {error}");
+    }
+}
