@@ -4,6 +4,10 @@ use alloy::primitives::U64;
 use regex::Regex;
 use serde_json::Value;
 
+#[cfg(test)]
+#[path = "template_amount_tests.rs"]
+mod template_amount_tests;
+
 #[derive(Debug, Clone)]
 pub struct Template {
     value: String,
