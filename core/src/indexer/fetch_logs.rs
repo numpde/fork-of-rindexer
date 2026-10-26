@@ -4428,3 +4428,7 @@ mod log_ordering_tests;
 #[cfg(test)]
 #[path = "pruned_history_tests.rs"]
 mod pruned_history_tests;
+
+#[cfg(test)]
+#[path = "unknown_rpc_retry_tests.rs"]
+mod unknown_rpc_retry_tests;
