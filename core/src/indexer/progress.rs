@@ -609,3 +609,7 @@ mod tests {
         assert_block_event(&mut rx, 42161, 500);
     }
 }
+
+#[cfg(test)]
+#[path = "progress_log_tests.rs"]
+mod progress_log_tests;
