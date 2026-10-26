@@ -124,3 +124,58 @@ async fn postgres_journal_rollback_restores_sequence_and_provenance_before_repla
     drop(callback);
     fixture.finish().await;
 }
+
+#[tokio::test]
+async fn postgres_uint256_maximum_journal_survives_reorg_without_replacement_event() {
+    let fixture = fixture("max", "uint256", false).await;
+    let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+    callback(vec![at(&fixture, "ethereum", 99, B256::repeat_byte(99), 500)]).await.unwrap();
+    callback(vec![at(&fixture, "ethereum", 100, B256::repeat_byte(100), 1000)]).await.unwrap();
+    assert_eq!(amount(&fixture).await, "1000");
+    let journal_count: i64 = fixture
+        .client
+        .query_one("SELECT count(*) FROM rindexer_internal.derived_op_log", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(journal_count, 2, "ordinary uint256 inputs must have durable recovery records");
+    rollback(&fixture, SetAction::Max, false).await;
+    assert_eq!(amount(&fixture).await, "500");
+    drop(callback);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_required_journal_failure_aborts_every_application_effect_and_retry_applies_once()
+{
+    let fixture = fixture("set", "uint64", false).await;
+    fixture.client.batch_execute("ALTER TABLE rindexer_internal.derived_op_log ADD CONSTRAINT reject_journal CHECK (block_number < 0)").await.unwrap();
+    let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+    let event = at(&fixture, "ethereum", 99, B256::repeat_byte(99), 500);
+    let before = fixture.position().await;
+    let result = callback(vec![event.clone()]).await;
+    assert!(
+        matches!(result, Err(crate::event::callback_registry::CallbackError::Retryable(_))),
+        "required recovery record failure must fail the callback: {result:?}"
+    );
+    assert_eq!(fixture.position().await, before);
+    let receipts: i64 = fixture
+        .client
+        .query_one("SELECT count(*) FROM rindexer_internal.event_applications", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(receipts, 0);
+    fixture
+        .client
+        .batch_execute(
+            "ALTER TABLE rindexer_internal.derived_op_log DROP CONSTRAINT reject_journal",
+        )
+        .await
+        .unwrap();
+    callback(vec![event.clone()]).await.unwrap();
+    callback(vec![event]).await.unwrap();
+    assert_eq!(fixture.position().await, (1, "500".to_string(), "99".to_string()));
+    drop(callback);
+    fixture.finish().await;
+}
