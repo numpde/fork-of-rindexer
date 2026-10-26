@@ -4349,3 +4349,7 @@ mod indexed_filter_tests;
 #[cfg(test)]
 #[path = "log_ordering_tests.rs"]
 mod log_ordering_tests;
+
+#[cfg(test)]
+#[path = "pruned_history_tests.rs"]
+mod pruned_history_tests;

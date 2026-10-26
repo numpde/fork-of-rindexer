@@ -849,3 +849,85 @@ async fn requested_global_shutdown_allows_live_producer_completion() {
     assert_eq!(fixture.cursor(), "1");
     assert_eq!(active_indexing_count(), 0);
 }
+
+async fn pruned_history_fixture(
+    concurrency: usize,
+) -> (Fixture, Arc<std::sync::atomic::AtomicUsize>) {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = calls.clone();
+    let mut fixture = Fixture::with_logs(
+        Arc::new(move |_| {
+            observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async { Ok(()) })
+        }),
+        vec![],
+    )
+    .await;
+    let EventProcessingConfig::ContractEventProcessing(config) =
+        Arc::get_mut(&mut fixture.config).unwrap()
+    else {
+        panic!("contract fixture")
+    };
+    config.live_indexing = true;
+    config.end_block = U64::from(5000);
+    config.config.fetch_concurrency = Some(concurrency);
+    let provider = Arc::new(
+        MockChainProvider::new(1)
+            .with_block_number(5000)
+            .with_log_rpc_error(4444, "provider-specific detail"),
+    );
+    let network = Arc::make_mut(&mut config.network_contract);
+    network.cached_provider = provider.clone();
+    network.block_clock = BlockClock::new(None, None, provider);
+    (fixture, calls)
+}
+
+#[tokio::test]
+async fn pruned_history_dispatcher_preserves_durable_cursor_and_skips_callbacks() {
+    for concurrency in [1, 2] {
+        let (fixture, calls) = pruned_history_fixture(concurrency).await;
+        let error = timeout(
+            Duration::from_secs(2),
+            super::process_event_logs(fixture.config.clone(), false, false, None, None),
+        )
+        .await
+        .expect("history expiry must reach the dispatcher promptly")
+        .expect_err("unavailable history is an indexing failure")
+        .to_string();
+        assert!(
+            error.contains("4444") && error.contains(&fixture.config.info_log_name()),
+            "{error}"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(fixture.cursor(), "1");
+        assert!(!fixture.config.cancel_token().is_cancelled());
+        assert_eq!(active_indexing_count(), 0);
+    }
+}
+
+#[tokio::test]
+async fn pruned_history_parallel_producer_closes_after_its_first_terminal_error() {
+    use tokio_stream::StreamExt;
+    let (fixture, calls) = pruned_history_fixture(2).await;
+    let mut stream = crate::indexer::fetch_logs::fetch_logs_stream(
+        fixture.config.clone(),
+        false,
+        None,
+        None,
+        crate::indexer::reorg::subscribe_reorgs("ethereum"),
+    );
+    let error = timeout(Duration::from_secs(2), stream.next())
+        .await
+        .expect("history failure must arrive promptly")
+        .expect("one terminal result")
+        .err()
+        .expect("failed range cannot certify progress");
+    assert!(error.to_string().contains("4444"));
+    assert!(timeout(Duration::from_secs(2), stream.next())
+        .await
+        .expect("parallel history must close rather than hand off to live indexing")
+        .is_none());
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert_eq!(fixture.cursor(), "1");
+    assert!(!fixture.config.cancel_token().is_cancelled());
+}

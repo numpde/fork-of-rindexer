@@ -1049,6 +1049,8 @@ pub mod mock {
         block_number: U64,
         block_fetch_error: Option<String>,
         panic_on_log_fetch: bool,
+        log_rpc_error: Option<(i64, String)>,
+        log_fetches: std::sync::atomic::AtomicUsize,
         block_batches: Option<std::sync::Mutex<std::collections::VecDeque<Vec<AnyRpcBlock>>>>,
         receipts: Vec<AnyTransactionReceipt>,
         traces: Vec<LocalizedTransactionTrace>,
@@ -1065,11 +1067,22 @@ pub mod mock {
                 block_number: U64::ZERO,
                 block_fetch_error: None,
                 panic_on_log_fetch: false,
+                log_rpc_error: None,
+                log_fetches: std::sync::atomic::AtomicUsize::new(0),
                 block_batches: None,
                 receipts: vec![],
                 traces: vec![],
                 shared_tip_logs: None,
             }
+        }
+
+        pub fn with_log_rpc_error(mut self, code: i64, message: &str) -> Self {
+            self.log_rpc_error = Some((code, message.to_string()));
+            self
+        }
+
+        pub fn log_fetches(&self) -> usize {
+            self.log_fetches.load(std::sync::atomic::Ordering::Relaxed)
         }
 
         pub fn with_block_fetch_error(mut self, message: &str) -> Self {
@@ -1158,6 +1171,19 @@ pub mod mock {
             event_filter: &RindexerEventFilter,
         ) -> Result<Vec<Log>, ProviderError> {
             assert!(!self.panic_on_log_fetch, "scripted log producer panic");
+            self.log_fetches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some((code, message)) = &self.log_rpc_error {
+                // Real RPC failures yield to the runtime; keep timeout-driven
+                // dispatcher tests from spinning synchronously inside the mock.
+                tokio::task::yield_now().await;
+                return Err(ProviderError::RequestFailed(RpcError::ErrorResp(
+                    alloy::rpc::json_rpc::ErrorPayload {
+                        code: *code,
+                        message: message.clone().into(),
+                        data: None,
+                    },
+                )));
+            }
             let from = event_filter.from_block().to::<u64>();
             let to = event_filter.to_block().to::<u64>();
             let topic_id = event_filter.event_signature();
