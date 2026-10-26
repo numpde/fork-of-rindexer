@@ -197,7 +197,7 @@ impl DerivedTableRollbackPlan {
         for binding in bindings {
             let binding = IterateBinding {
                 array_field: event_field_to_db_column(&binding.array_field),
-                alias: event_field_to_db_column(&binding.alias),
+                alias: normalize_event_field(&binding.alias),
             };
             super::validate_sql_identifier(&binding.array_field, "rollback iterate array column")?;
             super::validate_sql_identifier(&binding.alias, "rollback iterate alias")?;
@@ -416,6 +416,10 @@ impl SqlDialect {
     }
 }
 
+fn normalize_event_field(field: &str) -> String {
+    field.split('.').map(camel_to_snake).collect::<Vec<_>>().join("_")
+}
+
 fn event_field_to_db_column(field: &str) -> String {
     match field {
         "rindexer_block_number" => "block_number".to_string(),
@@ -425,7 +429,7 @@ fn event_field_to_db_column(field: &str) -> String {
         "rindexer_contract_address" => "contract_address".to_string(),
         "rindexer_log_index" => "log_index".to_string(),
         "rindexer_tx_index" => "tx_index".to_string(),
-        _ => field.split('.').map(camel_to_snake).collect::<Vec<_>>().join("_"),
+        _ => crate::abi::raw_event_abi_column_name(&normalize_event_field(field)),
     }
 }
 
@@ -450,23 +454,20 @@ struct ReversalSource<'a> {
 
 impl ReversalSource<'_> {
     fn column(&self, field: &str) -> String {
-        let column = event_field_to_db_column(field);
-        if let Some(index) = self.iterate.iter().position(|binding| binding.alias == column) {
+        let alias = normalize_event_field(field);
+        if let Some(index) = self.iterate.iter().position(|binding| binding.alias == alias) {
             match self.dialect {
-                SqlDialect::Postgres => {
-                    format!("_rindexer_iter.{}", self.dialect.quote(&column))
-                }
-                SqlDialect::Clickhouse => {
-                    format!("tupleElement(_rindexer_iter, {})", index + 1)
-                }
+                SqlDialect::Postgres => format!("_rindexer_iter.{}", self.dialect.quote(&alias)),
+                SqlDialect::Clickhouse => format!("tupleElement(_rindexer_iter, {})", index + 1),
             }
         } else {
+            let column = event_field_to_db_column(field);
             format!("_rindexer_event.{}", self.dialect.quote(&column))
         }
     }
 
     fn variable_expression(&self, variable: &ConditionLeft<'_>) -> String {
-        let base = event_field_to_db_column(variable.base_name());
+        let base = normalize_event_field(variable.base_name());
         if let Some(binding) = self.iterate.iter().find(|binding| binding.alias == base) {
             return self.iterate_variable_expression(variable, binding);
         }

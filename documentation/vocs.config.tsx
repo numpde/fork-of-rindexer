@@ -253,6 +253,10 @@ export default defineConfig({
           link: "/docs/migrations/terminal-event-failures",
         },
         {
+          text: "Raw Event Column Names",
+          link: "/docs/migrations/raw-event-column-names",
+        },
+        {
           text: "PostgreSQL Event Replay",
           link: "/docs/migrations/postgres-event-replay",
         },

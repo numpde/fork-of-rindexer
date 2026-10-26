@@ -2,6 +2,7 @@
 
 ### Breaking changes
 -------------------------------------------------
+- breaking: raw ABI columns colliding with event metadata, or starting with reserved `rindexer_abi_`, now use escaped storage names across PostgreSQL, ClickHouse and CSV. Stop writers and migrate or rebuild affected storage and dependent queries before restarting; existing rows/headers are not rewritten. Rust projects must run `rindexer codegen typings`; handwritten rollback operands use logical event paths or `rindexer_*` metadata aliases. Event expressions and decoded JSON retain ABI names; see [migration instructions](/docs/migrations/raw-event-column-names).
 - breaking: contract-event live indexing now returns an error when its log producer ends without a shutdown or cancellation request, instead of reporting successful completion. Supervisors and Rust callers must treat this as interrupted indexing and restart from durable progress after investigating the cause; finite history and requested stops remain successful.
 - breaking: direct launchers of the embedded GraphQL executable must supply `RINDEXER_GRAPHQL_DATABASE_URL` in the child environment and remove the positional connection URL. The helper now rejects positional database URLs and missing/empty child credentials, with updated startup usage messages. Normal `rindexer` launches continue to use the existing PostgreSQL configuration automatically.
 - breaking: historical `timestamps: true` indexing now reports a missing-header error and stops the affected stream when an unresolved one-block range cannot shrink further; it no longer retries incomplete header responses indefinitely or hands failed history to live indexing. Restore header coverage and restart from unfinished progress. Transient provider failures still retry.
@@ -35,6 +36,7 @@
 
 ### Bug fixes
 -------------------------------------------------
+- fix: ABI fields such as `contract_address`, `block_number` and `rindexer_id` now index without duplicating raw metadata columns. INSERT/COPY and rollback share the same ABI storage mapping while metadata and virtual iterate aliases keep their own identities ([#65](https://github.com/joshstevens19/rindexer/issues/65)).
 - fix: unexpected contract-event live EOF now identifies the stream in an indexing-task error after admitted callbacks finish; existing fetch/callback errors keep their original failure precedence.
 - fix: GraphQL server startup and supervised restarts no longer put the PostgreSQL connection URL/password in process arguments; the launcher supplies it through a child-specific environment value that the Node entrypoint removes after reading ([#222](https://github.com/joshstevens19/rindexer/issues/222)).
 - fix: address-filtered RPC log responses now merge in block/transaction/log order before historical progress advances, including one-chunk queries. RPC timestamp enrichment fills missing values in place, preserving input order and existing timestamps across partial responses ([#474](https://github.com/joshstevens19/rindexer/pull/474)).

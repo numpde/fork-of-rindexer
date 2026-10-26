@@ -91,6 +91,11 @@ fn raw_storage_names_separate_metadata_and_preserve_original_event_paths() {
         csv.iter().map(|property| &property.value).collect::<Vec<_>>(),
         sql[1..1 + inputs.len()].iter().collect::<Vec<_>>()
     );
+    let event = crate::abi::EventInfo::new(serde_json::from_value(definition()).unwrap()).unwrap();
+    assert_eq!(
+        event.csv_headers_for_event(),
+        sql.iter().filter(|name| name.as_str() != "block_timestamp").cloned().collect::<Vec<_>>()
+    );
     let objects =
         ABIInput::generate_abi_name_properties(&inputs, &GenerateAbiPropertiesType::Object, None);
     assert_eq!(
@@ -125,7 +130,7 @@ async fn postgres_abi_metadata_collisions_round_trip_through_insert_and_copy() {
         let columns = &fixture.params.sql_column_names[1..1 + names().len()];
         let selection =
             columns.iter().map(|name| format!("\"{name}\"::text")).collect::<Vec<_>>().join(",");
-        let rows=fixture.client.query(&format!("SELECT {selection},block_number::text,network,contract_address,rindexer_id FROM {} ORDER BY value",fixture.params.sql_event_table_name),&[]).await.unwrap();
+        let rows=fixture.client.query(&format!("SELECT {selection},block_number::text,network,contract_address,rindexer_id,tx_hash,block_hash,tx_index::text,log_index::text,(block_timestamp IS NULL) FROM {} AS event_row ORDER BY event_row.value::numeric",fixture.params.sql_event_table_name),&[]).await.unwrap();
         for (offset, row) in rows.iter().enumerate() {
             let id = offset as u64 + 1;
             for (index, value) in values(id).iter().enumerate() {
@@ -138,6 +143,17 @@ async fn postgres_abi_metadata_collisions_round_trip_through_insert_and_copy() {
                 format!("{:#x}", alloy::primitives::Address::ZERO)
             );
             assert_eq!(row.get::<_, i32>(names().len() + 3), id as i32);
+            assert_eq!(
+                row.get::<_, String>(names().len() + 4),
+                format!("{:#x}", B256::repeat_byte(id as u8))
+            );
+            assert_eq!(
+                row.get::<_, String>(names().len() + 5),
+                format!("{:#x}", B256::repeat_byte(2))
+            );
+            assert_eq!(row.get::<_, String>(names().len() + 6), id.to_string());
+            assert_eq!(row.get::<_, String>(names().len() + 7), id.to_string());
+            assert!(row.get::<_, bool>(names().len() + 8));
         }
         let declared:Vec<String>=fixture.client.query("SELECT column_name FROM information_schema.columns WHERE table_schema=$1 AND table_name='value'",&[&generate_indexer_contract_schema_name(&fixture.params.indexer_name,"Contract")]).await.unwrap().iter().map(|row|row.get(0)).collect();
         assert_eq!(
@@ -153,6 +169,7 @@ async fn rollback(
     fixture: &Fixture,
     source_types: std::collections::HashMap<String, ColumnType>,
     bindings: Vec<crate::manifest::contract::IterateBinding>,
+    operand: &str,
 ) {
     let schema = generate_indexer_contract_schema_name(&fixture.params.indexer_name, "Contract");
     let cursor = generate_internal_event_table_name(&schema, "Value");
@@ -187,7 +204,7 @@ async fn rollback(
                 vec![],
                 vec![DerivedColumnRollback::try_new(
                     "amount".into(),
-                    "block_number".into(),
+                    operand.into(),
                     SetAction::Add,
                 )
                 .unwrap()],
@@ -209,13 +226,14 @@ async fn rollback(
     .await
     .unwrap();
 }
-fn table(iterate: serde_json::Value) -> serde_json::Value {
-    json!({"name":"totals","global":true,"columns":[{"name":"amount","type":"uint256","default":"0"}],"events":[{"event":"Value","iterate":iterate,"operations":[{"type":"upsert","set":[{"column":"amount","action":"add","value":"$block_number"}]}]}]})
+fn table(iterate: serde_json::Value, operand: &str) -> serde_json::Value {
+    json!({"name":"totals","global":true,"columns":[{"name":"amount","type":"uint256","default":"0"}],"events":[{"event":"Value","iterate":iterate,"operations":[{"type":"upsert","set":[{"column":"amount","action":"add","value":format!("${operand}")}]}]}]})
 }
 
 #[tokio::test]
 async fn postgres_collision_rollback_reverses_the_abi_value_instead_of_chain_height() {
-    let fixture = Fixture::with_table(definition(), "Contract", table(json!([]))).await;
+    let fixture =
+        Fixture::with_table(definition(), "Contract", table(json!([]), "block_number")).await;
     let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
     for (height, amount) in [(99, 500), (100, 700)] {
         let mut data = values(height);
@@ -238,6 +256,7 @@ async fn postgres_collision_rollback_reverses_the_abi_value_instead_of_chain_hei
         ]
         .into(),
         vec![],
+        "block_number",
     )
     .await;
     assert_eq!(fixture.position().await.1, "500");
@@ -246,34 +265,49 @@ async fn postgres_collision_rollback_reverses_the_abi_value_instead_of_chain_hei
 
 #[tokio::test]
 async fn postgres_iterate_alias_matching_metadata_still_uses_its_virtual_value() {
-    let event = json!({"name":"Value","type":"event","anonymous":false,"inputs":[{"name":"ids","type":"uint256[]","indexed":false}]});
-    let fixture =
-        Fixture::with_table(event, "Contract", table(json!(["$ids as block_number"]))).await;
-    let mut event = fixture.events(&[1]).remove(0);
-    event.log.inner.data = LogData::new_unchecked(
-        vec![fixture.params.event.selector()],
-        DynSolValue::Tuple(vec![DynSolValue::Array(vec![
-            DynSolValue::Uint(U256::from(500), 256),
-            DynSolValue::Uint(U256::from(700), 256),
-        ])])
-        .abi_encode_params()
-        .into(),
-    );
-    event.log.block_number = Some(100);
-    event.tx_information.block_number = 100;
-    event.found_in_request.from_block = U64::from(100);
-    event.found_in_request.to_block = U64::from(100);
-    (no_code_callback(Arc::new(fixture.params.clone())).event_callback)(vec![event]).await.unwrap();
-    assert_eq!(fixture.position().await.1, "1200");
-    rollback(
-        &fixture,
-        [("ids".into(), ColumnType::Array(Box::new(ColumnType::Uint256)))].into(),
-        vec![crate::manifest::contract::IterateBinding {
-            array_field: "ids".into(),
-            alias: "block_number".into(),
-        }],
-    )
-    .await;
-    assert_eq!(fixture.position().await.1, "0");
-    fixture.finish().await;
+    for (array_field, alias, expected) in
+        [("ids", "block_number", "1200"), ("network", "block_number", "1200")]
+    {
+        let event = json!({"name":"Value","type":"event","anonymous":false,"inputs":[{"name":array_field,"type":"uint256[]","indexed":false}]});
+        let fixture = Fixture::with_table(
+            event,
+            "Contract",
+            table(json!([format!("${array_field} as {alias}")]), alias),
+        )
+        .await;
+        let mut event = fixture.events(&[1]).remove(0);
+        event.log.inner.data = LogData::new_unchecked(
+            vec![fixture.params.event.selector()],
+            DynSolValue::Tuple(vec![DynSolValue::Array(vec![
+                DynSolValue::Uint(U256::from(500), 256),
+                DynSolValue::Uint(U256::from(700), 256),
+            ])])
+            .abi_encode_params()
+            .into(),
+        );
+        event.log.block_number = Some(100);
+        event.tx_information.block_number = 100;
+        event.found_in_request.from_block = U64::from(100);
+        event.found_in_request.to_block = U64::from(100);
+        (no_code_callback(Arc::new(fixture.params.clone())).event_callback)(vec![event])
+            .await
+            .unwrap();
+        assert_eq!(fixture.position().await.1, expected);
+        rollback(
+            &fixture,
+            [(
+                fixture.params.sql_column_names[1].clone(),
+                ColumnType::Array(Box::new(ColumnType::Uint256)),
+            )]
+            .into(),
+            vec![crate::manifest::contract::IterateBinding {
+                array_field: array_field.into(),
+                alias: alias.into(),
+            }],
+            alias,
+        )
+        .await;
+        assert_eq!(fixture.position().await.1, "0");
+        fixture.finish().await;
+    }
 }

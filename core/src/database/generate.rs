@@ -15,6 +15,21 @@ use alloy::primitives::keccak256;
 use std::path::Path;
 use tracing::{error, info};
 
+/// Raw row order puts the emitting address first, then ABI values, then the
+/// remaining metadata. SQL writers and CSV projections share these names.
+pub(crate) const RAW_EVENT_METADATA_COLUMNS: [&str; 8] = [
+    "contract_address",
+    "tx_hash",
+    "block_number",
+    "block_timestamp",
+    "block_hash",
+    "network",
+    "tx_index",
+    "log_index",
+];
+/// PostgreSQL generates this key; it is reserved but not supplied by raw writers.
+pub(crate) const RAW_EVENT_ID_COLUMN: &str = "rindexer_id";
+
 fn generate_event_table_sql_with_comments(
     abi_inputs: &[EventInfo],
     contract_name: &str,
@@ -34,7 +49,7 @@ fn generate_event_table_sql_with_comments(
 
             let create_table_sql = format!(
                 "CREATE TABLE IF NOT EXISTS {table_name} (\
-                    rindexer_id SERIAL PRIMARY KEY NOT NULL, \
+                    {RAW_EVENT_ID_COLUMN} SERIAL PRIMARY KEY NOT NULL, \
                     contract_address CHAR(42) NOT NULL, \
                     {event_columns} \
                     tx_hash CHAR(66) NOT NULL, \

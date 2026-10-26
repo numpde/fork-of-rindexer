@@ -1,4 +1,4 @@
-use crate::database::generate::compact_table_name_if_needed;
+use crate::database::generate::{compact_table_name_if_needed, RAW_EVENT_METADATA_COLUMNS};
 use crate::helpers::{parse_solidity_integer_type, solidity_type_parts};
 use crate::{
     abi::{ABIInput, GenerateAbiPropertiesType},
@@ -21,17 +21,9 @@ fn generate_columns_names_only(inputs: &[ABIInput]) -> Vec<String> {
 }
 
 pub fn generate_column_names_only_with_base_properties(inputs: &[ABIInput]) -> Vec<String> {
-    let mut column_names: Vec<String> = vec!["contract_address".to_string()];
+    let mut column_names: Vec<String> = vec![RAW_EVENT_METADATA_COLUMNS[0].to_string()];
     column_names.extend(generate_columns_names_only(inputs));
-    column_names.extend(vec![
-        "tx_hash".to_string(),
-        "block_number".to_string(),
-        "block_timestamp".to_string(),
-        "block_hash".to_string(),
-        "network".to_string(),
-        "tx_index".to_string(),
-        "log_index".to_string(),
-    ]);
+    column_names.extend(RAW_EVENT_METADATA_COLUMNS[1..].iter().map(|name| name.to_string()));
     column_names
 }
 

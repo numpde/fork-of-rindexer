@@ -473,7 +473,11 @@ fn collect_source_column_types(
 
         if let Some(components) = &input.components {
             if input.type_.starts_with("tuple[") {
-                collect_jsonb_tuple_element_types(components, &column, source_column_types);
+                collect_jsonb_tuple_element_types(
+                    components,
+                    &crate::abi::raw_event_abi_column_name(&column),
+                    source_column_types,
+                );
             } else {
                 collect_source_column_types(components, Some(&column), source_column_types);
             }
@@ -481,7 +485,7 @@ fn collect_source_column_types(
         }
 
         if let Some(column_type) = ColumnType::from_solidity_type(&input.type_) {
-            source_column_types.insert(column, column_type);
+            source_column_types.insert(crate::abi::raw_event_abi_column_name(&column), column_type);
         }
     }
 }
@@ -2083,6 +2087,33 @@ contracts:
         assert_eq!(source_column_types["fixed_accounts.tokenAmount"], ColumnType::Uint256);
         assert!(!source_column_types.contains_key("accounts"));
         assert!(!source_column_types.contains_key("fixed_accounts"));
+    }
+
+    #[test]
+    fn collect_source_column_types_tracks_physical_raw_names() {
+        let inputs: Vec<ABIInput> = serde_json::from_value(serde_json::json!([
+            {"name":"block_number","type":"uint256[]"},
+            {"name":"network","type":"tuple[]","components":[{"name":"owner","type":"address"}]},
+            {"name":"tx","type":"tuple","components":[{"name":"hash","type":"uint256"}]}
+        ]))
+        .unwrap();
+        let mut types = HashMap::new();
+        collect_source_column_types(&inputs, None, &mut types);
+        assert_eq!(
+            types["rindexer_abi_block_number"],
+            ColumnType::Array(Box::new(ColumnType::Uint256))
+        );
+        assert_eq!(types["rindexer_abi_network.owner"], ColumnType::Address);
+        assert_eq!(types["rindexer_abi_tx_hash"], ColumnType::Uint256);
+        assert!(!types.contains_key("block_number"));
+        let names =
+            crate::database::postgres::generate::generate_column_names_only_with_base_properties(
+                &inputs,
+            );
+        assert_eq!(
+            &names[1..4],
+            &["rindexer_abi_block_number", "rindexer_abi_network", "rindexer_abi_tx_hash"]
+        );
     }
 
     #[test]

@@ -1,0 +1,73 @@
+# Raw event column names
+
+Raw event tables contain both ABI values and indexing metadata. Valid ABI inputs
+such as `contract_address`, `block_number` and `rindexer_id` previously generated
+duplicate PostgreSQL columns. Raw storage now separates those values using one
+naming rule across PostgreSQL, ClickHouse, CSV headers and generated Rust SQL
+column lists. See the original report, [#65](https://github.com/joshstevens19/rindexer/issues/65).
+
+## Naming rule
+
+The metadata columns retain their names: `contract_address`, `tx_hash`,
+`block_number`, `block_timestamp`, `block_hash`, `network`, `tx_index` and
+`log_index`. PostgreSQL also generates the `rindexer_id` primary key.
+
+ABI names are normalized and scalar tuple paths flattened as before. A resulting
+ABI column that matches any of those metadata names gets the `rindexer_abi_`
+prefix. That prefix is reserved: ABI column names already starting with it get
+another prefix, so they cannot occupy an escaped column belonging to another
+field. Escaped names exceeding PostgreSQL's 63-byte identifier limit use
+`rindexer_abi_` followed by the first 50 lowercase hex digits of the Keccak-256
+digest of the normalized ABI column name. This avoids losing distinguishing
+suffixes through PostgreSQL truncation.
+
+| ABI field or flattened path | Stored ABI column |
+| --- | --- |
+| `value` | `value` |
+| `blockNumber` | `rindexer_abi_block_number` |
+| `contract_address` | `rindexer_abi_contract_address` |
+| `block.number` | `rindexer_abi_block_number` |
+| `rindexer_abi_block_number` | `rindexer_abi_rindexer_abi_block_number` |
+
+The `blockNumber` and `block.number` rows are alternative examples; they do not
+establish support for two ABI leaves that flatten to the same column name.
+
+Decoded event names and JSON fields keep their ABI identity. Custom-table
+expressions use the event field, for example `$block_number`, while
+`$rindexer_block_number` continues to mean the chain height. Recovery translates
+event references through the same storage mapping. Virtual `iterate` aliases
+retain their own identity, including aliases named `block_number`.
+
+Handwritten rollback descriptors also use logical event paths or `rindexer_*`
+metadata aliases. A caller that used `block_number` to mean the chain height
+must use `rindexer_block_number`. Passing an already escaped physical label as
+an event operand would instead address an ABI field with that logical name.
+
+## Upgrading existing storage
+
+Projects with affected stored ABI columns need a reviewed migration before
+writers restart. This includes ABI names already using `rindexer_abi_`, even if
+they previously indexed successfully without a metadata collision.
+
+1. Stop writers and back up affected storage, manifests and ABIs.
+2. Inventory affected normalized/flattened ABI column names. Compare regenerated
+   SQL column lists with the existing schemas; metadata columns must retain their
+   meaning and values.
+3. Prefer rebuilding affected raw history, derived state, journals, application
+   receipts and checkpoints together in fresh storage from trusted canonical
+   history. Shared derived tables need all contributing streams included in that
+   plan. Reusing receipts against incomplete copied history cannot restore
+   missing effects through replay.
+4. For a reviewed in-place migration, apply the exact new ABI-column mapping to
+   every affected raw table before restarting. Long escaped names use the digest
+   rule above rather than a truncated prefix. Review dependent SQL and GraphQL
+   consumers as part of the migration.
+5. Start a fresh CSV output or migrate its ABI header labels deliberately before
+   appending. Column values retain their order; an old ambiguous header does not
+   become unambiguous automatically.
+6. Run `rindexer codegen typings` for Rust projects so generated INSERT/COPY column
+   lists match the storage schema. Original typed event access paths remain ABI
+   paths.
+
+Existing data and CSV headers are not rewritten automatically. Review replay of
+external deliveries according to each sink's existing guarantees.

@@ -91,6 +91,29 @@ impl AbiProperty {
     }
 }
 
+/// Project a normalized ABI leaf name into raw storage. ABI access paths and
+/// virtual iterate aliases are separate identities and must not be passed here
+/// after they have already been projected into a stored column name.
+pub(crate) fn raw_event_abi_column_name(name: &str) -> String {
+    use crate::database::generate::{RAW_EVENT_ID_COLUMN, RAW_EVENT_METADATA_COLUMNS};
+    const PREFIX: &str = "rindexer_abi_";
+    if name != RAW_EVENT_ID_COLUMN
+        && !RAW_EVENT_METADATA_COLUMNS.contains(&name)
+        && !name.starts_with(PREFIX)
+    {
+        return name.to_string();
+    }
+    let escaped = format!("{PREFIX}{name}");
+    if escaped.len() <= 63 {
+        return escaped;
+    }
+    // PostgreSQL truncates identifiers at 63 bytes. A fixed ASCII digest keeps
+    // distinct long escaped names from losing their distinguishing suffixes.
+    let mut bounded = format!("{PREFIX}{:x}", keccak256(name.as_bytes()));
+    bounded.truncate(63);
+    bounded
+}
+
 impl ABIInput {
     /// Indexed arrays and tuples expose only their topic digest. Their original
     /// Solidity type still defines the event signature, never the stored value.
@@ -156,12 +179,15 @@ impl ABIInput {
                             .join("_")
                     });
 
+                    let abi_column = match prefix.as_deref() {
+                        Some(prefix) => format!("{prefix}_{}", camel_to_snake(&input.name)),
+                        None => camel_to_snake(&input.name),
+                    };
+                    let storage_column = raw_event_abi_column_name(&abi_column);
                     match properties_type {
                         GenerateAbiPropertiesType::PostgresWithDataTypes => {
                             let value = format!(
-                                "\"{}{}\" {}",
-                                prefix.map_or_else(|| "".to_string(), |p| format!("{p}_")),
-                                camel_to_snake(&input.name),
+                                "\"{storage_column}\" {}",
                                 solidity_type_to_db_type(storage_type)
                             );
 
@@ -169,13 +195,12 @@ impl ABIInput {
                         }
                         GenerateAbiPropertiesType::PostgresColumnsNamesOnly
                         | GenerateAbiPropertiesType::CsvHeaderNames => {
-                            let value = format!(
-                                "{}{}",
-                                prefix.map_or_else(|| "".to_string(), |p| format!("{p}_")),
-                                camel_to_snake(&input.name),
-                            );
-
-                            vec![AbiProperty::new(value, &input.name, storage_type, path.clone())]
+                            vec![AbiProperty::new(
+                                storage_column,
+                                &input.name,
+                                storage_type,
+                                path.clone(),
+                            )]
                         }
                         GenerateAbiPropertiesType::Object => {
                             let value = format!(
@@ -188,9 +213,7 @@ impl ABIInput {
                         }
                         GenerateAbiPropertiesType::ClickhouseWithDataTypes => {
                             let value = format!(
-                                "\"{}{}\" {}",
-                                prefix.map_or_else(|| "".to_string(), |p| format!("{}_", p)),
-                                camel_to_snake(&input.name),
+                                "\"{storage_column}\" {}",
                                 solidity_type_to_clickhouse_type(storage_type)
                             );
 
@@ -400,13 +423,15 @@ impl EventInfo {
         .map(|m| m.value)
         .collect();
 
-        headers.insert(0, r#"contract_address"#.to_string());
-        headers.push(r#"tx_hash"#.to_string());
-        headers.push(r#"block_number"#.to_string());
-        headers.push(r#"block_hash"#.to_string());
-        headers.push(r#"network"#.to_string());
-        headers.push(r#"tx_index"#.to_string());
-        headers.push(r#"log_index"#.to_string());
+        use crate::database::generate::RAW_EVENT_METADATA_COLUMNS;
+        headers.insert(0, RAW_EVENT_METADATA_COLUMNS[0].to_string());
+        // Preserve CSV's existing metadata layout, which omits block_timestamp.
+        headers.extend(
+            RAW_EVENT_METADATA_COLUMNS[1..]
+                .iter()
+                .filter(|name| **name != "block_timestamp")
+                .map(|name| name.to_string()),
+        );
 
         headers
     }
