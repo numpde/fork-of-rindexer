@@ -1048,6 +1048,7 @@ pub mod mock {
         blocks: Vec<Arc<AnyRpcBlock>>,
         block_number: U64,
         block_fetch_error: Option<String>,
+        panic_on_log_fetch: bool,
         block_batches: Option<std::sync::Mutex<std::collections::VecDeque<Vec<AnyRpcBlock>>>>,
         receipts: Vec<AnyTransactionReceipt>,
         traces: Vec<LocalizedTransactionTrace>,
@@ -1063,6 +1064,7 @@ pub mod mock {
                 blocks: vec![],
                 block_number: U64::ZERO,
                 block_fetch_error: None,
+                panic_on_log_fetch: false,
                 block_batches: None,
                 receipts: vec![],
                 traces: vec![],
@@ -1072,6 +1074,12 @@ pub mod mock {
 
         pub fn with_block_fetch_error(mut self, message: &str) -> Self {
             self.block_fetch_error = Some(message.to_string());
+            self
+        }
+
+        /// Simulate a producer crash so the real dispatcher must classify EOF.
+        pub fn with_log_fetch_panic(mut self) -> Self {
+            self.panic_on_log_fetch = true;
             self
         }
 
@@ -1149,6 +1157,7 @@ pub mod mock {
             &self,
             event_filter: &RindexerEventFilter,
         ) -> Result<Vec<Log>, ProviderError> {
+            assert!(!self.panic_on_log_fetch, "scripted log producer panic");
             let from = event_filter.from_block().to::<u64>();
             let to = event_filter.to_block().to::<u64>();
             let topic_id = event_filter.event_signature();

@@ -774,3 +774,78 @@ async fn reorg_retires_retrying_callback_before_waiting_for_its_writer_guard() {
         .reason(fixture.config.id(), "ethereum")
         .is_none());
 }
+
+async fn stream_completion_fixture(live: bool, producer_panics: bool) -> Fixture {
+    let mut fixture = Fixture::with_logs(Arc::new(|_| Box::pin(async { Ok(()) })), vec![]).await;
+    let EventProcessingConfig::ContractEventProcessing(config) =
+        Arc::get_mut(&mut fixture.config).unwrap()
+    else {
+        panic!("contract fixture")
+    };
+    config.live_indexing = live;
+    config.start_block = U64::from(1);
+    config.end_block = U64::from(2);
+    let provider = MockChainProvider::new(1).with_block_number(2);
+    let provider =
+        Arc::new(if producer_panics { provider.with_log_fetch_panic() } else { provider });
+    let network = Arc::make_mut(&mut config.network_contract);
+    network.cached_provider = provider.clone();
+    network.block_clock = BlockClock::new(None, None, provider);
+    fixture
+}
+
+#[tokio::test]
+async fn unexpected_live_producer_eof_is_reported_as_failure() {
+    let fixture = stream_completion_fixture(true, true).await;
+    let result = timeout(
+        Duration::from_secs(2),
+        super::process_event_logs(fixture.config.clone(), false, false, None, None),
+    )
+    .await
+    .expect("dispatcher must observe the failed producer closing its channel");
+    let error =
+        result.expect_err("an unrequested live EOF cannot report successful indexing").to_string();
+    assert!(error.contains(&fixture.config.info_log_name()));
+    assert!(error.contains(fixture.config.id()));
+    assert!(error.contains("live logs stream ended unexpectedly"));
+    assert_eq!(fixture.cursor(), "1", "no fetched range completed before the producer failed");
+    assert_eq!(active_indexing_count(), 0);
+}
+
+#[tokio::test]
+async fn finite_history_forced_history_and_requested_cancellation_finish_successfully() {
+    for (live, force_history, cancel) in
+        [(false, false, false), (true, true, false), (true, false, true)]
+    {
+        let fixture = stream_completion_fixture(live, false).await;
+        if cancel {
+            fixture.config.cancel_token().cancel();
+        }
+        timeout(
+            Duration::from_secs(2),
+            super::process_event_logs(fixture.config.clone(), force_history, false, None, None),
+        )
+        .await
+        .expect("expected completion must finish")
+        .expect("finite or requested completion remains successful");
+        assert_eq!(fixture.cursor(), if cancel { "1" } else { "2" });
+        assert_eq!(active_indexing_count(), 0);
+    }
+}
+
+#[tokio::test]
+async fn requested_global_shutdown_allows_live_producer_completion() {
+    let fixture = stream_completion_fixture(true, false).await;
+    crate::system_state::initiate_shutdown().await;
+    let result = timeout(
+        Duration::from_secs(2),
+        super::process_event_logs(fixture.config.clone(), false, false, None, None),
+    )
+    .await;
+    crate::system_state::_test_reset_shutdown_flag();
+    result
+        .expect("shutdown completion must finish")
+        .expect("requested shutdown remains successful");
+    assert_eq!(fixture.cursor(), "1");
+    assert_eq!(active_indexing_count(), 0);
+}
