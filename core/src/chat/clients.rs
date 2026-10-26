@@ -177,20 +177,10 @@ impl ChatClients {
         Self { telegram, discord, slack, twilio, pagerduty, opsgenie }
     }
 
-    fn find_accepted_block_range(&self, from_block: &U64, to_block: &U64) -> U64 {
-        if from_block > to_block {
-            panic!("Invalid range: from_block must be less than or equal to to_block");
-        }
-
-        match from_block.overflowing_add(to_block - from_block) {
-            (result, false) => result,
-            (_, true) => U64::MAX,
-        }
-    }
-
     pub fn is_in_block_range_to_send(&self, from_block: &U64, to_block: &U64) -> bool {
-        // only 10 blocks at a time else rate limits will kick in
-        U64::from(10) <= self.find_accepted_block_range(from_block, to_block)
+        // Limit historical notification bursts to ten inclusive blocks. Comparing the
+        // distance avoids overflowing when counting a range ending at U64::MAX.
+        from_block <= to_block && to_block - from_block < U64::from(10)
     }
 
     fn has_any_chat(&self) -> bool {
