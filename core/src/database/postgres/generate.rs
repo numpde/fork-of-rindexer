@@ -54,6 +54,7 @@ pub fn generate_derived_op_log_table_sql() -> String {
         where_key VARCHAR(500) NOT NULL,
         column_name VARCHAR(100) NOT NULL,
         value NUMERIC NOT NULL,
+        row_metadata JSONB NOT NULL DEFAULT '{}',
         block_number BIGINT NOT NULL,
         tx_index INTEGER NOT NULL,
         log_index INTEGER NOT NULL

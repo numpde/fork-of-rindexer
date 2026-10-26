@@ -4670,18 +4670,13 @@ fn extract_row_metadata(row: &TableRowData) -> Option<(u64, u64, u64)> {
         Some(EthereumSqlTypeWrapper::U64BigInt(n)) => *n,
         _ => return None,
     };
-    let tx_index: u64 = match row.columns.get("tx_index") {
-        Some(EthereumSqlTypeWrapper::U64(n)) => *n,
-        Some(EthereumSqlTypeWrapper::U64BigInt(n)) => *n,
-        Some(EthereumSqlTypeWrapper::U32(n)) => (*n).into(),
-        _ => 0,
+    let Some(EthereumSqlTypeWrapper::U128(sequence)) =
+        row.columns.get(injected_columns::RINDEXER_SEQUENCE_ID)
+    else {
+        return None;
     };
-    let log_index: u64 = match row.columns.get("log_index") {
-        Some(EthereumSqlTypeWrapper::U64(n)) => *n,
-        Some(EthereumSqlTypeWrapper::U64BigInt(n)) => *n,
-        Some(EthereumSqlTypeWrapper::U32(n)) => (*n).into(),
-        _ => 0,
-    };
+    let tx_index = ((sequence >> 32) & u32::MAX as u128) as u64;
+    let log_index = (sequence & u32::MAX as u128) as u64;
     Some((block_number, tx_index, log_index))
 }
 
@@ -4743,6 +4738,28 @@ fn collect_journal_values(
     value_tuples
 }
 
+// Preserve the metadata of each admitted input, rather than the final batch row:
+// rollback must be able to restore an earlier event's sequence and provenance.
+fn journal_row_metadata(row: &TableRowData) -> serde_json::Value {
+    use crate::manifest::contract::injected_columns::*;
+    let mut metadata = serde_json::Map::new();
+    for column in
+        [RINDEXER_SEQUENCE_ID, BLOCK_NUMBER, BLOCK_TIMESTAMP, TX_HASH, BLOCK_HASH, CONTRACT_ADDRESS]
+    {
+        let Some(value) = row.columns.get(column) else { continue };
+        let value = match value {
+            EthereumSqlTypeWrapper::U128(n) => n.to_string(),
+            EthereumSqlTypeWrapper::U64BigInt(n) => n.to_string(),
+            EthereumSqlTypeWrapper::StringChar(value) => value.clone(),
+            EthereumSqlTypeWrapper::Address(value) => format!("{value:#x}"),
+            EthereumSqlTypeWrapper::DateTime(value) => value.to_rfc3339(),
+            _ => unreachable!("injected metadata has a fixed storage representation"),
+        };
+        metadata.insert(column.to_string(), serde_json::Value::String(value));
+    }
+    serde_json::Value::Object(metadata)
+}
+
 /// Builds the Postgres `rindexer_internal.derived_op_log` INSERT for non-reversible
 /// (Set/Max/Min) operations, or `None` when there is nothing to journal.
 /// Batches all rows into a single statement.
@@ -4756,12 +4773,24 @@ fn build_journal_sql(
         return None;
     }
 
-    Some(format!(
-        "INSERT INTO rindexer_internal.derived_op_log \
-         (derived_table, network, where_key, column_name, value, block_number, tx_index, log_index) \
-         VALUES {}",
-        values.join(", ")
-    ))
+    let mut statements = Vec::new();
+    for row in rows {
+        let values =
+            collect_journal_values(derived_table, operation, std::slice::from_ref(row), "''");
+        if values.is_empty() {
+            continue;
+        }
+        let metadata = journal_row_metadata(row).to_string().replace('\'', "''");
+        let values = values
+            .iter()
+            .map(|value| format!("{}, '{}'::jsonb)", &value[..value.len() - 1], metadata))
+            .collect::<Vec<_>>();
+        statements.push(format!(
+            "INSERT INTO rindexer_internal.derived_op_log \
+             (derived_table, network, where_key, column_name, value, block_number, tx_index, log_index, row_metadata) \
+             VALUES {}", values.join(", ")));
+    }
+    Some(statements.join(";"))
 }
 
 /// Journal non-reversible (Set/Max/Min) operations to Postgres `rindexer_internal.derived_op_log`.

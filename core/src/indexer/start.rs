@@ -940,6 +940,18 @@ pub(super) async fn start_indexing_contract_events(
         }
     }
 
+    if clickhouse.is_some()
+        && network_derived_tables
+            .iter()
+            .filter(|(network, _)| reorg_configs.contains_key(*network))
+            .flat_map(|(_, tables)| tables)
+            .any(|table| !table.journal_columns.is_empty())
+    {
+        return Err(StartIndexingError::ReorgRecovery(anyhow::anyhow!(
+            "Cannot enable ClickHouse reorg recovery for tables using set, max or min: ClickHouse journals cannot restore exact values and row provenance. Use PostgreSQL for these tables, or disable their reorg-dependent derived operations."
+        )));
+    }
+
     // Shared persistence per invocation (shared across all coordinators)
     let reorg_persistence =
         Arc::new(ReorgBlockHashPersistence::new(postgres.clone(), clickhouse.clone()));

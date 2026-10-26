@@ -1367,6 +1367,8 @@ impl ReorgTask {
                             jc.derived_column, dt.full_table_name
                         )
                     })?;
+                    self.restore_journal_metadata(pg, dt, jc, &network_filter, &network_join)
+                        .await?;
                     tracing::info!(
                         table = %dt.full_table_name,
                         column = %jc.derived_column,
@@ -1433,6 +1435,59 @@ impl ReorgTask {
             }
         }
         Ok(())
+    }
+
+    async fn restore_journal_metadata(
+        &self,
+        pg: &PgTransaction<'_>,
+        table: &DerivedTableInfo,
+        column: &DerivedColumnJournal,
+        network_filter: &str,
+        network_join: &str,
+    ) -> anyhow::Result<()> {
+        use crate::manifest::contract::injected_columns::*;
+        let metadata_columns = vec![
+            RINDEXER_SEQUENCE_ID.to_string(),
+            BLOCK_NUMBER.to_string(),
+            BLOCK_TIMESTAMP.to_string(),
+            TX_HASH.to_string(),
+            BLOCK_HASH.to_string(),
+            CONTRACT_ADDRESS.to_string(),
+        ];
+        // Timestamp is optional, and older tables can expose fewer metadata columns.
+        // PostgreSQL's row type is the authority for converting the recorded values.
+        let columns = pg
+            .query(
+                "SELECT attname::text FROM pg_attribute WHERE attrelid = $1::text::regclass \
+             AND attnum > 0 AND NOT attisdropped AND attname::text = ANY($2)",
+                &[&table.full_table_name, &metadata_columns],
+            )
+            .await?
+            .into_iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>();
+        if columns.is_empty() {
+            return Ok(());
+        }
+        let targets = columns.join(", ");
+        let restored =
+            columns.iter().map(|name| format!("restored.{name}")).collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "UPDATE {table} AS dt SET ({targets}) = \
+             (SELECT {restored} FROM jsonb_populate_record(dt, sub.row_metadata) AS restored) \
+             FROM (SELECT DISTINCT ON (where_key) where_key, row_metadata \
+                 FROM rindexer_internal.derived_op_log WHERE derived_table = '{table}'{network_filter} \
+                 ORDER BY where_key, block_number DESC, tx_index DESC, log_index DESC, id DESC) sub \
+             WHERE {key_join}{network_join}",
+            table = table.full_table_name,
+            key_join = Self::journal_where_key_join(&column.where_columns, "dt", "sub"),
+        );
+        pg.batch_execute(&sql).await.with_context(|| {
+            format!(
+                "Cannot restore canonical sequence and provenance for {}",
+                table.full_table_name
+            )
+        })
     }
 
     /// Build a WHERE clause joining derived table rows to journal where_key.

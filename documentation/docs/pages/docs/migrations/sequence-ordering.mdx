@@ -48,3 +48,23 @@ surviving row. Review historical correctness even if a table's current values lo
 plausible. Resume indexing only after state and recovery history are consistent.
 
 Fresh databases need no data migration. The YAML fields and defaults are unchanged.
+
+## Recovery journals and row provenance
+
+PostgreSQL `rindexer_internal.derived_op_log` now also stores `row_metadata` as
+`JSONB`. Each input records its sequence, block number and hash, transaction hash,
+contract address, and timestamp when configured. Recovery restores that metadata
+from the latest surviving canonical input before accepting replacement events.
+Transaction and log indices come from the packed sequence rather than absent
+custom-table fields.
+
+Existing journals do not contain this evidence. Rebuild affected derived tables
+and their journals from canonical events using the coordinated replay procedure
+above. Recreate the journal with the current generated schema; adding an empty
+metadata column does not reconstruct history. All indexers sharing the internal
+journal must be stopped and migrated together.
+
+ClickHouse reorg recovery with derived `set`, `max`, or `min` operations is now
+rejected at startup. Its existing numeric journal cannot preserve exact values
+and complete row provenance. Move these operations to PostgreSQL before enabling
+reorg recovery for them.
