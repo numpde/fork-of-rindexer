@@ -501,7 +501,13 @@ To avoid confusion `address` in `transaction_information` is the address of the 
 
 #### format_value
 
-You can use the `format_value` function to format the value of the event to a decimal value with the specified decimals.
+Use `format_value(value, decimals)` to display an unsigned token amount with an exact decimal scale.
+Decimal and `0x` hexadecimal inputs up to the `uint256` maximum are supported; `decimals` must be an integer from `0` through `255`.
+For example, `format_value(value, 18)` displays `1` as `0.000000000000000001` and `20000000000000000000` as `20`.
+Whole amounts omit the decimal point; nonzero fractions retain the specified number of digits, including trailing zeros.
+Invalid or out-of-range unsigned values remain as their original text. An unsupported decimal scale leaves the function placeholder unchanged.
+
+After upgrading, review notification parsers and expectations that relied on previously misformatted fractions or unscaled large amounts. Existing YAML expressions need no changes when their scales are in the supported range.
 
 Lets put it all together:
 

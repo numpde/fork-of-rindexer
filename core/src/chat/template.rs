@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use alloy::primitives::U64;
+use alloy::primitives::U256;
 use regex::Regex;
 use serde_json::Value;
 
@@ -67,7 +67,7 @@ impl Template {
             let args: Vec<&str> = captures[2].split(',').map(|s| s.trim()).collect();
             if function_name == "format_value" && args.len() == 2 {
                 if let Some(value_str) = self.get_nested_value(event_data, args[0]) {
-                    if let Ok(decimals) = args[1].parse::<u32>() {
+                    if let Ok(decimals) = args[1].parse::<u8>() {
                         return Some(self.format_value(&value_str, decimals));
                     }
                 }
@@ -76,18 +76,24 @@ impl Template {
         None
     }
 
-    fn format_value(&self, value: &str, decimals: u32) -> String {
-        match U64::from_str(value) {
-            Ok(v) => {
-                let divisor = U64::from(10).pow(U64::from(decimals));
-                let integer_part = v / divisor;
-                let fractional_part = v % divisor;
-                if fractional_part.is_zero() {
-                    return integer_part.to_string();
-                }
-                format!("{integer_part}.{fractional_part}")
-            }
-            Err(_) => value.to_string(),
+    fn format_value(&self, value: &str, decimals: u8) -> String {
+        let Ok(value) = U256::from_str(value) else {
+            return value.to_string();
+        };
+        let digits = value.to_string();
+        let decimals = usize::from(decimals);
+        if decimals == 0 {
+            return digits;
+        }
+
+        // Decimal placement preserves small fractions and avoids overflowing 10^decimals.
+        // The uint8 token scale bounds padding even for values near uint256::MAX.
+        let padded = format!("{digits:0>width$}", width = digits.len().max(decimals + 1));
+        let (integer_part, fractional_part) = padded.split_at(padded.len() - decimals);
+        if fractional_part.bytes().all(|digit| digit == b'0') {
+            integer_part.to_string()
+        } else {
+            format!("{integer_part}.{fractional_part}")
         }
     }
 }
