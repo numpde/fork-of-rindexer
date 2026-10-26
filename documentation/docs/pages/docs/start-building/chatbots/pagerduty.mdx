@@ -235,6 +235,13 @@ You can then write your own template inline, this is the template used as the Pa
 You have to use the ABI input names in object notation for example if i wanted to put value in the template
 i just have to write `{{value}}` in the template and it will be replaced with the value of the event itself.
 
+Only expressions written in `template_inline` are evaluated. Inserted event text is not evaluated as another template expression.
+For example, if `message` contains `forwarded {{recipient}}` and `recipient` is `Alice`, the template
+`{{message}} / {{recipient}}` renders as `forwarded {{recipient}} / Alice`.
+Unknown expressions and unfinished placeholders remain visible. Chat-platform formatting still applies to the resulting message.
+
+After upgrading, move any intended field or function expressions out of event values and into `template_inline`; repeated replacement of inserted expressions is no longer supported.
+
 :::info
 PagerDuty event summaries are plain text only.
 :::

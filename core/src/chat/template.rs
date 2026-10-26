@@ -23,35 +23,31 @@ impl Template {
     }
 
     pub fn parse_template_inline(&self, event_data: &Value) -> String {
-        let mut template = self.value.clone();
-        let placeholders = self.extract_placeholders(&template);
+        let mut output = String::with_capacity(self.value.len());
+        let mut remaining = self.value.as_str();
 
-        for placeholder in placeholders {
-            if placeholder.contains('(') {
-                if let Some(value) = self.evaluate_function(&placeholder, event_data) {
-                    template = template.replace(&format!("{{{{{placeholder}}}}}"), &value);
-                }
-            } else if let Some(value) = self.get_nested_value(event_data, &placeholder) {
-                template = template.replace(&format!("{{{{{placeholder}}}}}"), &value);
-            }
-        }
-        template
-    }
-
-    fn extract_placeholders(&self, template: &str) -> Vec<String> {
-        let mut placeholders = Vec::new();
-        let mut start = 0;
-        while let Some(start_index) = template[start..].find("{{") {
-            if let Some(end_index) = template[start + start_index + 2..].find("}}") {
-                let placeholder =
-                    &template[start + start_index + 2..start + start_index + 2 + end_index];
-                placeholders.push(placeholder.to_string());
-                start += start_index + 2 + end_index + 2;
-            } else {
+        // Only the configured template owns expressions; inserted event text is literal.
+        while let Some((prefix, after_open)) = remaining.split_once("{{") {
+            let Some((placeholder, suffix)) = after_open.split_once("}}") else {
                 break;
+            };
+            output.push_str(prefix);
+            let value = if placeholder.contains('(') {
+                self.evaluate_function(placeholder, event_data)
+            } else {
+                self.get_nested_value(event_data, placeholder)
+            };
+            if let Some(value) = value {
+                output.push_str(&value);
+            } else {
+                output.push_str("{{");
+                output.push_str(placeholder);
+                output.push_str("}}");
             }
+            remaining = suffix;
         }
-        placeholders
+        output.push_str(remaining);
+        output
     }
 
     fn get_nested_value(&self, data: &Value, path: &str) -> Option<String> {
