@@ -409,3 +409,7 @@ async fn perform_health_check(
 //     }
 //     Ok(())
 // }
+
+#[cfg(all(test, unix))]
+#[path = "graphql_credentials_tests.rs"]
+mod graphql_credentials_tests;
