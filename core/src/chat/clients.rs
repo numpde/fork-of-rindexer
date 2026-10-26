@@ -31,6 +31,10 @@ use crate::{
 
 type SendMessage = Vec<JoinHandle<Result<(), ChatError>>>;
 
+#[cfg(test)]
+#[path = "chat_range_tests.rs"]
+mod chat_range_tests;
+
 #[derive(Error, Debug)]
 pub enum ChatError {
     #[error("Telegram error: {0}")]
