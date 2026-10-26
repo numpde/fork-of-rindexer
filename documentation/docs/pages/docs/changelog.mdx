@@ -39,6 +39,7 @@
 
 ### Bug fixes
 -------------------------------------------------
+- fix: unknown RPC log-fetch failures can now shrink a two-block request to a single block, allowing sequential and parallel historical fetches to recover when only one-block requests succeed. Failed intervals retain their first unfinished block and single-block failures retain the existing backoff policy ([#327](https://github.com/joshstevens19/rindexer/issues/327)).
 - fix: RPC request counters/latencies and shared-tip metrics now match indexing network labels and keep distinct configured aliases of one chain separate. Generated ordinary and Shadow providers pass the configured name, and HyperSync failures and RPC fallbacks use the same label ([#462](https://github.com/joshstevens19/rindexer/issues/462)).
 - fix: explicit RPC history expiry now reports the stream and failed block range without producing callback/checkpoint work for that range. A terminal parallel-history error closes its producer, retires remaining workers and suppresses later batches and the historical-completion/live handoff ([#348](https://github.com/joshstevens19/rindexer/issues/348)).
 - fix: ambiguous event names now report the contract and conflicting signatures instead of producing duplicate Rust bindings or colliding name-based event identities. Identical entries across merged ABI files still deduplicate; function overloads remain accepted ([#152](https://github.com/joshstevens19/rindexer/issues/152)).

@@ -2300,6 +2300,7 @@ async fn suggested_retry_block_range(
     None
 }
 
+/// Endpoint offsets for inclusive requests: zero still fetches one block.
 #[derive(Debug, PartialEq)]
 enum FallbackBlockRange {
     Range5000,
@@ -2316,6 +2317,7 @@ enum FallbackBlockRange {
     Range10,
     Range5,
     Range1,
+    SingleBlock,
 }
 
 impl FallbackBlockRange {
@@ -2335,6 +2337,7 @@ impl FallbackBlockRange {
             FallbackBlockRange::Range10 => U64::from(10),
             FallbackBlockRange::Range5 => U64::from(5),
             FallbackBlockRange::Range1 => U64::from(1),
+            FallbackBlockRange::SingleBlock => U64::ZERO,
         }
     }
 
@@ -2353,7 +2356,8 @@ impl FallbackBlockRange {
             FallbackBlockRange::Range15 => FallbackBlockRange::Range10,
             FallbackBlockRange::Range10 => FallbackBlockRange::Range5,
             FallbackBlockRange::Range5 => FallbackBlockRange::Range1,
-            FallbackBlockRange::Range1 => FallbackBlockRange::Range1,
+            FallbackBlockRange::Range1 => FallbackBlockRange::SingleBlock,
+            FallbackBlockRange::SingleBlock => FallbackBlockRange::SingleBlock,
         }
     }
 
@@ -2385,8 +2389,10 @@ impl FallbackBlockRange {
             FallbackBlockRange::Range10
         } else if diff >= 5 {
             FallbackBlockRange::Range5
-        } else {
+        } else if diff >= 1 {
             FallbackBlockRange::Range1
+        } else {
+            FallbackBlockRange::SingleBlock
         }
     }
 }
@@ -2650,8 +2656,11 @@ mod tests {
     }
 
     #[test]
-    fn fallback_lower_bottoms_at_1() {
-        assert_eq!(FallbackBlockRange::Range1.lower(), FallbackBlockRange::Range1);
+    fn fallback_lower_bottoms_at_one_inclusive_block() {
+        assert_eq!(FallbackBlockRange::Range1.lower(), FallbackBlockRange::SingleBlock);
+        assert_eq!(FallbackBlockRange::SingleBlock.lower(), FallbackBlockRange::SingleBlock);
+        assert_eq!(FallbackBlockRange::SingleBlock.value(), U64::ZERO);
+        assert_eq!(FallbackBlockRange::from_diff(U64::ZERO), FallbackBlockRange::SingleBlock);
     }
 
     fn make_log_at_block(block_number: u64) -> Log {

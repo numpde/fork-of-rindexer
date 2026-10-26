@@ -39,6 +39,16 @@ receipts included.
 References: [Execution API error definition](https://ethereum.github.io/execution-apis/api/methods/eth_getLogs/#errors),
 [unavailable-history report #348](https://github.com/joshstevens19/rindexer/issues/348).
 
+## Shrinking failed log ranges
+
+When `eth_getLogs` fails without a usable provider range hint, historical
+fetching reduces the request through its fallback ranges. It can now reduce a
+failed two-block interval, such as `100–101`, to the single block `100–100`.
+Indexing resumes from that unfinished block when the smaller request succeeds.
+Existing single-block backoff and parallel-worker retry limits still apply.
+This addresses the minimum-range stall reported in
+[#327](https://github.com/joshstevens19/rindexer/issues/327).
+
 ## Tenderly
 
 [Tenderly](https://tenderly.co/) has some very fast nodes and in internal testing with free nodes they blew everyone out the water
