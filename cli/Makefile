@@ -75,7 +75,7 @@ codegen_indexer_lens:
 start_uniswap_base:
 	RUSTFLAGS='-C target-cpu=native' cargo run --release --features jemalloc -- start --path $(CURDIR)/../examples/uniswap_v3_base indexer
 start_indexer_redis_stream:
-    RUSTFLAGS='-C target-cpu=native' cargo run --release --features jemalloc -- start --path $(CURDIR)/../examples/redis-stream indexer
+	RUSTFLAGS='-C target-cpu=native' cargo run --release --features jemalloc -- start --path $(CURDIR)/../examples/redis-stream indexer
 start_indexer_hyperwarp:
 	RUSTFLAGS='-C target-cpu=native' cargo run --release --features jemalloc -- start --path $(CURDIR)/../examples/hyperwarp indexer
 start_factory_indexing:
