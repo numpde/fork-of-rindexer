@@ -216,3 +216,111 @@ async fn postgres_overlapping_subscriptions_share_receipts_but_advance_separate_
     assert_eq!(receipts, 1);
     fixture.finish().await;
 }
+
+async fn run_tip_subscription(fixture: &Fixture, head: u64) -> String {
+    let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+    let mut registry = super::super::permanent_failure_tests::registry(&fixture.params, callback);
+    let logs = (100..=head)
+        .map(|number| {
+            let mut log = fixture.events(&[number]).remove(0).log;
+            log.block_number = Some(number);
+            log.block_hash = Some(B256::repeat_byte(number as u8));
+            log
+        })
+        .collect();
+    let blocks = (99..=head)
+        .map(|number| {
+            let mut block = header(B256::repeat_byte(number as u8), number);
+            block.header.inner.number = number;
+            block.header.inner.parent_hash = B256::repeat_byte((number - 1) as u8);
+            block
+        })
+        .collect();
+    let provider = Arc::new(
+        MockChainProvider::new(1).with_block_number(head).with_blocks(blocks).with_logs(logs),
+    );
+    let detail = NetworkContract {
+        id: "tip-subscription".into(),
+        network: "ethereum".into(),
+        indexing_contract_setup: IndexingContractSetup::Address(AddressDetails {
+            address: ValueOrArray::Value(Address::ZERO),
+            indexed_filters: None,
+        }),
+        cached_provider: provider.clone(),
+        block_clock: BlockClock::new(None, None, provider),
+        decoder: noop_decoder(),
+        start_block: None,
+        end_block: None,
+        disable_logs_bloom_checks: true,
+    };
+    let key = detail.cursor_key();
+    registry.events[0].contract.details.push(detail);
+    let registry = registry.complete();
+    let progress = IndexingEventsProgressState::monitor(&registry.events, &[], None).await;
+    let manifest = serde_json::from_value(json!({"name":"Replay","project_type":"no-code",
+        "contracts":[],"networks":[{"name":"ethereum","chain_id":1,"rpc":"http://unused.invalid"}]})).unwrap();
+    // Complete the production historical phase at the current tip on each run;
+    // both range fields remain omitted in the subscription being restarted.
+    let (handles, _, _, _, _) = crate::indexer::start::start_indexing_contract_events(
+        &manifest,
+        fixture._directory.path(),
+        Some(fixture.client.clone()),
+        None,
+        &fixture.indexer,
+        registry,
+        Arc::new(TraceCallbackRegistry::new()),
+        &[],
+        true,
+        Default::default(),
+        progress,
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for handle in handles {
+            handle.await.unwrap().unwrap();
+        }
+    })
+    .await
+    .expect("finite startup snapshot completes");
+    key
+}
+
+#[tokio::test]
+async fn postgres_restart_without_start_block_recovers_downtime_exactly_once() {
+    let fixture = Fixture::new().await;
+    let first_key = run_tip_subscription(&fixture, 100).await;
+    assert_eq!(fixture.position().await, (1, "100".into(), "100".into()));
+    let resumed_key = run_tip_subscription(&fixture, 105).await;
+    assert_eq!(resumed_key, first_key, "unchanged YAML keeps the same subscription cursor");
+    assert_eq!(fixture.position().await, (6, "615".into(), "105".into()));
+    let blocks: Vec<String> = fixture
+        .client
+        .query(
+            &format!(
+                "SELECT block_number::text FROM {} ORDER BY block_number",
+                fixture.params.sql_event_table_name
+            ),
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(blocks, ["100", "101", "102", "103", "104", "105"]);
+    run_tip_subscription(&fixture, 105).await;
+    assert_eq!(
+        fixture.position().await,
+        (6, "615".into(), "105".into()),
+        "restart must preserve the completed effects"
+    );
+    let receipts: i64 = fixture
+        .client
+        .query_one("SELECT count(*) FROM rindexer_internal.event_applications", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(receipts, 6, "one application receipt per canonical event");
+    fixture.finish().await;
+}

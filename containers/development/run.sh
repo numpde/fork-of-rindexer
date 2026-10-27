@@ -42,6 +42,15 @@ case "$1" in
   advanced-table-manifest)
     exec cargo nextest run --frozen -p rindexer --test yaml_advanced_tables --no-fail-fast --no-capture
     ;;
+  postgres-resume-without-start-compile)
+    exec cargo nextest run --frozen -p rindexer --lib --no-run \
+      -E 'test(/postgres_restart_without_start_block_recovers_downtime_exactly_once$/)'
+    ;;
+  postgres-resume-without-start)
+    : "${RINDEXER_TEST_POSTGRES_URL:?missing explicit PostgreSQL fixture}"
+    exec cargo nextest run --frozen -p rindexer --lib --no-fail-fast --no-capture \
+      -E 'test(/postgres_restart_without_start_block_recovers_downtime_exactly_once$/)'
+    ;;
   runtime-image)
     cargo build --frozen --release -p rindexer_cli --no-default-features
     exec python3 -B containers/runtime/package.py >&3

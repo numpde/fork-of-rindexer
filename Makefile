@@ -568,3 +568,10 @@ tests/resume-without-start-block/docker: ## Check saved subscription cursors whe
 tests/advanced-table-manifest/docker: ## Validate advanced table manifests using owned temporary fixtures
 	@$(call offline_runner,$$dependency_image)
 	$(compose) run --rm --no-deps -T offline advanced-table-manifest
+
+.PHONY: tests/resume-without-start-block/postgres
+tests/resume-without-start-block/postgres: ## Verify downtime recovery through production PostgreSQL startup and callbacks
+	@$(call offline_runner,$$dependency_image)
+	$(compose) run --rm --no-deps -T offline postgres-resume-without-start-compile
+	$(compose) up -d --no-build --pull never --wait --wait-timeout 90 postgres
+	$(compose) run --rm --no-deps -T postgres-tests postgres-resume-without-start
