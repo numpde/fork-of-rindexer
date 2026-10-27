@@ -1842,6 +1842,68 @@ contracts:
     }
 
     #[tokio::test]
+    async fn resume_without_start_block_keeps_the_saved_subscription_prefix() {
+        let directory = tempfile::tempdir().unwrap();
+        let csv = Some(crate::manifest::storage::CsvDetails {
+            enabled: true,
+            path: "csv".into(),
+            disable_create_headers: None,
+        });
+        let cursors = directory.path().join("csv/test_contract/last-synced-blocks");
+        std::fs::create_dir_all(&cursors).unwrap();
+        std::fs::write(cursors.join("test_contract-ethereum-test_event-query-a.txt"), "100")
+            .unwrap();
+        std::fs::write(cursors.join("test_contract-ethereum-test_event-query-b.txt"), "104")
+            .unwrap();
+        let mock = MockChainProvider::new(1).with_block_number(105);
+        for (cursor_key, expected) in [("query-a", 101), ("query-b", 105), ("query-new", 105)] {
+            let config = SyncConfig {
+                project_path: directory.path(),
+                csv_details: &csv,
+                contract_csv_enabled: true,
+                cursor_key,
+                ..empty_sync_config()
+            };
+            let (start, end, _) =
+                get_start_end_block(&mock, None, None, config, "Test", "ethereum", None)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                start,
+                U64::from(expected),
+                "resume only this subscription's completed prefix"
+            );
+            assert_eq!(end, U64::from(105));
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_without_start_block_does_not_hide_an_unreadable_cursor() {
+        let directory = tempfile::tempdir().unwrap();
+        let csv = Some(crate::manifest::storage::CsvDetails {
+            enabled: true,
+            path: "csv".into(),
+            disable_create_headers: None,
+        });
+        let cursors = directory.path().join("csv/test_contract/last-synced-blocks");
+        std::fs::create_dir_all(&cursors).unwrap();
+        std::fs::write(cursors.join("test_contract-ethereum-test_event-query-a.txt"), "invalid")
+            .unwrap();
+        let config = SyncConfig {
+            project_path: directory.path(),
+            csv_details: &csv,
+            contract_csv_enabled: true,
+            cursor_key: "query-a",
+            ..empty_sync_config()
+        };
+        let mock = MockChainProvider::new(1).with_block_number(105);
+        assert!(matches!(
+            get_start_end_block(&mock, None, None, config, "Test", "ethereum", None).await,
+            Err(StartIndexingError::UnknownError(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn no_start_block_defaults_to_latest() {
         let mock = MockChainProvider::new(1).with_block_number(500);
         let (start, end, _) = get_start_end_block(

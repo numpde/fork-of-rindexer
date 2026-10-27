@@ -558,3 +558,8 @@ tests/make-timeouts: ## Check recipe deadlines, child cancellation and cleanup w
 .PHONY: runtime/launcher/checks
 runtime/launcher/checks: ## Check actual launcher engine selection with offline Compose rendering
 	@python3 -B -m unittest discover -s tests/runtime -v
+
+.PHONY: tests/resume-without-start-block/docker
+tests/resume-without-start-block/docker: ## Check saved subscription cursors when start_block is omitted
+	@$(call offline_runner,$$dependency_image)
+	$(compose) run --rm --no-deps -T offline resume-without-start-block

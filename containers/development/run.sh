@@ -35,6 +35,10 @@ if ! test -f "$RINDEXER_GRAPHQL_PREBUILT" || ! test -f /build/graphql/input.sha2
   printf '%s\n' "$key" > /build/graphql/input.sha256
 fi
 case "$1" in
+  resume-without-start-block)
+    exec cargo nextest run --frozen -p rindexer --lib --no-fail-fast --no-capture \
+      -E 'test(/^indexer::start::tests::resume_without_start_block_/)'
+    ;;
   runtime-image)
     cargo build --frozen --release -p rindexer_cli --no-default-features
     exec python3 -B containers/runtime/package.py >&3
