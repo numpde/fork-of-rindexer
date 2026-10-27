@@ -273,6 +273,32 @@ Compose fixtures retain their independent CPU, memory and task limits.
 The deadline tests need no Docker or dependencies. They take about 70 seconds because
 one deliberately unresponsive recipe exercises the full 60-second cleanup grace.
 
+### Rootless Docker fixture ports
+
+Native Testcontainers tests publish dynamic host ports. On affected rootless Docker
+engines, a port can be free inside RootlessKit's network namespace while another
+process owns it on the host. Container startup then fails with
+`RootlessKit PortManager.AddPort()` and `bind: address already in use`, before the
+test reaches its indexing assertions. This allocation problem is tracked in
+[moby/moby#53153](https://github.com/moby/moby/issues/53153).
+
+For supported PostgreSQL regressions, use the prepared Compose fixture lane:
+
+```bash
+make tests/resume-without-start-block/postgres
+```
+
+It compiles offline, runs PostgreSQL on a private network without a published host
+port, and removes its owned database fixture afterward. It requires the existing
+prepared images and dependencies; the target does not acquire them automatically.
+The full native workspace suites still use Testcontainers and can encounter the
+host-port allocation problem. Report fixture-start retries separately from test
+assertion failures and preserve the final command's exit status.
+
+Engine fixes or namespace port-range changes belong to coordinated engine
+maintenance. Repository test targets leave the shared daemon configuration and
+host port-range settings unchanged.
+
 ### Playing around with the CLI locally
 
 You can use the `make` commands to run the CLI commands locally, this is useful for testing and developing.
