@@ -1,4 +1,6 @@
 # Copy outside the checkout; restrict its permissions to 0600.
+# Select an existing local context. Older files without this key use default.
+RINDEXER_DOCKER_CONTEXT=rootless
 # Set RINDEXER_IMAGE to the immutable local ID printed by runtime/image/build.
 RINDEXER_IMAGE=sha256:REPLACE_WITH_BUILT_IMAGE_ID
 RINDEXER_PROJECT_DIR=/absolute/path/to/dedicated/indexer-project

@@ -1,3 +1,5 @@
+x-rindexer-docker-context: ${RINDEXER_DOCKER_CONTEXT:-default}
+
 services:
   indexer:
     # A fixed engine-wide name also rejects Compose scaling or another project

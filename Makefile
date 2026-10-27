@@ -546,7 +546,7 @@ runtime/image/build: tests/posture ## Build the minimal PostgreSQL CLI image off
 	docker image inspect rindexer-postgres:local --format '{{.Id}}'
 
 .PHONY: runtime/checks
-runtime/checks: ## Check the rendered single-host PostgreSQL deployment without starting services
+runtime/checks: runtime/launcher/checks ## Check the rendered single-host PostgreSQL deployment without starting services
 	@python3 -B containers/runtime/test.py
 	bash -n containers/runtime/deploy.sh containers/runtime/smoke.sh containers/runtime/startup-smoke.sh
 

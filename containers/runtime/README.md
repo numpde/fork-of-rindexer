@@ -52,8 +52,14 @@ bash containers/runtime/deploy.sh status /absolute/path/runtime.env
 bash containers/runtime/deploy.sh stop /absolute/path/runtime.env
 ```
 
-Use Docker Engine with Compose v2, Python 3, Bash and `flock`, with Docker's default
-local Unix-socket context.
+Use Docker Engine with Compose v2, Python 3, Bash and `flock`, with a local
+Unix-socket context. Set `RINDEXER_DOCKER_CONTEXT=rootless` in the private runtime
+env file to use an existing rootless engine. Files omitting this
+optional key retain `default`; the launcher never changes your global context.
+It resolves the named context once and pins its socket for all commands in that
+invocation. Missing contexts, remote endpoints and unavailable engines fail
+without falling back to another engine. Changing this key selects a different
+engine and its volumes; it does not migrate the database.
 The launcher rejects ambient engine/Compose overrides, validates the rendered
 configuration without printing credentials, and serializes operations with a host
 lock. `start` first stops and waits for the old indexer, then starts PostgreSQL

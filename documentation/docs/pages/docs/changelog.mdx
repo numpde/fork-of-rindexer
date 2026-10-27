@@ -50,6 +50,7 @@
 
 ### Bug fixes
 -------------------------------------------------
+- fix: the single-host PostgreSQL launcher accepts `RINDEXER_DOCKER_CONTEXT=rootless` in its private runtime env file, validates the local socket and pins it through start, status and stop. Omitted selectors retain `default`; ambient engine overrides are ignored and unavailable engines never fall back. Changing engines does not migrate existing database volumes.
 - fix: report a stopped indexing generation in health immediately after a stream task panics, including while admitted callbacks finish cleanup.
 - fix: CLI local PostgreSQL auto-start readiness now uses the native authenticated client and existing `DATABASE_URL`/TLS settings instead of host `pg_isready`. A ready database no longer fails because that utility is missing, and the probe no longer passes a credential-bearing URL in child arguments. Docker/Compose requirements and YAML configuration are unchanged.
 - fix: progress markers no longer appear as literal ANSI escape sequences in terminal or ANSI-disabled logs. Event-text control-sequence sanitization stays enabled ([#483](https://github.com/joshstevens19/rindexer/issues/483)).

@@ -5,6 +5,9 @@ import re
 import sys
 
 config = json.loads(Path(sys.argv[1]).read_text())
+context = config['x-rindexer-docker-context']
+if not isinstance(context, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', context):
+    raise SystemExit('RINDEXER_DOCKER_CONTEXT must name a local Docker context using letters, digits, dots, underscores or hyphens')
 services = config['services']
 if set(services) != {'indexer', 'postgres'}:
     raise SystemExit('Runtime must contain only the indexer and PostgreSQL services')
@@ -33,3 +36,6 @@ for name, service in services.items():
         raise SystemExit(f'{name} requires its non-root user and a read-only root filesystem')
     if service.get('cap_drop') != ['ALL'] or service.get('privileged', False):
         raise SystemExit(f'{name} must drop all capabilities and forbid privileged mode')
+
+# The launcher consumes only the validated context name, never credentials.
+print(context)

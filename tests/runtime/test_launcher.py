@@ -113,9 +113,10 @@ if os.environ.get('LAUNCHER_FAIL_ENGINE')=='1':
         result = self.run_launcher('status')
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertEqual('ps', self.effects()[0][-2])
+        self.assertEqual(['--host', 'unix:///fixture/default.sock'], self.effects()[0][:2])
 
-    def test_remote_and_missing_contexts_fail_before_engine_effects(self):
-        for context in ['remote', 'missing']:
+    def test_rejected_contexts_fail_before_engine_effects(self):
+        for context in ['remote', 'missing', '../rootless']:
             with self.subTest(context=context):
                 self.write_env(context)
                 self.log.write_text('')
