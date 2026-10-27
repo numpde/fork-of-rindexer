@@ -143,7 +143,8 @@ if ! docker image inspect "$$RINDEXER_RUNNER_IMAGE" >/dev/null; then
 fi
 git ls-files -z --deduplicate --cached --others --exclude-standard -- \
   Cargo.toml Cargo.lock rust-toolchain.toml rustfmt.toml .cargo core cli xtask \
-  e2e-tests examples graphql tests/development containers/development/typings.py > "$$scratch_dir/source-candidates"
+  e2e-tests examples graphql tests/development containers/development/typings.py \
+  containers/runtime/Dockerfile containers/runtime/package.py > "$$scratch_dir/source-candidates"
 : > "$$scratch_dir/source-files"
 while IFS= read -r -d '' file; do
   if ! test -e "$$file" && ! test -L "$$file"; then
@@ -538,3 +539,15 @@ tests/native-startup/docker: tests/posture ## Verify the first required native b
 	compose_profile_args=(--profile native-transfers)
 	$(compose) up -d --no-build --pull never --wait --wait-timeout 90 postgres anvil
 	$(compose) run --rm --no-deps -T -e RINDEXER_TEST_ANVIL_URL=http://anvil:8545 postgres-tests native-startup
+
+.PHONY: runtime/image/build
+runtime/image/build: tests/posture ## Build the minimal PostgreSQL CLI image offline (no Kafka, reth or Foundry)
+	@$(call offline_runner,$$dependency_image)
+	$(compose) run --rm --no-deps -T offline runtime-image > "$$scratch_dir/runtime.tar"
+	docker build --network none --tag rindexer-postgres:local - < "$$scratch_dir/runtime.tar"
+	docker image inspect rindexer-postgres:local --format '{{.Id}}'
+
+.PHONY: runtime/checks
+runtime/checks: ## Check the rendered single-host PostgreSQL deployment without starting services
+	@python3 -B containers/runtime/test.py
+	bash -n containers/runtime/deploy.sh containers/runtime/smoke.sh containers/runtime/startup-smoke.sh

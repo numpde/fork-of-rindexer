@@ -1,0 +1,74 @@
+services:
+  indexer:
+    # A fixed engine-wide name also rejects Compose scaling or another project
+    # accidentally starting a second copy of this single-host deployment.
+    container_name: rindexer-postgres-indexer
+    image: ${RINDEXER_IMAGE:?build and select an immutable local runtime image}
+    pull_policy: never
+    platform: linux/amd64
+    user: '65532:65532'
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 256
+    mem_limit: 2g
+    cpus: 2
+    stop_grace_period: 120s
+    restart: 'no'
+    environment:
+      DATABASE_URL: postgresql://rindexer:${POSTGRES_PASSWORD:?set a hexadecimal password}@postgres:5432/rindexer
+      RPC_HTTP_URL: ${RPC_HTTP_URL:?set the bounded RPC proxy URL}
+      CHAIN_ID: ${CHAIN_ID:?set the selected chain ID}
+      CONTRACT_ADDRESS: ${CONTRACT_ADDRESS:?select the contract}
+      START_BLOCK: ${START_BLOCK:?set the first required block}
+    volumes:
+      - type: bind
+        source: ${RINDEXER_PROJECT_DIR:?set a dedicated project directory}
+        target: /project
+        read_only: true
+        bind: {create_host_path: false}
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,uid=65532,gid=65532,mode=0700,size=128m
+    ports:
+      - '127.0.0.1:8080:8080'
+    networks: [database, rpc]
+    logging:
+      driver: local
+      options: {max-size: '10m', max-file: '3'}
+  postgres:
+    image: ${POSTGRES_IMAGE:?load the reviewed PostgreSQL image pin}
+    pull_policy: never
+    platform: linux/amd64
+    user: '999:999'
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+    mem_limit: 1g
+    cpus: 1
+    stop_grace_period: 60s
+    environment:
+      POSTGRES_USER: rindexer
+      POSTGRES_DB: rindexer
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set a hexadecimal password}
+    volumes:
+      - database:/var/lib/postgresql/data
+    tmpfs:
+      - /var/run/postgresql:rw,nosuid,nodev,noexec,uid=999,gid=999,mode=0700,size=16m
+      - /tmp:rw,nosuid,nodev,noexec,mode=1777,size=16m
+    networks: [database]
+    healthcheck:
+      test: [CMD, pg_isready, -h, '127.0.0.1', -U, rindexer, -d, rindexer]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    logging:
+      driver: local
+      options: {max-size: '10m', max-file: '3'}
+networks:
+  database:
+    internal: true
+  rpc: {}
+volumes:
+  database: {}

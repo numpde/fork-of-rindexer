@@ -1,0 +1,24 @@
+name: SelectedContracts
+project_type: no-code
+networks:
+  - name: selected
+    chain_id: ${CHAIN_ID}
+    rpc: ${RPC_HTTP_URL}
+    reorg_handling:
+      enabled: true
+    shared_tip_logs:
+      enabled: false
+storage:
+  postgres:
+    enabled: true
+    drop_each_run: false
+contracts:
+  - name: SelectedToken
+    abi: ./abis/erc20.json
+    include_events: [Transfer]
+    details:
+      - network: selected
+        address: ${CONTRACT_ADDRESS}
+        start_block: '${START_BLOCK}'
+global:
+  health_port: 8080

@@ -1,0 +1,10 @@
+# Copy outside the checkout; restrict its permissions to 0600.
+# Set RINDEXER_IMAGE to the immutable local ID printed by runtime/image/build.
+RINDEXER_IMAGE=sha256:REPLACE_WITH_BUILT_IMAGE_ID
+RINDEXER_PROJECT_DIR=/absolute/path/to/dedicated/indexer-project
+# Generate a hexadecimal password (for example, openssl rand -hex 32).
+POSTGRES_PASSWORD=REPLACE_WITH_RANDOM_HEXADECIMAL_PASSWORD
+RPC_HTTP_URL=https://YOUR_RPC_PROXY
+CHAIN_ID=1
+CONTRACT_ADDRESS=0xREPLACE_WITH_SELECTED_CONTRACT
+START_BLOCK=REPLACE_WITH_FIRST_REQUIRED_BLOCK

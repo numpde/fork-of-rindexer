@@ -13,6 +13,12 @@ and configurations with ClickHouse, CSV, streams or chat clients. Block traces a
 custom Rust callbacks retain their previous PostgreSQL replay behavior.
 Use one writer process; this change does not coordinate cursor
 publication between independent processes.
+Use stop-before-start replacement rather than overlapping replicas. The optional
+[single-host PostgreSQL runtime](https://github.com/numpde/fork-of-rindexer/tree/master/containers/runtime)
+provides a fixed container name and serialized deployment launcher on one Docker
+engine. It is not a database ownership lease: custom writers and other hosts must
+remain stopped. Session advisory locks alone would not fence pooled writes after
+the owning connection is lost.
 
 Network rollback now notifies every running fetcher to refetch replacement history.
 PostgreSQL checkpoint rollback takes the lesser of the existing checkpoint and

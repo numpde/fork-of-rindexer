@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# Generated Rust travels on stdout; compilation and packaging diagnostics use stderr.
-if [[ "${1:?missing command}" == codegen-typings ]]; then
+# Generated Rust and runtime contexts travel on stdout; diagnostics use stderr.
+if [[ "${1:?missing command}" == codegen-typings || "$1" == runtime-image ]]; then
   exec 3>&1
   exec 1>&2
 fi
@@ -35,6 +35,10 @@ if ! test -f "$RINDEXER_GRAPHQL_PREBUILT" || ! test -f /build/graphql/input.sha2
   printf '%s\n' "$key" > /build/graphql/input.sha256
 fi
 case "$1" in
+  runtime-image)
+    cargo build --frozen --release -p rindexer_cli --no-default-features
+    exec python3 -B containers/runtime/package.py >&3
+    ;;
   sequence-ordering-compile)
     exec cargo nextest run --frozen -p rindexer --lib --no-run -E 'test(/postgres_sequence_positions/) | test(/test_compute_sequence_id/)'
     ;;
