@@ -24,22 +24,18 @@ use crate::{
 #[path = "postgres_readiness_tests.rs"]
 mod postgres_readiness_tests;
 
-fn check_postgres_connection(conn_str: &str, max_retries: u32) -> Result<(), String> {
+async fn check_postgres_connection(max_retries: u32) -> Result<(), String> {
     let mut retries = 0;
 
     while retries < max_retries {
-        let status = Command::new("pg_isready").args(["-d", conn_str]).output().map_err(|e| {
-            let error = format!("Failed to check Postgres status: {e}");
-            rindexer_error!(error);
-            error
-        })?;
-
-        if status.status.success() {
+        // Readiness must use the same credentials and TLS policy as indexing,
+        // without requiring host PostgreSQL tools or exposing a URL in child arguments.
+        if PostgresClient::new().await.is_ok() {
             return Ok(());
         }
 
         retries += 1;
-        thread::sleep(Duration::from_millis(500));
+        tokio::time::sleep(Duration::from_millis(500)).await;
         rindexer_info!(
             "Waiting for Postgres to become available this may take a few attempts... attempt: {}",
             retries
@@ -49,7 +45,10 @@ fn check_postgres_connection(conn_str: &str, max_retries: u32) -> Result<(), Str
     Err("Postgres did not become available within the given retries.".into())
 }
 
-fn check_docker_compose_status(project_path: &PathBuf, max_retries: u32) -> Result<(), String> {
+async fn check_docker_compose_status(
+    project_path: &PathBuf,
+    max_retries: u32,
+) -> Result<(), String> {
     let mut retries = 0;
 
     while retries < max_retries {
@@ -68,8 +67,8 @@ fn check_docker_compose_status(project_path: &PathBuf, max_retries: u32) -> Resu
             if !output.contains("Exit") && output.contains("Up") {
                 rindexer_info!("All containers are up and running.");
 
-                return if let Ok(conn_str) = env::var("DATABASE_URL") {
-                    check_postgres_connection(&conn_str, max_retries).map_err(|e| {
+                return if env::var("DATABASE_URL").is_ok() {
+                    check_postgres_connection(max_retries).await.map_err(|e| {
                         let error = format!("Failed to connect to PostgresSQL: {e}");
                         rindexer_error!(error);
                         error
@@ -86,7 +85,7 @@ fn check_docker_compose_status(project_path: &PathBuf, max_retries: u32) -> Resu
         }
 
         retries += 1;
-        thread::sleep(Duration::from_millis(200));
+        tokio::time::sleep(Duration::from_millis(200)).await;
         rindexer_info!("Waiting for docker compose containers to start...");
     }
 
@@ -377,7 +376,7 @@ async fn handle_clickhouse_schema_sync(
     Ok(true)
 }
 
-fn start_docker_compose(project_path: &PathBuf) -> Result<(), String> {
+async fn start_docker_compose(project_path: &PathBuf) -> Result<(), String> {
     if !project_path.exists() {
         return Err(format!("Project path does not exist: {project_path:?}"));
     }
@@ -402,7 +401,7 @@ fn start_docker_compose(project_path: &PathBuf) -> Result<(), String> {
 
     rindexer_info!("Docker starting up the postgres container..");
 
-    check_docker_compose_status(project_path, 200)
+    check_docker_compose_status(project_path, 200).await
 }
 
 /// When `--watch` is enabled, the outer process acts as a restart loop.
@@ -478,7 +477,7 @@ pub async fn start(
                 );
             }
 
-            match start_docker_compose(&project_path) {
+            match start_docker_compose(&project_path).await {
                 Ok(_) => {
                     rindexer_info!("Docker postgres containers started up successfully");
                 }

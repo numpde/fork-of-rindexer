@@ -155,6 +155,13 @@ During sync, rindexer preserves existing values in `.env` and only appends missi
 
 Start various services like indexers, GraphQL APIs or both together. This will start the services based on the rindexer.yaml file. A health monitoring server is automatically started alongside these services.
 
+If PostgreSQL is enabled but its first connection attempt fails, the CLI can start the project's `docker-compose.yml`
+and wait for the configured database. This readiness check uses rindexer's native PostgreSQL client and the existing
+`DATABASE_URL`, authentication and TLS settings; a host `pg_isready` installation is not required.
+Docker and Docker Compose are still required for this automatic local startup path. Readiness retries do not repair
+invalid credentials or TLS settings: correct the configured connection if it cannot authenticate and execute a startup query.
+
+
 ```bash
 `rindexer start indexer` or `rindexer start graphql` or `rindexer start all`
 

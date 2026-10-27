@@ -45,6 +45,7 @@
 
 ### Bug fixes
 -------------------------------------------------
+- fix: CLI local PostgreSQL auto-start readiness now uses the native authenticated client and existing `DATABASE_URL`/TLS settings instead of host `pg_isready`. A ready database no longer fails because that utility is missing, and the probe no longer passes a credential-bearing URL in child arguments. Docker/Compose requirements and YAML configuration are unchanged.
 - fix: progress markers no longer appear as literal ANSI escape sequences in terminal or ANSI-disabled logs. Event-text control-sequence sanitization stays enabled ([#483](https://github.com/joshstevens19/rindexer/issues/483)).
 - fix: unknown RPC log-fetch failures can now shrink a two-block request to a single block, allowing sequential and parallel historical fetches to recover when only one-block requests succeed. Failed intervals retain their first unfinished block and single-block failures retain the existing backoff policy ([#327](https://github.com/joshstevens19/rindexer/issues/327)).
 - fix: RPC request counters/latencies and shared-tip metrics now match indexing network labels and keep distinct configured aliases of one chain separate. Generated ordinary and Shadow providers pass the configured name, and HyperSync failures and RPC fallbacks use the same label ([#462](https://github.com/joshstevens19/rindexer/issues/462)).
