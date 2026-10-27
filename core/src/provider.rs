@@ -1070,6 +1070,7 @@ pub mod mock {
         panic_on_log_fetch: bool,
         log_rpc_error: Option<(i64, String)>,
         log_fetch_waiter: Option<Arc<tokio::sync::Notify>>,
+        initial_log_successes: usize,
         log_fetches: std::sync::atomic::AtomicUsize,
         block_batches: Option<std::sync::Mutex<std::collections::VecDeque<Vec<AnyRpcBlock>>>>,
         receipts: Vec<AnyTransactionReceipt>,
@@ -1089,6 +1090,7 @@ pub mod mock {
                 panic_on_log_fetch: false,
                 log_rpc_error: None,
                 log_fetch_waiter: None,
+                initial_log_successes: 0,
                 log_fetches: std::sync::atomic::AtomicUsize::new(0),
                 block_batches: None,
                 receipts: vec![],
@@ -1099,6 +1101,12 @@ pub mod mock {
 
         pub fn with_log_rpc_error(mut self, code: i64, message: &str) -> Self {
             self.log_rpc_error = Some((code, message.to_string()));
+            self
+        }
+
+        /// Return normal log responses before applying the configured waiter and RPC error.
+        pub fn with_initial_log_successes(mut self, requests: usize) -> Self {
+            self.initial_log_successes = requests;
             self
         }
 
@@ -1199,21 +1207,23 @@ pub mod mock {
             event_filter: &RindexerEventFilter,
         ) -> Result<Vec<Log>, ProviderError> {
             assert!(!self.panic_on_log_fetch, "scripted log producer panic");
-            self.log_fetches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if let Some(waiter) = &self.log_fetch_waiter {
-                waiter.notified().await;
-            }
-            if let Some((code, message)) = &self.log_rpc_error {
-                // Real RPC failures yield to the runtime; keep timeout-driven
-                // dispatcher tests from spinning synchronously inside the mock.
-                tokio::task::yield_now().await;
-                return Err(ProviderError::RequestFailed(RpcError::ErrorResp(
-                    alloy::rpc::json_rpc::ErrorPayload {
-                        code: *code,
-                        message: message.clone().into(),
-                        data: None,
-                    },
-                )));
+            let request = self.log_fetches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if request >= self.initial_log_successes {
+                if let Some(waiter) = &self.log_fetch_waiter {
+                    waiter.notified().await;
+                }
+                if let Some((code, message)) = &self.log_rpc_error {
+                    // Real RPC failures yield to the runtime; keep timeout-driven
+                    // dispatcher tests from spinning synchronously inside the mock.
+                    tokio::task::yield_now().await;
+                    return Err(ProviderError::RequestFailed(RpcError::ErrorResp(
+                        alloy::rpc::json_rpc::ErrorPayload {
+                            code: *code,
+                            message: message.clone().into(),
+                            data: None,
+                        },
+                    )));
+                }
             }
             let from = event_filter.from_block().to::<u64>();
             let to = event_filter.to_block().to::<u64>();

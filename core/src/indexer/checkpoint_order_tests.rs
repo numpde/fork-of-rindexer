@@ -931,3 +931,114 @@ async fn pruned_history_parallel_producer_closes_after_its_first_terminal_error(
     assert_eq!(fixture.cursor(), "1");
     assert!(!fixture.config.cancel_token().is_cancelled());
 }
+
+#[derive(Clone, Copy)]
+enum StreamFailure {
+    Fetch,
+    CallbackPanic,
+}
+
+#[tokio::test]
+async fn fetch_failure_waits_for_admitted_callback_before_returning() {
+    assert_stream_failure_drains_admitted_work(StreamFailure::Fetch).await;
+}
+
+#[tokio::test]
+async fn callback_panic_waits_for_other_admitted_callbacks_before_returning() {
+    assert_stream_failure_drains_admitted_work(StreamFailure::CallbackPanic).await;
+}
+
+async fn assert_stream_failure_drains_admitted_work(failure: StreamFailure) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let entered = Arc::new(Notify::new());
+    let release_callback = Arc::new(Notify::new());
+    let release_second_fetch = Arc::new(Notify::new());
+    let effects = Arc::new(AtomicUsize::new(0));
+    let callback_entered = entered.clone();
+    let callback_release = release_callback.clone();
+    let callback_effects = effects.clone();
+    let callback: EventCallbackType = Arc::new(move |events| {
+        let entered = callback_entered.clone();
+        let release = callback_release.clone();
+        let effects = callback_effects.clone();
+        Box::pin(async move {
+            if events[0].tx_information.block_number == 4 {
+                panic!("scripted callback panic");
+            }
+            entered.notify_one();
+            release.notified().await;
+            effects.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+    });
+    let logs: Vec<_> = [2, 4]
+        .into_iter()
+        .map(|block| Log {
+            block_hash: Some(B256::repeat_byte(block as u8)),
+            block_number: Some(block),
+            transaction_hash: Some(B256::repeat_byte(block as u8)),
+            transaction_index: Some(0),
+            log_index: Some(0),
+            ..Default::default()
+        })
+        .collect();
+    let mut fixture = Fixture::with_logs(callback, logs.clone()).await;
+    let EventProcessingConfig::ContractEventProcessing(config) =
+        Arc::get_mut(&mut fixture.config).unwrap()
+    else {
+        panic!("contract fixture")
+    };
+    config.end_block = U64::from(4);
+    let provider = MockChainProvider::new(1)
+        .with_block_number(4)
+        .with_max_block_range(1)
+        .with_logs(logs)
+        .with_initial_log_successes(1)
+        .with_log_fetch_waiter(release_second_fetch.clone());
+    let provider = Arc::new(match failure {
+        StreamFailure::Fetch => provider.with_log_rpc_error(4444, "scripted unavailable history"),
+        StreamFailure::CallbackPanic => provider,
+    });
+    let network = Arc::make_mut(&mut config.network_contract);
+    network.cached_provider = provider.clone();
+    network.block_clock = BlockClock::new(None, None, provider);
+
+    let config = fixture.config.clone();
+    let mut processing = tokio::spawn(async move {
+        super::process_event_logs(config, false, false, None, None).await.map_err(|e| e.to_string())
+    });
+    timeout(Duration::from_secs(2), entered.notified()).await.expect("first callback admitted");
+    release_second_fetch.notify_one();
+    let early = timeout(Duration::from_millis(150), &mut processing).await;
+    let returned_before_release = early.is_ok();
+    assert_eq!(effects.load(Ordering::SeqCst), 0, "the first callback is still paused");
+    // Release and settle work even on the red implementation, which detached its callback.
+    release_callback.notify_one();
+    let result = match early {
+        Ok(result) => result,
+        Err(_) => timeout(Duration::from_secs(2), processing)
+            .await
+            .expect("stream finishes after its admitted callback settles"),
+    }
+    .expect("dispatcher task must not panic");
+    timeout(Duration::from_secs(2), async {
+        while active_indexing_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("all callback activity settles");
+    let error = result.expect_err("stream failure remains an error");
+    match failure {
+        StreamFailure::Fetch => assert!(error.contains("4444"), "{error}"),
+        StreamFailure::CallbackPanic => assert!(error.contains("panic"), "{error}"),
+    }
+    assert_eq!(effects.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.cursor(), "2", "only the successful prefix is checkpointed");
+    assert!(!fixture.config.cancel_token().is_cancelled());
+    assert!(
+        !returned_before_release,
+        "stream returned an error while its admitted callback was still paused"
+    );
+}
