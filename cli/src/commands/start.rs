@@ -20,6 +20,10 @@ use crate::{
     rindexer_yaml::validate_rindexer_yaml_exist,
 };
 
+#[cfg(all(test, unix))]
+#[path = "postgres_readiness_tests.rs"]
+mod postgres_readiness_tests;
+
 fn check_postgres_connection(conn_str: &str, max_retries: u32) -> Result<(), String> {
     let mut retries = 0;
 
