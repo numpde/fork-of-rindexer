@@ -246,6 +246,10 @@ For example, if `message` contains `forwarded {{recipient}}` and `recipient` is 
 `{{message}} / {{recipient}}` renders as `forwarded {{recipient}} / Alice`.
 Unknown expressions and unfinished placeholders remain visible. Chat-platform formatting still applies to the resulting message.
 
+String fields insert their decoded text, preserving embedded quotes, backslashes, Unicode and actual line breaks.
+Arrays and objects render as compact JSON, including quoted keys and string values; numbers, booleans and `null` keep their JSON representations.
+After upgrading, review message parsers and remove workarounds for stripped quotes or JSON-escaped string text. Template field names and YAML keys are unchanged.
+
 After upgrading, move any intended field or function expressions out of event values and into `template_inline`; repeated replacement of inserted expressions is no longer supported.
 
 :::info

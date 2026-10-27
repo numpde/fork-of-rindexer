@@ -61,7 +61,10 @@ impl Template {
             let value = current.get(key)?;
             current = value;
         }
-        Some(current.to_string().replace('"', ""))
+        Some(match current {
+            Value::String(text) => text.clone(),
+            value => value.to_string(),
+        })
     }
 
     fn evaluate_function(&self, function_call: &str, event_data: &Value) -> Option<String> {
