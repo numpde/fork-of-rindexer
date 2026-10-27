@@ -113,8 +113,11 @@ contracts: []
 The block to start indexing from, you can use the deployed block if you wish to get everything.
 
 :::info
-This is optional but most people will want to use this, if you do not provide an start block it will index the data from now and then live index as new blocks
-come in. Important to know this will NOT track last synced block and when you start and stop the indexer it will start from the latest block.
+This field is optional. A new subscription without saved progress starts at the latest
+block when `start_block` is omitted. On restart, saved progress takes precedence
+whether or not `start_block` is configured: indexing resumes at the next unfinished
+block, including blocks produced while the indexer was stopped. If no progress is
+persisted, each start still begins at the configured start or the current tip.
 You can read more about this [here](/docs/start-building/live-indexing-and-historic).
 :::
 

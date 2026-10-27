@@ -154,23 +154,19 @@ async fn get_start_end_block(
     crate::indexer::last_synced::initialize_subscription_cursor(&config)
         .await
         .map_err(StartIndexingError::UnknownError)?;
-    let last_known_start_block = if manifest_start_block.is_some() {
-        let last_synced_block =
-            get_last_synced_block_number(config).await.map_err(StartIndexingError::UnknownError)?;
-
-        if let Some(value) = last_synced_block {
+    // A configured start bootstraps a new subscription; it does not determine
+    // whether an existing subscription owns durable progress across restarts.
+    let last_known_start_block = get_last_synced_block_number(config)
+        .await
+        .map_err(StartIndexingError::UnknownError)?
+        .map(|value| {
             let start_from = value + U64::from(1);
             info!(
                 "{} Found last synced block number - {:?} rindexer will start up from {:?}",
                 event_name, value, start_from
             );
-            Some(start_from)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+            start_from
+        });
 
     let start_block =
         last_known_start_block.unwrap_or(manifest_start_block.unwrap_or(latest_block));

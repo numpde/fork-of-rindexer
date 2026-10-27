@@ -39,10 +39,19 @@ contracts:
 
 If you want to index live data you can just remove the [start_block](/docs/start-building/yaml-config/contracts#start_block)
 and [end_block](/docs/start-building/yaml-config/contracts#end_block) from the YAML configuration file. This will index
-from the latest block and then index all new blocks as they come in.
+from the latest block on the first start, then index new blocks as they arrive.
 
 :::info
-Important to know this will NOT track last synced block and when you start and stop the indexer it will start from the latest block.
+Omitting `start_block` does not disable saved progress. When a subscription has a
+persisted cursor, restart resumes from its next unfinished block and catches up on
+blocks produced during downtime. A new subscription with no saved cursor starts
+at the current tip; a subscription without persistent progress does so on every start.
+
+After upgrading from a version that discarded progress without `start_block`,
+review each saved subscription cursor and the backlog it will resume. If an older
+restart already advanced the cursor across missing history, this change cannot
+infer or repair that gap: restore or rebuild the affected interval from verified
+canonical history.
 :::
 
 ```yaml
