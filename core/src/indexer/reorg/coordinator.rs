@@ -753,6 +753,92 @@ mod tests {
         assert_eq!(coordinator.window.block_numbers(), (100..=105).collect::<Vec<_>>());
     }
 
+    fn exhausted_history_coordinator(keep_oldest: bool) -> ReorgCoordinator {
+        let mut coordinator = make_coordinator(make_window_with_blocks(&[
+            (100, 100, 99),
+            (101, 101, 100),
+            (102, 102, 101),
+        ]));
+        coordinator.network = "exhausted-history".into();
+        let mut blocks = Vec::new();
+        for number in 100..=102 {
+            let mut block = header(number, (number - 1) as u8);
+            block.header.hash = hash((number + 100) as u8);
+            block.header.parent_hash = hash((number + 99) as u8);
+            blocks.push(block);
+        }
+        if keep_oldest {
+            blocks[0] = header(100, 99);
+            blocks[1].header.parent_hash = hash(100);
+        }
+        coordinator.provider =
+            Some(Arc::new(crate::provider::mock::MockChainProvider::new(1).with_blocks(blocks)));
+        coordinator
+    }
+
+    #[tokio::test]
+    async fn history_exhausted_startup_requires_a_proven_common_ancestor() {
+        let coordinator = exhausted_history_coordinator(false);
+        let error = coordinator
+            .validate_on_startup()
+            .await
+            .map(|task| task.map(|task| task.fork_point))
+            .expect_err("the oldest retained block is not evidence of the fork boundary");
+        let text = error.to_string();
+        for evidence in ["exhausted-history", "100", "102", "recovery history"] {
+            assert!(text.contains(evidence), "{text}");
+        }
+        assert_eq!(coordinator.window.block_numbers(), vec![100, 101, 102]);
+    }
+
+    #[tokio::test]
+    async fn history_exhausted_live_detection_cannot_invent_the_oldest_fork_point() {
+        let mut coordinator = exhausted_history_coordinator(false);
+        assert!(
+            coordinator.on_new_block(103, hash(203), hash(202)).await.is_err(),
+            "a mismatched window cannot establish the fork point at its oldest block"
+        );
+    }
+
+    #[tokio::test]
+    async fn history_exhausted_live_detection_quarantines_writers_without_rollback() {
+        let mut coordinator = exhausted_history_coordinator(false);
+        let recovery = super::super::subscribe_reorgs(&coordinator.network);
+        let context =
+            ReorgContext { postgres: None, clickhouse: None, registry: None, trace_registry: None };
+        let result = super::super::detect_and_handle_reorg(
+            &mut coordinator,
+            103,
+            hash(203),
+            hash(202),
+            "history-test",
+            &context,
+        )
+        .await;
+        let error = result.expect_err("unknown ancestry must never authorize a partial rollback");
+        assert!(error.to_string().contains("recovery history"), "{error:#}");
+        assert!(coordinator.pending_recovery.tasks.is_empty(), "no unproven rollback is queued");
+        assert_eq!(coordinator.window.block_numbers(), vec![100, 101, 102]);
+        assert_eq!(recovery.take_rewind(), None, "no speculative replacement prefix is published");
+        assert!(
+            event_writer_barrier("exhausted-history").try_read().is_err(),
+            "new network writes stay quarantined"
+        );
+        assert!(
+            coordinator.on_new_block(103, hash(103), hash(102)).await.is_err(),
+            "a later head cannot clear the terminal recovery failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn history_exhausted_control_retained_ancestor_still_recovers_first_divergence() {
+        let mut coordinator = exhausted_history_coordinator(true);
+        let task = coordinator.validate_on_startup().await.unwrap().unwrap();
+        assert_eq!(task.fork_point, 101);
+        let task = coordinator.on_new_block(103, hash(203), hash(202)).await.unwrap().unwrap();
+        assert_eq!(task.fork_point, 101);
+    }
+
     #[tokio::test]
     async fn startup_incomplete_canonical_response_is_rejected() {
         let mut coordinator = make_coordinator(make_window_with_blocks(&[
