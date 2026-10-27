@@ -11,6 +11,14 @@ The health monitoring system tracks the status of key components:
 - **Sync status** - Data synchronization health across storage backends
 - **Overall system health** - Aggregated status across all components
 
+## Terminal indexing failures
+
+A terminal contract-event fetch error, unexpected producer exit or callback-task failure makes `/health` return HTTP `503` with `services.indexing: "unhealthy"` and an entry in `indexing.failed_streams`. The entry identifies the indexer, contract, event and network; it does not expose callback or RPC error text. For stream-level failures its block range describes the configured stream interval, rather than claiming an exact failing event position.
+
+Failures become visible before already admitted callbacks finish draining. Reporting an operational failure does not abort those handlers. The generation supervisor inspects both task and application results as each stream finishes, requests a cooperative generation stop on the first failure, waits for remaining tasks to settle, and returns that failure. Finite successful streams do not stop their live peers.
+
+A blocked or indefinitely retrying user handler can delay final cleanup; failed health is available during that wait. Stop the failed instance completely before starting its replacement. Custom-handler effects retain their existing replay requirements.
+
 ## Health Server
 
 The health monitoring server runs automatically alongside your rindexer instance on a separate port. By default, it runs on port `8080`, but this can be configured.

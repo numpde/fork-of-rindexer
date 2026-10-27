@@ -2,7 +2,6 @@ use std::{collections::HashMap, path::Path, sync::Arc};
 
 use alloy::primitives::U64;
 use anyhow::Context;
-use futures::future::try_join_all;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use tokio::sync::Mutex;
@@ -1426,13 +1425,27 @@ async fn start_indexing(
 
 async fn await_indexing_tasks(
     handles: Vec<JoinHandle<Result<(), CombinedLogEventProcessingError>>>,
-    _cancel_token: &CancellationToken,
+    cancel_token: &CancellationToken,
 ) -> Result<(), StartIndexingError> {
-    let results = try_join_all(handles).await?;
-    for result in results {
-        result.map_err(StartIndexingError::CombinedError)?;
+    let mut tasks = handles.into_iter().collect::<FuturesUnordered<_>>();
+    let mut failure = None;
+    while let Some(joined) = tasks.next().await {
+        let result = joined
+            .map_err(StartIndexingError::CouldNotRunAllIndexHandlersJoin)
+            .and_then(|result| result.map_err(StartIndexingError::CombinedError));
+        if let Err(error) = result {
+            if failure.is_none() {
+                error!(error = %error, "Indexing stream failed; stopping this indexing generation");
+                failure = Some(error);
+                cancel_token.cancel();
+            }
+        }
     }
-    Ok(())
+    // Keep task ownership until peers finish their existing cooperative cleanup.
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]

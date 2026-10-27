@@ -163,6 +163,23 @@ async fn process_event_logs(
 
     let failures = config.registry().failure_state();
     let network = config.network_contract().network.clone();
+    let (from_block, to_block) = match config.as_ref() {
+        EventProcessingConfig::ContractEventProcessing(config) => {
+            (config.start_block, config.end_block)
+        }
+        EventProcessingConfig::FactoryEventProcessing(config) => {
+            (config.start_block, config.end_block)
+        }
+    };
+    let failed_stream = crate::event::callback_registry::FailedStream {
+        id: config.id().to_string(),
+        indexer: config.indexer_name(),
+        contract: config.contract_name(),
+        event: config.event_name(),
+        network: network.clone(),
+        from_block: from_block.to(),
+        to_block: to_block.to(),
+    };
     // Error exits stop admission, but must not detach callbacks that already own effects.
     let mut processing_result: Result<(), Box<ProviderError>> = async {
         'outer: loop {
@@ -301,12 +318,34 @@ async fn process_event_logs(
     }
     .await;
     drop(logs_stream);
+    if processing_result.is_ok() {
+        if let Some(reason) = failures.reason(config.id(), &network) {
+            processing_result = Err(Box::new(ProviderError::CustomError(reason)));
+        }
+    }
+    // Classify the producer exit before cleanup can wait on user work. Operational
+    // failures affect health immediately but must not cancel an admitted callback.
+    if processing_result.is_ok()
+        && config.live_indexing()
+        && !force_no_live_indexing
+        && is_running()
+        && !config.cancel_token().is_cancelled()
+    {
+        processing_result = Err(Box::new(ProviderError::CustomError(format!(
+            "{} - live logs stream ended unexpectedly for stream {}; no shutdown or cancellation was requested",
+            config.info_log_name(), config.id()
+        ))));
+    }
+    if processing_result.is_err() {
+        failures.record_stream(failed_stream.clone());
+    }
 
     // A join failure must not detach the other admitted callbacks either. Preserve an
     // earlier fetch/dispatch error; otherwise report the first callback join failure.
     while let Some(joined) = in_flight.next().await {
         if let Err(error) = joined {
             if processing_result.is_ok() {
+                failures.record_stream(failed_stream.clone());
                 processing_result = Err(Box::new(ProviderError::BatchRequestFailed(error)));
             }
         }
@@ -315,19 +354,6 @@ async fn process_event_logs(
 
     if let Some(reason) = failures.reason(config.id(), &network) {
         return Err(Box::new(ProviderError::CustomError(reason)));
-    }
-
-    // Join admitted work before classifying completion. Live subscriptions
-    // have no successful EOF unless history was forced or stopping was requested.
-    if config.live_indexing()
-        && !force_no_live_indexing
-        && is_running()
-        && !config.cancel_token().is_cancelled()
-    {
-        return Err(Box::new(ProviderError::CustomError(format!(
-            "{} - live logs stream ended unexpectedly for stream {}; no shutdown or cancellation was requested",
-            config.info_log_name(), config.id()
-        ))));
     }
 
     Ok(())
