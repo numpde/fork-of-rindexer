@@ -172,6 +172,7 @@ async fn postgres_batch_checks(
     cursor: &str,
 ) -> Result<()> {
     let valid = event(&params, 1);
+    let cursor_key = valid.found_in_request.cursor_key.clone();
     let corrected = event(&params, 2);
     let mut invalid = corrected.clone();
     truncate_data(&mut invalid);
@@ -179,7 +180,7 @@ async fn postgres_batch_checks(
     let callback = no_code_callback(Arc::new(params)).event_callback;
     let result = callback(vec![valid.clone(), invalid]).await;
     let rows: i64 = postgres.query_one(&format!("SELECT count(*) FROM {table}"), &[]).await?.get(0);
-    let position: String = postgres.query_one(&format!("SELECT last_synced_block::text FROM rindexer_internal.{cursor} WHERE network = 'ethereum'"), &[]).await?.get(0);
+    let position: String = postgres.query_one(&format!("SELECT last_synced_block::text FROM rindexer_internal.{cursor} WHERE network = 'ethereum' AND cursor_key=$1"), &[&cursor_key]).await?.get(0);
     ensure!(result.is_err() && rows == 0 && position == "1", "decode failure must reject before writes and cursor advance: result={result:?}, rows={rows}, cursor={position}");
     callback(vec![valid, corrected]).await.map_err(anyhow::Error::msg)?;
     let rows = postgres.query(&format!("SELECT value FROM {table} ORDER BY value"), &[]).await?;
@@ -187,7 +188,7 @@ async fn postgres_batch_checks(
         rows.len() == 2 && rows[0].get::<_, String>(0) == "1" && rows[1].get::<_, String>(0) == "2",
         "corrected input must index both original events exactly once"
     );
-    let position: String = postgres.query_one(&format!("SELECT last_synced_block::text FROM rindexer_internal.{cursor} WHERE network = 'ethereum'"), &[]).await?.get(0);
+    let position: String = postgres.query_one(&format!("SELECT last_synced_block::text FROM rindexer_internal.{cursor} WHERE network = 'ethereum' AND cursor_key=$1"), &[&cursor_key]).await?.get(0);
     ensure!(position == "2", "corrected batch must advance the cursor");
     Ok(())
 }
@@ -251,8 +252,8 @@ async fn postgres_decode_failure_keeps_rows_and_cursor_unchanged_until_corrected
     // Only the ABI columns are under test; the fixed metadata shape matches event-table DDL.
     postgres.batch_execute(&format!("CREATE SCHEMA {schema}; CREATE SCHEMA IF NOT EXISTS rindexer_internal;
         CREATE TABLE {schema}.value (contract_address CHAR(42), {columns}, tx_hash CHAR(66), block_number NUMERIC, block_timestamp TIMESTAMPTZ, block_hash CHAR(66), network VARCHAR(50), tx_index NUMERIC, log_index VARCHAR(78));
-        CREATE TABLE rindexer_internal.{cursor} (network TEXT PRIMARY KEY, last_synced_block NUMERIC);
-        INSERT INTO rindexer_internal.{cursor} VALUES ('ethereum', 1);")).await.expect("create isolated event and cursor tables");
+        CREATE TABLE rindexer_internal.{cursor} (network TEXT NOT NULL, cursor_key TEXT NOT NULL, last_synced_block NUMERIC, PRIMARY KEY (network,cursor_key));
+        INSERT INTO rindexer_internal.{cursor} VALUES ('ethereum', '{cursor_key}', 1);", cursor_key=crate::event::cursor::NETWORK_CURSOR_KEY)).await.expect("create isolated event and cursor tables");
     let result = postgres_batch_checks(postgres.clone(), params, &cursor).await;
     postgres
         .batch_execute(&format!(

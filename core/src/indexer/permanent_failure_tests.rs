@@ -77,8 +77,8 @@ impl PostgresCase {
         let columns = generate_columns_with_data_types(&params.event_info.inputs).join(", ");
         client.batch_execute(&format!("CREATE SCHEMA {schema}; CREATE SCHEMA IF NOT EXISTS rindexer_internal;
             CREATE TABLE {schema}.value (contract_address CHAR(42), {columns}, tx_hash CHAR(66), block_number NUMERIC, block_timestamp TIMESTAMPTZ, block_hash CHAR(66), network VARCHAR(50), tx_index NUMERIC, log_index VARCHAR(78));
-            CREATE TABLE rindexer_internal.{cursor} (network TEXT PRIMARY KEY, last_synced_block NUMERIC);
-            INSERT INTO rindexer_internal.{cursor} VALUES ('ethereum', 1);")).await.expect("create owned event/cursor fixture");
+            CREATE TABLE rindexer_internal.{cursor} (network TEXT NOT NULL, cursor_key TEXT NOT NULL, last_synced_block NUMERIC, PRIMARY KEY (network,cursor_key));
+            INSERT INTO rindexer_internal.{cursor} VALUES ('ethereum', '{cursor_key}', 1);", cursor_key=crate::event::cursor::NETWORK_CURSOR_KEY)).await.expect("create owned event/cursor fixture");
         Self { params, client, schema, cursor, _container: container }
     }
 
@@ -109,8 +109,8 @@ impl PostgresCase {
         let cursor = self
             .client
             .query_one(
-                &format!("SELECT last_synced_block::text FROM rindexer_internal.{}", self.cursor),
-                &[],
+                &format!("SELECT last_synced_block::text FROM rindexer_internal.{} WHERE network='ethereum' AND cursor_key=$1", self.cursor),
+                &[&crate::event::cursor::NETWORK_CURSOR_KEY],
             )
             .await
             .unwrap()
