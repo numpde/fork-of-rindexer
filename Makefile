@@ -554,3 +554,7 @@ runtime/checks: ## Check the rendered single-host PostgreSQL deployment without 
 .PHONY: tests/make-timeouts
 tests/make-timeouts: ## Check recipe deadlines, child cancellation and cleanup without Docker
 	@python3 -B -m unittest discover -s tests/make -p test_make_timeouts.py -v
+
+.PHONY: runtime/launcher/checks
+runtime/launcher/checks: ## Check actual launcher engine selection with offline Compose rendering
+	@python3 -B -m unittest discover -s tests/runtime -v
