@@ -13,11 +13,23 @@ The health monitoring system tracks the status of key components:
 
 ## Terminal indexing failures
 
-A terminal contract-event fetch error, unexpected producer exit or callback-task failure makes `/health` return HTTP `503` with `services.indexing: "unhealthy"` and an entry in `indexing.failed_streams`. The entry identifies the indexer, contract, event and network; it does not expose callback or RPC error text. For stream-level failures its block range describes the configured stream interval, rather than claiming an exact failing event position.
+A terminal contract-event fetch error, unexpected producer exit or callback-task failure makes `/health` return HTTP `503` with `services.indexing: "unhealthy"` and an entry in `indexing.failed_streams`. The entry identifies the indexer, contract, event and network; it does not expose callback or RPC error text. For stream-level and generation-stop failures its numeric bound fields describe configuration, rather than an exact failing event position; an unspecified bound is `0`. The subscription catalog exposes configured bounds as nullable fields.
 
 Failures become visible before already admitted callbacks finish draining. Reporting an operational failure does not abort those handlers. The generation supervisor inspects both task and application results as each stream finishes, requests a cooperative generation stop on the first failure, waits for remaining tasks to settle, and returns that failure. Finite successful streams do not stop their live peers.
 
 A blocked or indefinitely retrying user handler can delay final cleanup; failed health is available during that wait. Stop the failed instance completely before starting its replacement. Custom-handler effects retain their existing replay requirements.
+
+## PostgreSQL subscription progress
+
+The runtime supplies health with the same contract and native-transfer registries used for indexing. PostgreSQL health reads each configured query's `(network, cursor_key)` checkpoint; an unrelated raw table or legacy network-only cursor is not evidence of its progress. `indexing.subscriptions` includes the indexer, contract, event, network, query key, configured bounds, `last_synced_block`, `observed_head`, `target_block`, `lag_blocks` and status.
+
+For example, with head `100`, safe distance `2`, and two query cursors at `95` and `80`, their targets are both `98` and their lags are `3` and `18`. Lag excludes blocks before a configured start. Each request reads durable progress again; it does not infer a completed query from another query's maximum.
+
+Subscription states are `waiting_for_checkpoint`, `syncing`, `live`, `completed`, `failed` and `unavailable`. Missing checkpoints report null progress/lag rather than zero. A finite query is `completed` only after its durable cursor reaches the configured `end_block`; catching up to an earlier safe head remains `live`. An unavailable RPC head or checkpoint read produces `unavailable`, null unknown values and HTTP `503`; it is never presented as zero lag. Health samples checkpoint rows and heads independently, not as an atomic cross-network database snapshot.
+
+One RPC head probe per configured network is made per health request, with a two-second timeout per probe. Choose a polling interval appropriate for your RPC budget. Normal catch-up reports `services.sync: "syncing"` while overall health remains a process/connectivity check; a `200` response is not a freshness SLA. Alert on each subscription's lag and status for deployment readiness. ClickHouse/CSV retain their existing storage health checks and do not expose PostgreSQL cursor progress.
+
+Rust callers constructing `HealthServer` directly should attach `.with_event_registry(&registry)` and, when applicable, `.with_trace_registry(&trace_registry)`. A PostgreSQL indexer configured with inputs but no registry catalog reports sync as `notconfigured`, rather than guessing from table existence. No YAML changes are needed for the built-in runtime. JSON clients must allow the additive `indexing.subscriptions` field and the new `syncing` service status.
 
 ## Health Server
 
@@ -68,11 +80,12 @@ The health endpoint returns different status types for each service:
 | Status | Description |
 |--------|-------------|
 | `healthy` | Service is functioning normally |
+| `syncing` | Selected subscriptions are catching up to their safe targets |
 | `unhealthy` | Service has encountered an error |
 | `unknown` | Status cannot be determined |
-| `not_configured` | Service is not set up |
+| `notconfigured` | Service is not set up |
 | `disabled` | Service is intentionally disabled |
-| `no_data` | Service is working but no data is available |
+| `nodata` | Service is working but no data is available |
 | `stopped` | Service is not running |
 
 ## Service Health Checks
@@ -83,7 +96,7 @@ The database health check verifies PostgreSQL connectivity and functionality:
 
 - **`healthy`**: PostgreSQL is enabled and a simple `SELECT 1` query succeeds
 - **`unhealthy`**: PostgreSQL is enabled but the connection fails or query errors occur
-- **`not_configured`**: PostgreSQL is enabled but no database client is available
+- **`notconfigured`**: PostgreSQL is enabled but no database client is available
 - **`disabled`**: PostgreSQL is not enabled in the configuration
 
 **What it checks**: Basic database connectivity by executing `SELECT 1` against the PostgreSQL instance.
@@ -99,32 +112,17 @@ The indexing health check monitors the indexer process state:
 
 ### Sync Health Check
 
-The sync health check verifies data synchronization status based on your storage configuration:
-
-**For PostgreSQL storage:**
-- **`healthy`**: Database has event tables (excluding system tables like `latest_block`, `*_last_known_*`, `*_last_run_*`)
-- **`no_data`**: No event tables exist yet (acceptable for new deployments)
-- **`unhealthy`**: Database query fails or connection issues
-- **`not_configured`**: No database client available
+For PostgreSQL, sync health uses the registry-selected durable checkpoints and bounded RPC head probes described above. It reports `healthy` for caught-up queries, `syncing` during catch-up, `nodata` when selected checkpoints are missing, and `unhealthy` when a query has failed or its head/checkpoint is unavailable. PostgreSQL connectivity alone does not prove that a selected subscription is advancing.
 
 **For CSV storage:**
-- **`healthy`**: CSV directory exists and contains `.csv` files
-- **`no_data`**: CSV directory doesn't exist or contains no `.csv` files
-- **`unhealthy`**: CSV directory exists but cannot be read
-- **`not_configured`**: CSV storage not configured
-
-**What it checks**:
-- **PostgreSQL**: Queries `information_schema.tables` to find user-created event tables
-- **CSV**: Checks if the CSV directory exists and contains CSV files
+- **`healthy`**: The configured directory contains `.csv` files.
+- **`nodata`**: The directory or CSV files are absent.
+- **`unhealthy`**: The directory cannot be read.
+- **`notconfigured`**: CSV storage is not configured.
 
 ### Overall Health Status
 
-The overall health status is determined by combining all service checks:
-
-- **`healthy`**: All critical services are healthy, or sync shows `no_data` (acceptable for new deployments)
-- **`unhealthy`**: Any critical service is `unhealthy`, `not_configured`, or indexing is `stopped`
-
-**Critical services**: Database, Indexing, and Sync (when enabled)
+Database/indexing/sync failures or missing required configuration return HTTP `503`. Normal catch-up (`syncing`) and a new deployment awaiting its first checkpoint (`nodata`) remain process-health `200` states. Use per-subscription lag/status for freshness readiness; table presence is no longer PostgreSQL progress evidence.
 
 ## Health Server Lifecycle
 

@@ -57,6 +57,7 @@ async fn response(
     let router =
         crate::health::HealthServer::new(0, Arc::new(manifest), Some(fixture.client.clone()))
             .with_callback_failures(vec![registry.failure_state()])
+            .with_event_registry(registry)
             .router();
     let result = router
         .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
@@ -132,5 +133,28 @@ async fn postgres_health_reports_unavailable_rpc_head_instead_of_zero_lag() {
     assert!(subscriptions.iter().all(|state| state["observed_head"].is_null()
         && state["lag_blocks"].is_null()
         && state["status"] == "unavailable"));
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_health_does_not_complete_a_finite_query_before_its_end_block() {
+    let fixture = Fixture::new().await;
+    let mut registry =
+        registry(&fixture, Arc::new(MockChainProvider::new(1).with_block_number(100)));
+    for detail in &mut registry.events[0].contract.details {
+        detail.end_block = Some(U64::from(1000));
+    }
+    let table = cursor_table(&fixture);
+    for detail in &registry.events[0].contract.details {
+        fixture.client.execute(&format!("INSERT INTO rindexer_internal.{table} (network,cursor_key,last_synced_block) VALUES ('ethereum',$1,98)"), &[&detail.cursor_key()]).await.unwrap();
+    }
+    let (_, body) = response(&fixture, &registry).await;
+    for state in body["indexing"]["subscriptions"].as_array().unwrap() {
+        assert_eq!(state["lag_blocks"], 0);
+        assert_eq!(
+            state["status"], "live",
+            "caught up to the safe head is not completion of a future end block"
+        );
+    }
     fixture.finish().await;
 }

@@ -7,12 +7,19 @@ use tracing::{error, info};
 
 use crate::{
     database::postgres::client::PostgresClient,
-    event::callback_registry::{CallbackFailures, FailedStream},
+    event::callback_registry::{
+        CallbackFailures, EventCallbackRegistry, FailedStream, TraceCallbackRegistry,
+    },
     indexer::task_tracker::active_indexing_count,
     manifest::core::Manifest,
     metrics::metrics_handler,
     system_state::{get_reload_state, is_running, ReloadState},
 };
+
+#[path = "health_subscriptions.rs"]
+mod subscriptions;
+use subscriptions::SubscriptionSource;
+pub use subscriptions::{SubscriptionHealth, SubscriptionIdentity, SubscriptionStatus};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthStatus {
@@ -35,12 +42,15 @@ pub struct IndexingStatus {
     pub is_running: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failed_streams: Vec<FailedStream>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subscriptions: Vec<SubscriptionHealth>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HealthStatusType {
     Healthy,
+    Syncing,
     Unhealthy,
     Unknown,
     NotConfigured,
@@ -60,10 +70,14 @@ pub struct HealthServer {
     port: u16,
     state: HealthServerState,
     callback_failures: Vec<Arc<CallbackFailures>>,
+    subscriptions: Vec<SubscriptionSource>,
 }
 
 #[derive(Clone)]
 struct CallbackFailureSources(Vec<Arc<CallbackFailures>>);
+
+#[derive(Clone)]
+struct SubscriptionSources(Vec<SubscriptionSource>);
 
 impl HealthServer {
     pub fn new(
@@ -75,6 +89,7 @@ impl HealthServer {
             port,
             state: HealthServerState { manifest, postgres_client },
             callback_failures: vec![],
+            subscriptions: vec![],
         }
     }
 
@@ -83,11 +98,30 @@ impl HealthServer {
         self
     }
 
+    pub fn with_event_registry(mut self, registry: &EventCallbackRegistry) -> Self {
+        self.subscriptions.extend(subscriptions::event_sources(registry));
+        let failures = registry.failure_state();
+        if !self.callback_failures.iter().any(|source| Arc::ptr_eq(source, &failures)) {
+            self.callback_failures.push(failures);
+        }
+        self
+    }
+
+    pub fn with_trace_registry(mut self, registry: &TraceCallbackRegistry) -> Self {
+        self.subscriptions.extend(subscriptions::trace_sources(registry));
+        let failures = registry.failure_state();
+        if !self.callback_failures.iter().any(|source| Arc::ptr_eq(source, &failures)) {
+            self.callback_failures.push(failures);
+        }
+        self
+    }
+
     pub(crate) fn router(self) -> Router {
         Router::new()
             .route("/health", get(health_handler))
             .route("/metrics", get(metrics_handler))
             .layer(Extension(CallbackFailureSources(self.callback_failures)))
+            .layer(Extension(SubscriptionSources(self.subscriptions)))
             .with_state(self.state)
     }
 
@@ -108,21 +142,25 @@ impl HealthServer {
 async fn health_handler(
     State(state): State<HealthServerState>,
     Extension(failures): Extension<CallbackFailureSources>,
+    Extension(subscriptions): Extension<SubscriptionSources>,
 ) -> Result<(StatusCode, Json<HealthStatus>), StatusCode> {
     let database_health = check_database_health(&state).await;
     let failed_streams = failures.0.iter().flat_map(|source| source.snapshot()).collect::<Vec<_>>();
     let indexing_health = check_indexing_health(&failed_streams);
-    let sync_health = check_sync_health(&state).await;
+    let (sync_health, subscription_health) =
+        check_sync_health(&state, &subscriptions.0, &failed_streams).await;
 
     let overall_status = determine_overall_status(&database_health, &indexing_health, &sync_health);
 
-    let health_status = build_health_status(
+    let mut health_status = build_health_status(
         overall_status,
         database_health,
         indexing_health,
         sync_health,
         failed_streams,
     );
+
+    health_status.indexing.subscriptions = subscription_health;
 
     let status_code = if matches!(health_status.status, HealthStatusType::Healthy) {
         StatusCode::OK
@@ -152,6 +190,7 @@ fn build_health_status(
             active_tasks: active_indexing_count(),
             is_running: is_running(),
             failed_streams,
+            subscriptions: vec![],
         },
     }
 }
@@ -187,32 +226,29 @@ fn check_indexing_health(failed_streams: &[FailedStream]) -> HealthStatusType {
     }
 }
 
-async fn check_sync_health(state: &HealthServerState) -> HealthStatusType {
+async fn check_sync_health(
+    state: &HealthServerState,
+    subscriptions: &[SubscriptionSource],
+    failures: &[FailedStream],
+) -> (HealthStatusType, Vec<SubscriptionHealth>) {
     if state.manifest.storage.postgres_enabled() {
-        check_postgres_sync_health(state).await
-    } else if state.manifest.storage.csv_enabled() {
-        check_csv_sync_health(state)
-    } else {
-        HealthStatusType::Disabled
-    }
-}
-
-async fn check_postgres_sync_health(state: &HealthServerState) -> HealthStatusType {
-    match &state.postgres_client {
-        Some(client) => {
-            match client.query_one_or_none(
-                r#"SELECT 1 FROM information_schema.tables WHERE table_schema NOT IN ('information_schema', 'pg_catalog', 'rindexer_internal') AND table_name NOT LIKE 'latest_block' AND table_name NOT LIKE '%_last_known_%' AND table_name NOT LIKE '%_last_run_%' LIMIT 1"#,
-                &[]
-            ).await {
-                Ok(Some(_)) => HealthStatusType::Healthy,
-                Ok(None) => HealthStatusType::NoData,
-                Err(e) => {
-                    error!("Sync health check failed: {}", e);
-                    HealthStatusType::Unhealthy
-                }
-            }
+        if subscriptions.is_empty() {
+            let configured = !state.manifest.all_contracts().is_empty()
+                || state.manifest.native_transfers.enabled;
+            return (
+                if configured {
+                    HealthStatusType::NotConfigured
+                } else {
+                    HealthStatusType::Disabled
+                },
+                vec![],
+            );
         }
-        None => HealthStatusType::NotConfigured,
+        subscriptions::snapshot(state.postgres_client.as_deref(), subscriptions, failures).await
+    } else if state.manifest.storage.csv_enabled() {
+        (check_csv_sync_health(state), vec![])
+    } else {
+        (HealthStatusType::Disabled, vec![])
     }
 }
 

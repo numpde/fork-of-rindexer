@@ -16,7 +16,10 @@ pub use system_state::{
 };
 
 mod health;
-pub use health::{start_health_server, HealthServer, HealthServerState, HealthStatus};
+pub use health::{
+    start_health_server, HealthServer, HealthServerState, HealthStatus, SubscriptionHealth,
+    SubscriptionIdentity, SubscriptionStatus,
+};
 
 mod database;
 pub use database::{

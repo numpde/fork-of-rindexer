@@ -1426,8 +1426,8 @@ async fn start_indexing(
 async fn await_indexing_tasks(
     handles: Vec<JoinHandle<Result<(), CombinedLogEventProcessingError>>>,
     cancel_token: &CancellationToken,
-    _registry: &EventCallbackRegistry,
-    _trace_registry: &TraceCallbackRegistry,
+    registry: &EventCallbackRegistry,
+    trace_registry: &TraceCallbackRegistry,
 ) -> Result<(), StartIndexingError> {
     let mut tasks = handles.into_iter().collect::<FuturesUnordered<_>>();
     let mut failure = None;
@@ -1438,6 +1438,43 @@ async fn await_indexing_tasks(
         if let Err(error) = result {
             if failure.is_none() {
                 error!(error = %error, "Indexing stream failed; stopping this indexing generation");
+                // A task can panic before its dispatcher reports a failure. Every
+                // subscription in this generation is now stopping; publish that
+                // state before waiting for peers to drain admitted callbacks.
+                let reason =
+                    format!("Indexing generation stopped after a stream task failed: {error}");
+                for event in &registry.events {
+                    for detail in &event.contract.details {
+                        registry.failure_state().record_stream(
+                            crate::event::callback_registry::FailedStream {
+                                id: event.id.clone(),
+                                indexer: event.indexer_name.clone(),
+                                contract: event.contract.name.clone(),
+                                event: event.event_name.clone(),
+                                network: detail.network.clone(),
+                                from_block: detail.start_block.unwrap_or_default().to(),
+                                to_block: detail.end_block.unwrap_or_default().to(),
+                            },
+                            reason.clone(),
+                        );
+                    }
+                }
+                for event in &trace_registry.events {
+                    for detail in &event.trace_information.details {
+                        trace_registry.failure_state().record_stream(
+                            crate::event::callback_registry::FailedStream {
+                                id: event.id.clone(),
+                                indexer: event.indexer_name.clone(),
+                                contract: event.contract_name.clone(),
+                                event: event.event_name.clone(),
+                                network: detail.network.clone(),
+                                from_block: detail.start_block.unwrap_or_default().to(),
+                                to_block: detail.end_block.unwrap_or_default().to(),
+                            },
+                            reason.clone(),
+                        );
+                    }
+                }
                 failure = Some(error);
                 cancel_token.cancel();
             }

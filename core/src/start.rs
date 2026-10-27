@@ -209,6 +209,8 @@ pub async fn start_rindexer(details: StartDetails<'_>) -> Result<(), StartRindex
             // Health server follows the indexer lifecycle - only runs when indexer is running
             let health_server_handle = if let Some(indexing) = details.indexing_details.as_ref() {
                 let manifest_clone = Arc::clone(&manifest);
+                let health_registry = indexing.registry.clone();
+                let health_trace_registry = indexing.trace_registry.clone();
                 let callback_failures = vec![
                     indexing.registry.failure_state(),
                     indexing.trace_registry.failure_state(),
@@ -234,6 +236,8 @@ pub async fn start_rindexer(details: StartDetails<'_>) -> Result<(), StartRindex
 
                     if let Err(e) = HealthServer::new(health_port, manifest_clone, postgres_client)
                         .with_callback_failures(callback_failures)
+                        .with_event_registry(&health_registry)
+                        .with_trace_registry(&health_trace_registry)
                         .start()
                         .await
                     {
