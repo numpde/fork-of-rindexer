@@ -1420,17 +1420,24 @@ async fn start_indexing(
         }));
     }
 
-    let results = try_join_all(handles).await?;
-
-    for result in results {
-        match result {
-            Ok(()) => {}
-            Err(e) => return Err(StartIndexingError::CombinedError(e)),
-        }
-    }
-
+    await_indexing_tasks(handles, &cancel_token).await?;
     Ok(processed_network_contracts)
 }
+
+async fn await_indexing_tasks(
+    handles: Vec<JoinHandle<Result<(), CombinedLogEventProcessingError>>>,
+    _cancel_token: &CancellationToken,
+) -> Result<(), StartIndexingError> {
+    let results = try_join_all(handles).await?;
+    for result in results {
+        result.map_err(StartIndexingError::CombinedError)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "supervision_tests.rs"]
+mod supervision_tests;
 
 pub async fn initialize_database(
     manifest: &Manifest,

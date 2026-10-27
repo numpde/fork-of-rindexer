@@ -1012,6 +1012,8 @@ async fn assert_stream_failure_drains_admitted_work(failure: StreamFailure) {
     release_second_fetch.notify_one();
     let early = timeout(Duration::from_millis(150), &mut processing).await;
     let returned_before_release = early.is_ok();
+    let failure_reported_before_release =
+        !fixture.config.registry().failure_state().snapshot().is_empty();
     assert_eq!(effects.load(Ordering::SeqCst), 0, "the first callback is still paused");
     // Release and settle work even on the red implementation, which detached its callback.
     release_callback.notify_one();
@@ -1041,4 +1043,42 @@ async fn assert_stream_failure_drains_admitted_work(failure: StreamFailure) {
         !returned_before_release,
         "stream returned an error while its admitted callback was still paused"
     );
+    assert!(
+        failure_reported_before_release,
+        "health must report a failed stream before its admitted callback finishes draining"
+    );
+}
+
+#[tokio::test]
+async fn terminal_fetch_and_unexpected_producer_exit_make_health_unhealthy() {
+    use axum::{
+        body::{to_bytes, Body},
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+    for fixture in [pruned_history_fixture(1).await.0, stream_completion_fixture(true, true).await]
+    {
+        let result =
+            super::process_event_logs(fixture.config.clone(), false, false, None, None).await;
+        assert!(result.is_err());
+        let manifest = serde_json::from_value(serde_json::json!({"name":"health-test", "project_type":"no-code", "networks":[], "contracts":[]})).unwrap();
+        let router = crate::health::HealthServer::new(0, Arc::new(manifest), None)
+            .with_callback_failures(vec![fixture.config.registry().failure_state()])
+            .router();
+        let response = router
+            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "terminal stream errors cannot leave health green: {body}"
+        );
+        assert_eq!(body["indexing"]["failed_streams"][0]["network"], "ethereum");
+        assert_eq!(body["indexing"]["failed_streams"][0]["id"], fixture.config.id());
+    }
 }
