@@ -316,9 +316,10 @@ impl TestEnv {
         ch.execute(
             "CREATE TABLE IF NOT EXISTS rindexer_internal.test_schema_ping (
                  network String,
+                 cursor_key String,
                  last_synced_block UInt64
              ) ENGINE = ReplacingMergeTree
-             ORDER BY (network)",
+             ORDER BY (network, cursor_key)",
         )
         .await
         .expect("failed to create test_schema_ping checkpoint table in CH");
@@ -2604,8 +2605,9 @@ async fn test_reorg_reversal_transfer_batch_iterate() {
     ch.execute(
         "CREATE TABLE rindexer_internal.test_schema_transfer_batch (
              network String,
+             cursor_key String,
              last_synced_block UInt64
-         ) ENGINE = ReplacingMergeTree ORDER BY network",
+         ) ENGINE = ReplacingMergeTree ORDER BY (network, cursor_key)",
     )
     .await
     .unwrap();
@@ -2676,7 +2678,7 @@ async fn test_reorg_reversal_transfer_batch_iterate() {
     .unwrap();
     ch.execute(&format!(
         "INSERT INTO rindexer_internal.test_schema_transfer_batch
-         (network, last_synced_block) VALUES ('{network}', {block2})"
+         (network, cursor_key, last_synced_block) VALUES ('{network}', '__event__', {block2})"
     ))
     .await
     .unwrap();
@@ -3047,7 +3049,10 @@ async fn test_reorg_reversal_expands_postgres_jsonb_tuple_arrays() {
         Ok(_) => panic!("invalid reversal SQL must fail"),
         Err(error) => error,
     };
-    assert!(error.to_string().contains("Accumulative reversal"));
+    assert!(
+        error.to_string().contains("Accumulative reversal"),
+        "unexpected rollback error: {error:#}"
+    );
     let raw_rows: i64 =
         pg.query_one("SELECT count(*) FROM test_schema.account_batch", &[]).await.unwrap().get(0);
     assert_eq!(raw_rows, 1, "failed reversal must roll back raw deletion");
@@ -3872,7 +3877,10 @@ async fn test_reorg_clickhouse_add_reversal() {
         Ok(_) => panic!("invalid ClickHouse reversal must fail after raw deletion"),
         Err(error) => error,
     };
-    assert!(error.to_string().contains("Accumulative reversal"));
+    assert!(
+        error.to_string().contains("Accumulative reversal"),
+        "unexpected rollback error: {error:#}"
+    );
     let retained_snapshots: u64 = ch
         .query_one(
             "SELECT count() FROM system.tables
@@ -3894,7 +3902,10 @@ async fn test_reorg_clickhouse_add_reversal() {
         Ok(_) => panic!("invalid later ClickHouse phase must fail"),
         Err(error) => error,
     };
-    assert!(error.to_string().contains("failed to delete derived table rows"));
+    assert!(
+        error.to_string().contains("failed to delete derived table rows"),
+        "unexpected rollback error: {error:#}"
+    );
     let ch_balance_after_late_failure: u64 = ch
         .query_one(&format!(
             "SELECT toUInt64(balance) FROM test_schema.user_balances FINAL

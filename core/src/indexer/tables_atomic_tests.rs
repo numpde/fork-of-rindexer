@@ -646,13 +646,14 @@ impl Harness {
                        "tx_hash" TEXT NOT NULL
                    );
                    CREATE TABLE rindexer_internal.{cursor_table} (
-                       "network" TEXT,
-                       "cursor_key" TEXT DEFAULT '__event__',
+                       "network" TEXT NOT NULL,
+                       "cursor_key" TEXT NOT NULL,
                        PRIMARY KEY (network,cursor_key),
                        "last_synced_block" NUMERIC NOT NULL
                    );
-                   INSERT INTO rindexer_internal.{cursor_table} VALUES ('{NETWORK}', 0);"#,
+                   INSERT INTO rindexer_internal.{cursor_table} (network, cursor_key, last_synced_block) VALUES ('{NETWORK}', '{cursor_key}', 0);"#,
                 journal = generate_derived_op_log_table_sql(),
+                cursor_key = crate::event::cursor::NETWORK_CURSOR_KEY,
             ))
             .await
             .expect("failed to bootstrap the test schema");
@@ -750,10 +751,10 @@ impl Harness {
             .client
             .query_one_or_none(
                 &format!(
-                    "SELECT last_synced_block::BIGINT FROM rindexer_internal.{} WHERE network = $1",
+                    "SELECT last_synced_block::BIGINT FROM rindexer_internal.{} WHERE network = $1 AND cursor_key = $2",
                     self.cursor_table
                 ),
-                &[&NETWORK],
+                &[&NETWORK, &crate::event::cursor::NETWORK_CURSOR_KEY],
             )
             .await
             .expect("failed to read the cursor row");
@@ -770,8 +771,8 @@ impl Harness {
     async fn reseed_cursor_row(&self) {
         self.client
             .batch_execute(&format!(
-                "INSERT INTO rindexer_internal.{} VALUES ('{NETWORK}', 0)",
-                self.cursor_table
+                "INSERT INTO rindexer_internal.{} (network, cursor_key, last_synced_block) VALUES ('{NETWORK}', '{}', 0)",
+                self.cursor_table, crate::event::cursor::NETWORK_CURSOR_KEY
             ))
             .await
             .expect("failed to reseed the cursor row");
