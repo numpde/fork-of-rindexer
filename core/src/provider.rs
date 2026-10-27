@@ -1066,6 +1066,7 @@ pub mod mock {
         logs: Vec<Log>,
         blocks: Vec<Arc<AnyRpcBlock>>,
         block_number: U64,
+        block_number_error: Option<String>,
         block_fetch_error: Option<String>,
         panic_on_log_fetch: bool,
         log_rpc_error: Option<(i64, String)>,
@@ -1086,6 +1087,7 @@ pub mod mock {
                 logs: vec![],
                 blocks: vec![],
                 block_number: U64::ZERO,
+                block_number_error: None,
                 block_fetch_error: None,
                 panic_on_log_fetch: false,
                 log_rpc_error: None,
@@ -1134,6 +1136,11 @@ pub mod mock {
 
         pub fn with_block_number(mut self, n: u64) -> Self {
             self.block_number = U64::from(n);
+            self
+        }
+
+        pub fn with_block_number_error(mut self, message: &str) -> Self {
+            self.block_number_error = Some(message.to_string());
             self
         }
 
@@ -1199,7 +1206,10 @@ pub mod mock {
         }
 
         async fn get_block_number(&self) -> Result<U64, ProviderError> {
-            Ok(self.block_number)
+            match &self.block_number_error {
+                Some(error) => Err(ProviderError::CustomError(error.clone())),
+                None => Ok(self.block_number),
+            }
         }
 
         async fn get_logs(

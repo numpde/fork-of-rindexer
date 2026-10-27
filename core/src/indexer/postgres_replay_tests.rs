@@ -1672,3 +1672,6 @@ mod table_timestamp_tests;
 
 #[path = "raw_column_collision_tests.rs"]
 mod raw_column_collision_tests;
+
+#[path = "health_subscription_tests.rs"]
+mod health_subscription_tests;

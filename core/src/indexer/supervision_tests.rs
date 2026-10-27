@@ -31,9 +31,14 @@ async fn failed_task_stops_its_generation(panic: bool) {
     });
     let supervisor_cancel = cancel.clone();
     let mut supervisor = tokio::spawn(async move {
-        await_indexing_tasks(vec![peer, failed], &supervisor_cancel)
-            .await
-            .map_err(|e| e.to_string())
+        await_indexing_tasks(
+            vec![peer, failed],
+            &supervisor_cancel,
+            &EventCallbackRegistry::new(),
+            &TraceCallbackRegistry::new(),
+        )
+        .await
+        .map_err(|e| e.to_string())
     });
     let early = timeout(Duration::from_millis(150), &mut supervisor).await;
     let observed_before_cleanup = early.is_ok();
@@ -54,6 +59,55 @@ async fn failed_task_stops_its_generation(panic: bool) {
 #[tokio::test]
 async fn successful_finite_streams_do_not_cancel_the_generation() {
     let cancel = CancellationToken::new();
-    await_indexing_tasks(vec![tokio::spawn(async { Ok(()) })], &cancel).await.unwrap();
+    await_indexing_tasks(
+        vec![tokio::spawn(async { Ok(()) })],
+        &cancel,
+        &EventCallbackRegistry::new(),
+        &TraceCallbackRegistry::new(),
+    )
+    .await
+    .unwrap();
     assert!(!cancel.is_cancelled());
+}
+
+#[tokio::test]
+async fn task_panic_reaches_health_before_live_peers_finish_cleanup() {
+    use crate::indexer::process::checkpoint_order_tests::Fixture;
+    use tokio::sync::Notify;
+    let fixture = Fixture::with_logs(Arc::new(|_| Box::pin(async { Ok(()) })), vec![]).await;
+    let registry = fixture.config.registry();
+    let failures = registry.failure_state();
+    let cancel = CancellationToken::new();
+    let peer_cancel = cancel.clone();
+    let release = Arc::new(Notify::new());
+    let peer_release = release.clone();
+    let peer = tokio::spawn(async move {
+        peer_cancel.cancelled().await;
+        peer_release.notified().await;
+        Ok(())
+    });
+    let failed = tokio::spawn(async { panic!("scripted task panic before dispatcher reporting") });
+    let supervisor_cancel = cancel.clone();
+    let supervisor = tokio::spawn(async move {
+        await_indexing_tasks(
+            vec![peer, failed],
+            &supervisor_cancel,
+            &registry,
+            &TraceCallbackRegistry::new(),
+        )
+        .await
+    });
+    timeout(Duration::from_secs(2), cancel.cancelled()).await.expect("generation cancelled");
+    let reported = failures.snapshot();
+    let still_draining = !supervisor.is_finished();
+    release.notify_one();
+    timeout(Duration::from_secs(2), supervisor)
+        .await
+        .unwrap()
+        .unwrap()
+        .expect_err("panic propagated");
+    assert!(still_draining, "live peer cleanup remains owned");
+    assert_eq!(reported.len(), 1, "health must fail during task-panic cleanup");
+    assert_eq!(reported[0].network, "ethereum");
+    assert_eq!(reported[0].contract, "Contract");
 }

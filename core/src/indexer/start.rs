@@ -1419,13 +1419,15 @@ async fn start_indexing(
         }));
     }
 
-    await_indexing_tasks(handles, &cancel_token).await?;
+    await_indexing_tasks(handles, &cancel_token, &registry, &trace_registry).await?;
     Ok(processed_network_contracts)
 }
 
 async fn await_indexing_tasks(
     handles: Vec<JoinHandle<Result<(), CombinedLogEventProcessingError>>>,
     cancel_token: &CancellationToken,
+    _registry: &EventCallbackRegistry,
+    _trace_registry: &TraceCallbackRegistry,
 ) -> Result<(), StartIndexingError> {
     let mut tasks = handles.into_iter().collect::<FuturesUnordered<_>>();
     let mut failure = None;
