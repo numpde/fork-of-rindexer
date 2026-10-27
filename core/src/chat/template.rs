@@ -12,6 +12,10 @@ mod template_amount_tests;
 #[path = "template_literal_tests.rs"]
 mod template_literal_tests;
 
+#[cfg(test)]
+#[path = "template_value_tests.rs"]
+mod template_value_tests;
+
 #[derive(Debug, Clone)]
 pub struct Template {
     value: String,
