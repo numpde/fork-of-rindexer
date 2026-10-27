@@ -563,3 +563,8 @@ runtime/launcher/checks: ## Check actual launcher engine selection with offline 
 tests/resume-without-start-block/docker: ## Check saved subscription cursors when start_block is omitted
 	@$(call offline_runner,$$dependency_image)
 	$(compose) run --rm --no-deps -T offline resume-without-start-block
+
+.PHONY: tests/advanced-table-manifest/docker
+tests/advanced-table-manifest/docker: ## Validate advanced table manifests using owned temporary fixtures
+	@$(call offline_runner,$$dependency_image)
+	$(compose) run --rm --no-deps -T offline advanced-table-manifest

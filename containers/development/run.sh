@@ -39,6 +39,9 @@ case "$1" in
     exec cargo nextest run --frozen -p rindexer --lib --no-fail-fast --no-capture \
       -E 'test(/^indexer::start::tests::resume_without_start_block_/)'
     ;;
+  advanced-table-manifest)
+    exec cargo nextest run --frozen -p rindexer --test yaml_advanced_tables --no-fail-fast --no-capture
+    ;;
   runtime-image)
     cargo build --frozen --release -p rindexer_cli --no-default-features
     exec python3 -B containers/runtime/package.py >&3
