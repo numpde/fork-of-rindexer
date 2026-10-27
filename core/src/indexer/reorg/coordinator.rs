@@ -23,6 +23,14 @@ use super::{event_writer_barrier, ReorgContext};
 /// Balances write frequency against data-loss risk on crash.
 const FLUSH_INTERVAL: u64 = 50;
 
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("Cannot recover reorg on network {network}: retained recovery history {oldest}..={latest} contains no canonical common ancestor; stop writers and rebuild from independently verified canonical history")]
+pub(crate) struct RecoveryHistoryExceeded {
+    pub(super) network: String,
+    pub(super) oldest: u64,
+    pub(super) latest: u64,
+}
+
 /// The request outlives its caller, including cancellation during SQL/RPC awaits.
 /// Keep the acquired barrier here too: a failed attempt must not admit writers.
 #[derive(Default)]
@@ -30,6 +38,7 @@ struct PendingRecovery {
     tasks: VecDeque<ReorgTask>,
     notifications: VecDeque<(ReorgTask, ReorgTaskResult)>,
     writer_guard: Option<OwnedRwLockWriteGuard<()>>,
+    fatal_history: Option<RecoveryHistoryExceeded>,
 }
 
 pub struct ReorgCoordinator {
@@ -119,6 +128,9 @@ impl ReorgCoordinator {
         block_hash: B256,
         parent_hash: B256,
     ) -> anyhow::Result<Option<ReorgTask>> {
+        if let Some(error) = &self.pending_recovery.fatal_history {
+            return Err(error.clone().into());
+        }
         anyhow::ensure!(self.pending_recovery.tasks.is_empty() && self.pending_recovery.notifications.is_empty(),
             "Cannot accept block {block_number} on network {} before retrying pending reorg recovery", self.network);
         // A one-block fork can preserve its parent and tip height. Compare the
@@ -244,10 +256,19 @@ impl ReorgCoordinator {
         self.prepare_reorg_task(block_number).await.map(Some)
     }
 
-    async fn prepare_reorg_task(&self, block_number: u64) -> anyhow::Result<ReorgTask> {
+    async fn prepare_reorg_task(&mut self, block_number: u64) -> anyhow::Result<ReorgTask> {
         metrics::record_reorg_detection_source(&self.network, "rpc");
 
-        let (fork_point, canonical_blocks) = self.find_fork_point().await?;
+        let (fork_point, canonical_blocks) = match self.find_fork_point().await {
+            Ok(found) => found,
+            Err(error) => {
+                if let Some(exhausted) = error.downcast_ref::<RecoveryHistoryExceeded>() {
+                    self.pending_recovery.fatal_history = Some(exhausted.clone());
+                    super::retire_callbacks(&self.network);
+                }
+                return Err(error);
+            }
+        };
         // Another pipeline may expose the changed hash below our retained tip.
         // Its descendants are invalidated too, including finalized buffers.
         let detection_point = self.window.latest_block().unwrap_or(block_number).max(block_number);
@@ -321,30 +342,7 @@ impl ReorgCoordinator {
                     canonical_blocks: vec![],
                 }))
             }
-            None => {
-                // Entire window reorged
-                let oldest = self.window.oldest_block().unwrap_or(0);
-                let latest = self.window.latest_block().unwrap_or(0);
-                let depth = latest.saturating_sub(oldest) + 1;
-                warn!(
-                    network = %self.network,
-                    oldest,
-                    latest,
-                    depth,
-                    "Startup validation: entire window reorged"
-                );
-                metrics::record_reorg_detection_source(&self.network, "startup");
-                metrics::record_reorg(&self.network, depth);
-
-                Ok(Some(ReorgTask {
-                    network: self.network.clone(),
-                    fork_point: oldest,
-                    detection_point: latest,
-                    event_tables: self.event_tables.clone(),
-                    derived_tables: self.derived_tables.clone(),
-                    canonical_blocks: vec![],
-                }))
-            }
+            None => Err(self.history_exhausted_error().into()),
         }
     }
 
@@ -426,10 +424,27 @@ impl ReorgCoordinator {
 
         let fork_point = match self.window.find_fork_point(&canonical) {
             Some(last_match) => last_match + 1,
-            None => block_numbers[0],
+            None => return Err(self.history_exhausted_error().into()),
         };
 
         Ok((fork_point, canonical_blocks))
+    }
+
+    fn history_exhausted_error(&self) -> RecoveryHistoryExceeded {
+        RecoveryHistoryExceeded {
+            network: self.network.clone(),
+            oldest: self.window.oldest_block().expect("validated nonempty recovery window"),
+            latest: self.window.latest_block().expect("validated nonempty recovery window"),
+        }
+    }
+
+    /// Keep the network fenced until this failed generation is completely stopped.
+    pub(super) async fn quarantine_history(&mut self) {
+        if self.pending_recovery.writer_guard.is_none() {
+            super::retire_callbacks(&self.network);
+            self.pending_recovery.writer_guard =
+                Some(event_writer_barrier(&self.network).write_owned().await);
+        }
     }
 
     /// Execute a reorg task through the coordinator, keeping internals encapsulated.
@@ -449,6 +464,9 @@ impl ReorgCoordinator {
         &mut self,
         ctx: &ReorgContext<'_>,
     ) -> anyhow::Result<Option<u64>> {
+        if let Some(error) = self.pending_recovery.fatal_history.clone() {
+            return Err(error.into());
+        }
         let mut earliest_fork: Option<u64> = None;
         while !self.pending_recovery.tasks.is_empty() {
             if self.pending_recovery.writer_guard.is_none() {
@@ -816,7 +834,7 @@ mod tests {
         )
         .await;
         let error = result.expect_err("unknown ancestry must never authorize a partial rollback");
-        assert!(error.to_string().contains("recovery history"), "{error:#}");
+        assert!(format!("{error:#}").contains("recovery history"), "{error:#}");
         assert!(coordinator.pending_recovery.tasks.is_empty(), "no unproven rollback is queued");
         assert_eq!(coordinator.window.block_numbers(), vec![100, 101, 102]);
         assert_eq!(recovery.take_rewind(), None, "no speculative replacement prefix is published");

@@ -21,7 +21,11 @@ async fn phase(fixture: &Fixture, replacement: bool, historical: bool) {
     let mut log = fixture.events(&[if replacement { 20 } else { 10 }]).remove(0).log;
     log.block_number = Some(100);
     log.block_hash = Some(if replacement { REPLACEMENT } else { ORIGINAL });
-    let mut blocks = vec![header(if replacement { REPLACEMENT } else { ORIGINAL }, 10)];
+    // Retain the unchanged parent so recovery can prove the first divergent block.
+    let mut ancestor = header(B256::repeat_byte(99), 9);
+    ancestor.header.inner.number = 99;
+    ancestor.header.inner.parent_hash = B256::repeat_byte(98);
+    let mut blocks = vec![ancestor, header(if replacement { REPLACEMENT } else { ORIGINAL }, 10)];
     if replacement {
         let mut next = header(B256::repeat_byte(101), 11);
         next.header.inner.number = 101;
@@ -47,7 +51,7 @@ async fn phase(fixture: &Fixture, replacement: bool, historical: bool) {
         cached_provider: provider.clone(),
         block_clock: BlockClock::new(None, None, provider),
         decoder: noop_decoder(),
-        start_block: Some(U64::from(100)),
+        start_block: Some(U64::from(99)),
         end_block: Some(U64::from(if replacement { 101 } else { 100 })),
         disable_logs_bloom_checks: true,
     });

@@ -473,7 +473,7 @@ impl TraceProcessingConfig {
     pub(crate) fn terminal_failure(&self) -> Option<CallbackError> {
         let failures = self.registry.failure_state();
         self.registry.events.iter().find_map(|event| {
-            failures.reason(&event.id, &self.network).map(CallbackError::Permanent)
+            failures.terminal_reason(&event.id, &self.network).map(CallbackError::Permanent)
         })
     }
 

@@ -80,7 +80,7 @@ pub fn fetch_logs_stream(
 
     debug!("{} Configured with {} event buffer", config.info_log_name(), channel_size);
 
-    let (tx, rx) = mpsc::channel(channel_size);
+    let (tx, rx) = mpsc::channel::<Result<FetchLogsResult, Box<dyn Error + Send>>>(channel_size);
 
     tokio::spawn(async move {
         let mut current_filter = config.to_event_filter().unwrap();
@@ -96,6 +96,7 @@ pub fn fetch_logs_stream(
             let config = config.clone();
             let traces = trace_registry.clone();
             let stop = monitor_stop.clone();
+            let terminal_sender = tx.clone();
             tokio::spawn(async move {
                 loop {
                     tokio::select! {
@@ -130,6 +131,10 @@ pub fn fetch_logs_stream(
                     )
                     .await
                     {
+                        if error.downcast_ref::<crate::indexer::reorg::coordinator::RecoveryHistoryExceeded>().is_some() {
+                            let _ = terminal_sender.send(Err(Box::new(ProviderError::CustomError(format!("{error:#}"))))).await;
+                            break;
+                        }
                         error!(
                             "{} - Historical reorg recovery failed: {}",
                             config.info_log_name(),
@@ -1568,6 +1573,10 @@ async fn live_indexing_stream(
                             }
                             Ok(None) => {}
                             Err(e) => {
+                                if e.downcast_ref::<crate::indexer::reorg::coordinator::RecoveryHistoryExceeded>().is_some() {
+                                    let _ = tx.send(Err(Box::new(ProviderError::CustomError(format!("{e:#}"))))).await;
+                                    return;
+                                }
                                 error!(
                                     "{} - Reorg handling failed, pausing before retry: {:?}",
                                     info_log_name, e

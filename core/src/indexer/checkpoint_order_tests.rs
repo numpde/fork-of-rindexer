@@ -1082,3 +1082,105 @@ async fn terminal_fetch_and_unexpected_producer_exit_make_health_unhealthy() {
         assert_eq!(body["indexing"]["failed_streams"][0]["id"], fixture.config.id());
     }
 }
+
+#[tokio::test]
+async fn terminal_network_failure_interrupts_waiting_writer_admission() {
+    let fixture = Fixture::new(Arc::new(|_| Box::pin(async { Ok(()) }))).await;
+    let failures = fixture.config.registry().failure_state();
+    let barrier = crate::indexer::reorg::event_writer_barrier("ethereum");
+    let quarantine = barrier.clone().write_owned().await;
+    let mut checkpoints = CallbackCheckpoints::default();
+    let admission = super::handle_logs_result(
+        fixture.config.clone(),
+        Arc::new(Semaphore::new(1)),
+        &mut checkpoints,
+        Ok(FetchLogsResult {
+            reorg_generation: crate::indexer::reorg::reorg_generation("ethereum"),
+            logs: vec![],
+            from_block: U64::from(2),
+            to_block: U64::from(2),
+            reorg: None,
+        }),
+    );
+    tokio::pin!(admission);
+    assert!(
+        futures::poll!(&mut admission).is_pending(),
+        "admission is waiting at the writer barrier"
+    );
+    failures.record_stream(
+        crate::event::callback_registry::FailedStream {
+            id: fixture.config.id().into(),
+            indexer: fixture.config.indexer_name(),
+            contract: fixture.config.contract_name(),
+            event: fixture.config.event_name(),
+            network: "ethereum".into(),
+            from_block: 1,
+            to_block: 10,
+        },
+        "Cannot recover reorg: recovery history has no common ancestor".into(),
+    );
+    let result = timeout(Duration::from_secs(2), admission)
+        .await
+        .expect("terminal state must wake an admission blocked by quarantine");
+    assert!(result.is_err());
+    assert!(
+        barrier.try_read().is_err(),
+        "the quarantine was not released to make admission finish"
+    );
+    assert_eq!(fixture.cursor(), "1", "even an empty range cannot checkpoint while quarantined");
+    assert!(
+        failures.reason(fixture.config.id(), "ethereum").is_none(),
+        "operational failure reporting does not abort an already admitted callback"
+    );
+    drop(quarantine);
+}
+
+#[tokio::test]
+async fn terminal_network_failure_interrupts_waiting_callback_permit() {
+    let fixture = Fixture::new(Arc::new(|_| Box::pin(async { Ok(()) }))).await;
+    let failures = fixture.config.registry().failure_state();
+    let barrier = crate::indexer::reorg::event_writer_barrier("ethereum");
+    let permits = Arc::new(Semaphore::new(1));
+    let busy = permits.clone().acquire_owned().await.unwrap();
+    let mut checkpoints = CallbackCheckpoints::default();
+    let admission = super::handle_logs_result(
+        fixture.config.clone(),
+        permits,
+        &mut checkpoints,
+        Ok(FetchLogsResult {
+            reorg_generation: crate::indexer::reorg::reorg_generation("ethereum"),
+            logs: vec![],
+            from_block: U64::from(2),
+            to_block: U64::from(2),
+            reorg: None,
+        }),
+    );
+    tokio::pin!(admission);
+    assert!(futures::poll!(&mut admission).is_pending());
+    assert!(
+        barrier.try_write().is_err(),
+        "the waiting admission currently owns a writer read guard"
+    );
+    failures.record_stream(
+        crate::event::callback_registry::FailedStream {
+            id: fixture.config.id().into(),
+            indexer: fixture.config.indexer_name(),
+            contract: fixture.config.contract_name(),
+            event: fixture.config.event_name(),
+            network: "ethereum".into(),
+            from_block: 1,
+            to_block: 10,
+        },
+        "Cannot recover reorg: recovery history has no common ancestor".into(),
+    );
+    let result = timeout(Duration::from_secs(2), admission)
+        .await
+        .expect("terminal state must wake an admission blocked by callback capacity");
+    assert!(result.is_err());
+    assert!(
+        barrier.try_write().is_ok(),
+        "quarantine can acquire the barrier without waiting for callback capacity"
+    );
+    assert_eq!(fixture.cursor(), "1");
+    drop(busy);
+}

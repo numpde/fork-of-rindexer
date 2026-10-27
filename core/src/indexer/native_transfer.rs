@@ -713,7 +713,15 @@ async fn native_transfer_block_consumer_at_generation(
     }
 
     let writer_barrier = event_writer_barrier(network_name);
-    let _writer_guard = writer_barrier.read().await;
+    let _writer_guard = tokio::select! {
+        guard = writer_barrier.read() => guard,
+        _ = config.cancel_token.cancelled() => return Err(ProviderError::CustomError(format!(
+            "Cannot admit native-transfer writes on network {network_name:?}: indexing generation stopped"
+        )).into()),
+    };
+    if let Some(failure) = config.terminal_failure() {
+        return Err(failure.into());
+    }
     if generation != crate::indexer::reorg::reorg_generation(network_name) {
         return Err(ProviderError::CustomError(format!(
             "Cannot apply native-transfer batch on network {network_name:?}: a reorg completed while fetching; retry the block range"
@@ -839,7 +847,15 @@ pub async fn native_transfer_block_consumer_debug(
     }
 
     let writer_barrier = event_writer_barrier(network_name);
-    let _writer_guard = writer_barrier.read().await;
+    let _writer_guard = tokio::select! {
+        guard = writer_barrier.read() => guard,
+        _ = config.cancel_token.cancelled() => return Err(ProviderError::CustomError(format!(
+            "Cannot admit native-transfer writes on network {network_name:?}: indexing generation stopped"
+        )).into()),
+    };
+    if let Some(failure) = config.terminal_failure() {
+        return Err(failure.into());
+    }
     if generation != crate::indexer::reorg::reorg_generation(network_name) {
         return Err(ProviderError::CustomError(format!(
             "Cannot apply native-transfer batch on network {network_name:?}: a reorg completed while fetching; retry the block range"
@@ -1754,25 +1770,30 @@ mod tests {
 
     #[tokio::test]
     async fn native_transfer_rewinds_to_fork_point_on_reorg() {
-        // Window has block 11 with hash=11, parent=10 (pre-reorg state).
+        // Retain the unchanged block 9 as proof of the common ancestor.
         // Canonical blocks 10 and 11 now have hashes 0xFD and 0xFE (reorged).
         // Fetch range 12..=12 with canonical block 12 whose parent_hash=0xFE
         // does NOT match the window's stored hash of block 11 → reorg.
         //
         // The coordinator then fetches missing blocks from the provider to locate
         // the fork point; we expose the complete canonical window so find_fork_point can succeed.
+        let canonical_9 = make_block_with_parent(9, b256(9), b256(8));
         let canonical_10 = make_block_with_parent(10, b256(0xFD), b256(9));
         let canonical_11 = make_block_with_parent(11, b256(0xFE), b256(0xFD));
         let canonical_12 = make_block_with_parent(12, b256(12), b256(0xFE));
         let provider: Arc<dyn ChainProvider> =
             Arc::new(MockChainProvider::new(1).with_blocks(vec![
+                canonical_9,
                 canonical_10,
                 canonical_11,
                 canonical_12,
             ]));
 
-        let coordinator =
-            make_test_coordinator("ethereum", &[(10, 10, 9), (11, 11, 10)], provider.clone());
+        let coordinator = make_test_coordinator(
+            "ethereum",
+            &[(9, 9, 8), (10, 10, 9), (11, 11, 10)],
+            provider.clone(),
+        );
 
         let outcome = native_transfer_detect_reorg_in_range(
             provider.as_ref(),
@@ -1786,10 +1807,8 @@ mod tests {
         )
         .await;
 
-        // Coordinator's find_fork_point compares the window's entries against
-        // canonical hashes. With window blocks [10, 11] and canonical [10@0xFD, 11@0xFE],
-        // no canonical hash matches any window entry → fork_point falls back to the
-        // oldest window block (10).
+        // Block 9 still matches the canonical chain, so the first divergent
+        // block is provably 10. An entirely mismatched window must fail closed.
         //
         // Helper contract: `rewind_to` IS the first canonical block to re-fetch
         // (inclusive) — equal to `fork_point`.

@@ -254,6 +254,60 @@ pub struct ReorgContext<'a> {
     pub trace_registry: Option<&'a TraceCallbackRegistry>,
 }
 
+async fn quarantine_exhausted_history(
+    coordinator: &mut ReorgCoordinator,
+    error: &anyhow::Error,
+    ctx: &ReorgContext<'_>,
+) {
+    let Some(history) = error.downcast_ref::<coordinator::RecoveryHistoryExceeded>() else {
+        return;
+    };
+    // Wake blocked admissions before taking the write barrier. Callback retry
+    // retirement still lets an active attempt resolve its transaction first.
+    if let Some(registry) = ctx.registry {
+        for event in &registry.events {
+            if event.contract.details.iter().any(|detail| detail.network == history.network) {
+                registry.failure_state().record_stream(
+                    crate::event::callback_registry::FailedStream {
+                        id: event.id.clone(),
+                        indexer: event.indexer_name.clone(),
+                        contract: event.contract.name.clone(),
+                        event: event.event_name.clone(),
+                        network: history.network.clone(),
+                        from_block: history.oldest,
+                        to_block: history.latest,
+                    },
+                    history.to_string(),
+                );
+            }
+        }
+    }
+    if let Some(registry) = ctx.trace_registry {
+        for event in &registry.events {
+            if event
+                .trace_information
+                .details
+                .iter()
+                .any(|detail| detail.network == history.network)
+            {
+                registry.failure_state().record_stream(
+                    crate::event::callback_registry::FailedStream {
+                        id: event.id.clone(),
+                        indexer: event.indexer_name.clone(),
+                        contract: event.contract_name.clone(),
+                        event: event.event_name.clone(),
+                        network: history.network.clone(),
+                        from_block: history.oldest,
+                        to_block: history.latest,
+                    },
+                    history.to_string(),
+                );
+            }
+        }
+    }
+    coordinator.quarantine_history().await;
+}
+
 /// Returns `Some(fork_point)` if a reorg was detected and handled (caller should rewind and `continue`),
 /// or `None` if no reorg was detected. Returns `Err` if detection or rollback failed.
 pub async fn detect_and_handle_reorg(
@@ -264,15 +318,22 @@ pub async fn detect_and_handle_reorg(
     log_prefix: &str,
     ctx: &ReorgContext<'_>,
 ) -> anyhow::Result<Option<u64>> {
-    if let Some(fork_point) = coordinator.retry_pending_reorg(ctx).await.with_context(|| {
+    let pending = coordinator.retry_pending_reorg(ctx).await;
+    if let Err(error) = &pending {
+        quarantine_exhausted_history(coordinator, error, ctx).await;
+    }
+    if let Some(fork_point) = pending.with_context(|| {
         format!("{log_prefix} - Pending reorg recovery failed before block {block_number}")
     })? {
         return Ok(Some(fork_point));
     }
-    let Some(reorg_task) =
-        coordinator.on_new_block(block_number, block_hash, parent_hash).await.with_context(
-            || format!("{} - Reorg detection failed on block {}", log_prefix, block_number),
-        )?
+    let detected = coordinator.on_new_block(block_number, block_hash, parent_hash).await;
+    if let Err(error) = &detected {
+        quarantine_exhausted_history(coordinator, error, ctx).await;
+    }
+    let Some(reorg_task) = detected.with_context(|| {
+        format!("{log_prefix} - Reorg detection failed on block {block_number}")
+    })?
     else {
         return Ok(None);
     };

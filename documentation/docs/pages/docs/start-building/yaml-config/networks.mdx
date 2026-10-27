@@ -22,6 +22,20 @@ repeated or disconnected headers cause the poller to retry. Header response orde
 may differ from request order. This validation does not repair gaps created by
 earlier versions automatically.
 
+If every retained block hash differs from the canonical chain, recovery stops with
+`retained recovery history ... contains no canonical common ancestor`. The oldest
+retained height is not treated as the fork point. Startup refuses to run; a live
+instance reports failed health, retires old callback retries and keeps that
+network's writer barrier quarantined until the failed generation is stopped.
+No speculative rollback or rewind is published. A later matching head does not
+clear this terminal failure.
+
+Stop all writers and establish an independently verified canonical recovery point,
+then restore a consistent backup or rebuild the affected raw events, derived state,
+receipts and cursors together. Do not delete only the header window or advance the
+cursor to bypass the error. A larger `reorg_handling.window_size` reduces exposure;
+it cannot prove the boundary of a fork that already exceeds retained history.
+
 ### name
 
 The name of the network it should be unique to the YAML so you can not have 2 networks with the same name in the same

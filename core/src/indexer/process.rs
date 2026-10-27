@@ -148,7 +148,7 @@ async fn process_event_logs(
             if let Some(reason) = config
                 .registry()
                 .failure_state()
-                .reason(config.id(), &config.network_contract().network)
+                .terminal_reason(config.id(), &config.network_contract().network)
             {
                 return Err(Box::new(ProviderError::CustomError(reason)));
             }
@@ -185,7 +185,7 @@ async fn process_event_logs(
         'outer: loop {
             let result = tokio::select! {
                 result = logs_stream.next() => result,
-                reason = failures.wait_failed(config.id(), &network) => {
+                reason = failures.wait_terminal(config.id(), &network) => {
                     return Err(Box::new(ProviderError::CustomError(format!(
                         "{} - Stream permanently blocked: {}", config.info_log_name(), reason
                     ))));
@@ -336,8 +336,8 @@ async fn process_event_logs(
             config.info_log_name(), config.id()
         ))));
     }
-    if processing_result.is_err() {
-        failures.record_stream(failed_stream.clone());
+    if let Err(error) = &processing_result {
+        failures.record_stream(failed_stream.clone(), error.to_string());
     }
 
     // A join failure must not detach the other admitted callbacks either. Preserve an
@@ -345,7 +345,7 @@ async fn process_event_logs(
     while let Some(joined) = in_flight.next().await {
         if let Err(error) = joined {
             if processing_result.is_ok() {
-                failures.record_stream(failed_stream.clone());
+                failures.record_stream(failed_stream.clone(), error.to_string());
                 processing_result = Err(Box::new(ProviderError::BatchRequestFailed(error)));
             }
         }
@@ -1060,7 +1060,7 @@ async fn handle_logs_result(
             if let Some(reason) = config
                 .registry()
                 .failure_state()
-                .reason(config.id(), &config.network_contract().network)
+                .terminal_reason(config.id(), &config.network_contract().network)
             {
                 return Err(Box::new(ProviderError::CustomError(reason)));
             }
@@ -1070,9 +1070,19 @@ async fn handle_logs_result(
                 return Ok(tokio::spawn(async {}));
             }
 
-            let writer_guard =
-                event_writer_barrier(&config.network_contract().network).read_owned().await;
+            let failures = config.registry().failure_state();
+            let network_contract = config.network_contract();
+            let barrier = event_writer_barrier(&network_contract.network);
+            let writer_guard = tokio::select! {
+                guard = barrier.read_owned() => guard,
+                reason = failures.wait_terminal(config.id(), &network_contract.network) => {
+                    return Err(Box::new(ProviderError::CustomError(reason)));
+                }
+            };
 
+            if let Some(reason) = failures.terminal_reason(config.id(), &network_contract.network) {
+                return Err(Box::new(ProviderError::CustomError(reason)));
+            }
             if result.reorg_generation
                 != crate::indexer::reorg::reorg_generation(&config.network_contract().network)
             {
@@ -1101,7 +1111,16 @@ async fn handle_logs_result(
                 })?;
 
             let checkpoint = checkpoints.next();
-            if let Ok(permit) = callback_permits.clone().acquire_owned().await {
+            let permit = tokio::select! {
+                permit = callback_permits.clone().acquire_owned() => permit,
+                reason = failures.wait_terminal(config.id(), &network_contract.network) => {
+                    return Err(Box::new(ProviderError::CustomError(reason)));
+                }
+            };
+            if let Some(reason) = failures.terminal_reason(config.id(), &network_contract.network) {
+                return Err(Box::new(ProviderError::CustomError(reason)));
+            }
+            if let Ok(permit) = permit {
                 let task = tokio::spawn(async move {
                     let _writer_guard = writer_guard;
                     trigger_event(config, fn_data, result.to_block, checkpoint).await;
