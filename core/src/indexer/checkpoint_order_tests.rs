@@ -309,7 +309,7 @@ pub(crate) async fn replay_lagging_buffer_after_rollback(
             .with_max_block_range(9)
             .with_logs(logs)
             .with_blocks(
-                (98..=100)
+                (81..=100)
                     .map(|number| {
                         AnyRpcBlock::new(
                             Block::new(

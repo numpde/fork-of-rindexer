@@ -215,3 +215,29 @@ async fn direct_live_height_fetch_accepts_observed_tip_identity() {
     let result = live_result(log(10, Some(hash(10)))).await.unwrap().unwrap();
     assert_eq!(result.logs[0].block_hash, Some(hash(10)));
 }
+
+#[tokio::test]
+async fn tip_fallback_old_logs_require_a_continuous_proof_across_header_batches() {
+    let number_hash = |number| B256::from(alloy::primitives::U256::from(number));
+    for corrupt_ancestor in [false, true] {
+        let mut headers = (1..=300)
+            .map(|number| header(number, number_hash(number), number_hash(number - 1)))
+            .collect::<Vec<_>>();
+        if corrupt_ancestor {
+            headers[43].header.hash = number_hash(999);
+        }
+        let provider = MockChainProvider::new(1)
+            .with_blocks(headers)
+            .with_logs(vec![log(1, Some(number_hash(1)))]);
+        let filter = RindexerEventFilter::empty_for_test()
+            .set_from_block(U64::from(1))
+            .set_to_block(U64::from(300));
+        let result =
+            fetch_logs_against_observed_head(&provider, &filter, 300, number_hash(300)).await;
+        assert_eq!(
+            result.is_err(),
+            corrupt_ancestor,
+            "older logs need one connected ancestry proof, including across RPC batches"
+        );
+    }
+}

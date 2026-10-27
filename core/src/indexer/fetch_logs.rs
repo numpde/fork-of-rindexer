@@ -1299,6 +1299,99 @@ enum TipWindowFetch {
     Wait,
 }
 
+/// Keep the observed head as the authority even when an RPC call falls back to heights.
+async fn fetch_logs_against_observed_head(
+    provider: &dyn ChainProvider,
+    filter: &RindexerEventFilter,
+    head_number: u64,
+    head_hash: B256,
+) -> Result<Vec<Log>, ProviderError> {
+    let logs = provider.get_logs(filter).await?;
+    // Removed logs are recovery notifications. The caller handles the whole batch
+    // as a reorg before admitting any of its event rows.
+    if logs.iter().any(|log| log.removed) {
+        return Ok(logs);
+    }
+    let from = filter.from_block().to::<u64>();
+    let to = filter.to_block().to::<u64>();
+    if from > to || to > head_number {
+        return Err(ProviderError::CustomError(format!(
+            "Cannot validate live logs for range {from}..={to} against observed head {head_number}: range is outside that head"
+        )));
+    }
+    let mut identities = BTreeMap::new();
+    for log in &logs {
+        let (Some(number), Some(hash)) = (log.block_number, log.block_hash) else {
+            return Err(ProviderError::CustomError(format!(
+                "Cannot validate live logs for range {from}..={to}: returned log is missing its block number or hash"
+            )));
+        };
+        if number < from || number > to {
+            return Err(ProviderError::CustomError(format!(
+                "Cannot validate live logs for range {from}..={to}: returned log belongs to block {number}"
+            )));
+        }
+        if identities.insert(number, hash).is_some_and(|previous| previous != hash) {
+            return Err(ProviderError::CustomError(format!(
+                "Cannot validate live logs at block {number}: response mixes different block hashes"
+            )));
+        }
+    }
+    let Some((&first_log_block, _)) = identities.first_key_value() else {
+        // An empty filtered answer has no returned block identity to validate.
+        // This check cannot establish whether the RPC omitted matching logs.
+        return Ok(logs);
+    };
+    if first_log_block == head_number {
+        if identities[&head_number] != head_hash {
+            return Err(ProviderError::CustomError(format!(
+                "Cannot validate live logs at observed head {head_number}: expected block hash {head_hash}, received {}",
+                identities[&head_number]
+            )));
+        }
+        return Ok(logs);
+    }
+
+    // Prove older returned logs belong to the observed head's connected ancestry.
+    // Walk backwards in bounded batches, including their shared parent anchors.
+    const HEADER_PROOF_BLOCKS: u64 = 256;
+    let mut end = head_number;
+    let mut expected_hash = head_hash;
+    loop {
+        let start = end.saturating_sub(HEADER_PROOF_BLOCKS - 1).max(first_log_block);
+        let numbers = (start..=end).map(U64::from).collect::<Vec<_>>();
+        let headers = crate::indexer::reorg::fetch_canonical_headers(provider, &numbers)
+            .await
+            .map_err(|error| {
+                ProviderError::CustomError(format!(
+                    "Cannot validate live logs against observed head {head_number}: {error:#}"
+                ))
+            })?;
+        let last = headers.last().expect("nonempty validated header batch");
+        if last.header.hash != expected_hash {
+            return Err(ProviderError::CustomError(format!(
+                "Cannot validate live log ancestry at block {end}: expected hash {expected_hash}, received {}",
+                last.header.hash
+            )));
+        }
+        for (&number, &claimed) in identities.range(start..=end) {
+            let header = &headers[(number - start) as usize].header;
+            if claimed != header.hash {
+                return Err(ProviderError::CustomError(format!(
+                    "Cannot validate live logs at block {number}: header hash is {}, returned log hash is {claimed}", header.hash
+                )));
+            }
+        }
+        if start == first_log_block {
+            break;
+        }
+        expected_hash =
+            headers.first().expect("nonempty validated header batch").header.parent_hash;
+        end = start - 1;
+    }
+    Ok(logs)
+}
+
 /// Serves the live window of `current_filter`, which ends at the tip the stream polled
 /// (`tip_hash`), from the shared cache. `contract_address` is the snapshot this window would
 /// have sent to `eth_getLogs`; the stream's own call is the fallback, counted by reason.
@@ -1325,7 +1418,13 @@ async fn fetch_tip_window(
                 let prefix = if from_block < to_block {
                     let prefix_filter =
                         current_filter.clone().set_to_block(to_block - U64::from(1));
-                    cached_provider.get_logs(&prefix_filter).await
+                    fetch_logs_against_observed_head(
+                        cached_provider,
+                        &prefix_filter,
+                        to_block.to::<u64>(),
+                        tip_hash,
+                    )
+                    .await
                 } else {
                     Ok(Vec::new())
                 };
@@ -1348,11 +1447,23 @@ async fn fetch_tip_window(
                     waited.as_millis(),
                     oldest_pending
                 );
-                cached_provider.get_logs(current_filter).await
+                fetch_logs_against_observed_head(
+                    cached_provider,
+                    current_filter,
+                    to_block.to::<u64>(),
+                    tip_hash,
+                )
+                .await
             }
             TipLookup::Fallback(reason) => {
                 metrics::record_shared_tip_logs_fallback(tip_logs.network(), reason.as_label());
-                cached_provider.get_logs(current_filter).await
+                fetch_logs_against_observed_head(
+                    cached_provider,
+                    current_filter,
+                    to_block.to::<u64>(),
+                    tip_hash,
+                )
+                .await
             }
         };
     TipWindowFetch::Fetched(fetched)
@@ -1766,7 +1877,15 @@ async fn live_indexing_stream(
                                             }
                                         }
                                     }
-                                    None => cached_provider.get_logs(&current_filter).await,
+                                    None => {
+                                        fetch_logs_against_observed_head(
+                                            cached_provider.as_ref(),
+                                            &current_filter,
+                                            latest_block.header.number,
+                                            latest_block.header.hash,
+                                        )
+                                        .await
+                                    }
                                 };
 
                                 match fetched {
@@ -3605,7 +3724,11 @@ mod tests {
         ];
         let provider = Arc::new(RecordingLiveProvider::recording(
             MockChainProvider::new(1)
-                .with_blocks(vec![busy_tip()])
+                .with_blocks(
+                    (TIP - 3..=TIP)
+                        .map(|number| tip_block(number, hash_of(number), Bloom::repeat_byte(0xff)))
+                        .collect(),
+                )
                 .with_logs(prefix)
                 .with_shared_tip_logs(tip_logs),
         ));
