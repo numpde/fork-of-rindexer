@@ -4450,3 +4450,7 @@ mod pruned_history_tests;
 #[cfg(test)]
 #[path = "unknown_rpc_retry_tests.rs"]
 mod unknown_rpc_retry_tests;
+
+#[cfg(test)]
+#[path = "tip_fallback_identity_tests.rs"]
+mod tip_fallback_identity_tests;
