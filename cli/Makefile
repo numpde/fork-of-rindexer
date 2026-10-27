@@ -1,3 +1,5 @@
+include ../tools/make-timeout.mk
+
 FOUNDRY_EXAMPLE_SOURCE ?= https://github.com/Uniswap/v4-periphery
 FOUNDRY_EXAMPLE_PATH ?= $(CURDIR)/../examples/rindexer_foundry_import
 FOUNDRY_EXAMPLE_NAME ?= UniswapV4PeripheryImport

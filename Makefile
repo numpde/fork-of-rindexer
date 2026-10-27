@@ -1,11 +1,7 @@
 # Development entrypoints. Container preparation, copied inputs and lifecycle are
 # owned here; Compose defines services and containers/development/run.sh runs
 # commands inside them. The /native regression target uses installed build tools.
-SHELL := /bin/bash
-.SHELLFLAGS := -euo pipefail -c
-# Each recipe needs one shell so setup variables and cleanup traps survive until
-# its Docker command finishes. Make must also stop on an intermediate failure.
-.ONESHELL:
+include tools/make-timeout.mk
 .DEFAULT_GOAL := help
 # Serialize this Make invocation; run.sh separately locks the shared build cache.
 .NOTPARALLEL:
@@ -41,13 +37,15 @@ compose_cleanup_required=0
 cleanup() {
   local exit_status=$$?
   trap - EXIT
+  # Finish bounded cleanup even if cancellation is delivered more than once.
+  trap '' TERM INT
   if (( compose_cleanup_required )); then
     # Log retrieval and Compose teardown must not replace a failed command's
     # status. A teardown failure still turns an otherwise successful run red.
     if (( exit_status != 0 )); then
-      $(compose) logs --no-color postgres >&2 || true
+      timeout --signal=TERM --kill-after=5s 5s $(compose) logs --no-color postgres >&2 || true
     fi
-    if ! $(compose) down --volumes --remove-orphans; then
+    if ! timeout --signal=TERM --kill-after=5s 35s $(compose) down --volumes --remove-orphans; then
       if (( exit_status == 0 )); then
         exit_status=1
       fi
@@ -551,3 +549,8 @@ runtime/image/build: tests/posture ## Build the minimal PostgreSQL CLI image off
 runtime/checks: ## Check the rendered single-host PostgreSQL deployment without starting services
 	@python3 -B containers/runtime/test.py
 	bash -n containers/runtime/deploy.sh containers/runtime/smoke.sh containers/runtime/startup-smoke.sh
+
+
+.PHONY: tests/make-timeouts
+tests/make-timeouts: ## Check recipe deadlines, child cancellation and cleanup without Docker
+	@python3 -B -m unittest discover -s tests/make -p test_make_timeouts.py -v

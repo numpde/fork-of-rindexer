@@ -1,3 +1,5 @@
+include ../tools/make-timeout.mk
+
 # Rindexer E2E Tests Makefile
 
 # Override the rindexer binary path

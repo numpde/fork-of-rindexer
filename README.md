@@ -241,6 +241,38 @@ you can run `cargo fmt` to format the code, rules have been mapped in the `rustf
 Anyone is welcome to contribute to rindexer, feel free to look over the issues or open a new one if you have
 any new ideas or bugs you have found.
 
+### Make recipe deadlines
+
+The root, `cli/` and `e2e-tests/` Makefiles limit each complete recipe to **30 minutes**,
+including compilation, dependency preparation and cache waits. Use a positive integer
+with an optional `s`, `m` or `h` suffix to choose another finite limit:
+
+```bash
+make MAKE_TIMEOUT=90m dev/image/build
+make MAKE_TIMEOUT=60m ci
+make tests/make-timeouts
+```
+
+Zero and invalid limits fail before the recipe starts. Aggregate targets such as
+`ci` give each prerequisite recipe its own budget; the aggregate can take longer
+than one budget. A recursive Make launched inside a recipe shares its caller's
+remaining budget and cannot extend it with another `MAKE_TIMEOUT` value.
+
+At expiry, the recipe process group receives `TERM`. Cleanup has up to **60 seconds**
+before `KILL`; Make reports a failed recipe (`124`, or `137` after forced termination).
+The root container launcher also bounds log collection and Compose teardown so a
+stuck cleanup cannot wait indefinitely. Python 3, Bash and GNU coreutils `timeout`
+are required. Interactive CLI input and caller signals are preserved.
+
+CLI example targets that previously ran indefinitely now stop at this deadline.
+Choose a longer finite limit when needed. A target that launches a detached service
+only bounds its launch; the service has its own lifecycle. A native process cgroup
+also does not contain containers launched by a separate Docker daemon. The maintained
+Compose fixtures retain their independent CPU, memory and task limits.
+
+The deadline tests need no Docker or dependencies. They take about 70 seconds because
+one deliberately unresponsive recipe exercises the full 60-second cleanup grace.
+
 ### Playing around with the CLI locally
 
 You can use the `make` commands to run the CLI commands locally, this is useful for testing and developing.
