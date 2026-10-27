@@ -69,6 +69,15 @@ in throughput due to lock contention, and unwanted situations like connection po
 
 You may benefit from increasing this above `2` for very simple workloads, generally a value of `1` or `2` is optimal.
 
+When a contract-event stream encounters a fetch, dispatch or callback-task failure, it stops admitting new batches and
+waits for all callbacks it already admitted before returning the error. Successful admitted batches can finish their effects
+and advance the cursor through the completed prefix during that wait. A callback panic does not skip waiting for its peers.
+
+There is no added cleanup timeout or forced handler abort. A blocked handler or one that keeps retrying can delay the error
+return indefinitely. Supervisors and Rust callers must wait for the stream to return before treating its callbacks as settled;
+review restart timeouts when upgrading. This does not make custom-handler effects transactional or idempotent.
+
+
 ```yaml [rindexer.yaml]
 name: rIndexer
 description: My native transfers rindexer project

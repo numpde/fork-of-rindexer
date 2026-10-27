@@ -163,141 +163,155 @@ async fn process_event_logs(
 
     let failures = config.registry().failure_state();
     let network = config.network_contract().network.clone();
-    'outer: loop {
-        let result = tokio::select! {
-            result = logs_stream.next() => result,
-            reason = failures.wait_failed(config.id(), &network) => {
-                return Err(Box::new(ProviderError::CustomError(format!(
-                    "{} - Stream permanently blocked: {}", config.info_log_name(), reason
-                ))));
+    // Error exits stop admission, but must not detach callbacks that already own effects.
+    let mut processing_result: Result<(), Box<ProviderError>> = async {
+        'outer: loop {
+            let result = tokio::select! {
+                result = logs_stream.next() => result,
+                reason = failures.wait_failed(config.id(), &network) => {
+                    return Err(Box::new(ProviderError::CustomError(format!(
+                        "{} - Stream permanently blocked: {}", config.info_log_name(), reason
+                    ))));
+                }
+            };
+            let Some(result) = result else {
+                break;
+            };
+            if let Some(e) = pending_error.take() {
+                return Err(Box::new(ProviderError::CustomError(e.to_string())));
             }
-        };
-        let Some(result) = result else {
-            break;
-        };
+
+            // Reorg-bearing batches bypass coalescing — the coordinator's rollback
+            // semantics require standalone delivery in order.
+            let (mut coalesced_logs, mut final_from_block, mut final_to_block, reorg_generation) =
+                match result {
+                    Ok(fetch_result) => {
+                        if fetch_result.reorg.is_some() {
+                            dispatch_batch(
+                                &config,
+                                &callback_permits,
+                                &mut checkpoints,
+                                fetch_result,
+                                block_until_indexed,
+                                &mut in_flight,
+                            )
+                            .await?;
+                            continue;
+                        }
+                        (
+                            fetch_result.logs,
+                            fetch_result.from_block,
+                            fetch_result.to_block,
+                            fetch_result.reorg_generation,
+                        )
+                    }
+                    Err(e) => {
+                        return Err(Box::new(ProviderError::CustomError(e.to_string())));
+                    }
+                };
+
+            // Drain any additional READY results (non-blocking via now_or_never).
+            // SAFETY: tokio mpsc Receiver::recv/poll_recv is cancel-safe — dropping
+            // the future without completion does not consume any item from the channel.
+            const MAX_COALESCE_LOGS: usize = 5000;
+            let mut coalesced_count = 1usize;
+            while coalesced_logs.len() < MAX_COALESCE_LOGS {
+                match logs_stream.next().now_or_never() {
+                    Some(Some(Ok(fetch_result))) => {
+                        if fetch_result.reorg.is_some()
+                            || fetch_result.reorg_generation != reorg_generation
+                        {
+                            // Flush coalesced + reorg, then `continue 'outer` to
+                            // rebuild coalescing state with fresh block-range vars
+                            // (otherwise the stale min/max would poison the next
+                            // batch's reported range).
+                            dispatch_batch(
+                                &config,
+                                &callback_permits,
+                                &mut checkpoints,
+                                FetchLogsResult {
+                                    reorg_generation,
+                                    logs: std::mem::take(&mut coalesced_logs),
+                                    from_block: final_from_block,
+                                    to_block: final_to_block,
+                                    reorg: None,
+                                },
+                                block_until_indexed,
+                                &mut in_flight,
+                            )
+                            .await?;
+                            dispatch_batch(
+                                &config,
+                                &callback_permits,
+                                &mut checkpoints,
+                                fetch_result,
+                                block_until_indexed,
+                                &mut in_flight,
+                            )
+                            .await?;
+                            continue 'outer;
+                        }
+                        final_from_block = final_from_block.min(fetch_result.from_block);
+                        final_to_block = final_to_block.max(fetch_result.to_block);
+                        coalesced_logs.extend(fetch_result.logs);
+                        coalesced_count += 1;
+                    }
+                    Some(Some(Err(e))) => {
+                        pending_error = Some(e);
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+
+            if coalesced_count > 1 {
+                debug!(
+                    "{} - Coalesced {} batches into {} logs (blocks {} - {})",
+                    config.info_log_name(),
+                    coalesced_count,
+                    coalesced_logs.len(),
+                    final_from_block,
+                    final_to_block
+                );
+            }
+
+            dispatch_batch(
+                &config,
+                &callback_permits,
+                &mut checkpoints,
+                FetchLogsResult {
+                    reorg_generation,
+                    logs: coalesced_logs,
+                    from_block: final_from_block,
+                    to_block: final_to_block,
+                    reorg: None,
+                },
+                block_until_indexed,
+                &mut in_flight,
+            )
+            .await?;
+        }
+
+        // Check for any remaining pending error after stream ends
         if let Some(e) = pending_error.take() {
             return Err(Box::new(ProviderError::CustomError(e.to_string())));
         }
 
-        // Reorg-bearing batches bypass coalescing — the coordinator's rollback
-        // semantics require standalone delivery in order.
-        let (mut coalesced_logs, mut final_from_block, mut final_to_block, reorg_generation) =
-            match result {
-                Ok(fetch_result) => {
-                    if fetch_result.reorg.is_some() {
-                        dispatch_batch(
-                            &config,
-                            &callback_permits,
-                            &mut checkpoints,
-                            fetch_result,
-                            block_until_indexed,
-                            &mut in_flight,
-                        )
-                        .await?;
-                        continue;
-                    }
-                    (
-                        fetch_result.logs,
-                        fetch_result.from_block,
-                        fetch_result.to_block,
-                        fetch_result.reorg_generation,
-                    )
-                }
-                Err(e) => {
-                    return Err(Box::new(ProviderError::CustomError(e.to_string())));
-                }
-            };
+        Ok(())
+    }
+    .await;
+    drop(logs_stream);
 
-        // Drain any additional READY results (non-blocking via now_or_never).
-        // SAFETY: tokio mpsc Receiver::recv/poll_recv is cancel-safe — dropping
-        // the future without completion does not consume any item from the channel.
-        const MAX_COALESCE_LOGS: usize = 5000;
-        let mut coalesced_count = 1usize;
-        while coalesced_logs.len() < MAX_COALESCE_LOGS {
-            match logs_stream.next().now_or_never() {
-                Some(Some(Ok(fetch_result))) => {
-                    if fetch_result.reorg.is_some()
-                        || fetch_result.reorg_generation != reorg_generation
-                    {
-                        // Flush coalesced + reorg, then `continue 'outer` to
-                        // rebuild coalescing state with fresh block-range vars
-                        // (otherwise the stale min/max would poison the next
-                        // batch's reported range).
-                        dispatch_batch(
-                            &config,
-                            &callback_permits,
-                            &mut checkpoints,
-                            FetchLogsResult {
-                                reorg_generation,
-                                logs: std::mem::take(&mut coalesced_logs),
-                                from_block: final_from_block,
-                                to_block: final_to_block,
-                                reorg: None,
-                            },
-                            block_until_indexed,
-                            &mut in_flight,
-                        )
-                        .await?;
-                        dispatch_batch(
-                            &config,
-                            &callback_permits,
-                            &mut checkpoints,
-                            fetch_result,
-                            block_until_indexed,
-                            &mut in_flight,
-                        )
-                        .await?;
-                        continue 'outer;
-                    }
-                    final_from_block = final_from_block.min(fetch_result.from_block);
-                    final_to_block = final_to_block.max(fetch_result.to_block);
-                    coalesced_logs.extend(fetch_result.logs);
-                    coalesced_count += 1;
-                }
-                Some(Some(Err(e))) => {
-                    pending_error = Some(e);
-                    break;
-                }
-                _ => break,
+    // A join failure must not detach the other admitted callbacks either. Preserve an
+    // earlier fetch/dispatch error; otherwise report the first callback join failure.
+    while let Some(joined) = in_flight.next().await {
+        if let Err(error) = joined {
+            if processing_result.is_ok() {
+                processing_result = Err(Box::new(ProviderError::BatchRequestFailed(error)));
             }
         }
-
-        if coalesced_count > 1 {
-            debug!(
-                "{} - Coalesced {} batches into {} logs (blocks {} - {})",
-                config.info_log_name(),
-                coalesced_count,
-                coalesced_logs.len(),
-                final_from_block,
-                final_to_block
-            );
-        }
-
-        dispatch_batch(
-            &config,
-            &callback_permits,
-            &mut checkpoints,
-            FetchLogsResult {
-                reorg_generation,
-                logs: coalesced_logs,
-                from_block: final_from_block,
-                to_block: final_to_block,
-                reorg: None,
-            },
-            block_until_indexed,
-            &mut in_flight,
-        )
-        .await?;
     }
-
-    // Check for any remaining pending error after stream ends
-    if let Some(e) = pending_error.take() {
-        return Err(Box::new(ProviderError::CustomError(e.to_string())));
-    }
-
-    while let Some(joined) = in_flight.next().await {
-        joined.map_err(|e| Box::new(ProviderError::BatchRequestFailed(e)))?;
-    }
+    processing_result?;
 
     if let Some(reason) = failures.reason(config.id(), &network) {
         return Err(Box::new(ProviderError::CustomError(reason)));
