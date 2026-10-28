@@ -1,0 +1,66 @@
+x-docs: &docs
+  image: ${RINDEXER_DOCS_IMAGE:?run make docs/deps/install}
+  pull_policy: never
+  platform: linux/amd64
+  user: '65532:65532'
+  init: true
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  pids_limit: 256
+  mem_limit: 4g
+  cpus: 1
+  working_dir: /work
+  volumes:
+    - type: bind
+      source: ${RINDEXER_ROOT:?}/documentation/vocs.config.tsx
+      target: /work/vocs.config.tsx
+      read_only: true
+      bind: {create_host_path: false}
+    - type: bind
+      source: ${RINDEXER_ROOT:?}/documentation/tsconfig.json
+      target: /work/tsconfig.json
+      read_only: true
+      bind: {create_host_path: false}
+    - type: bind
+      source: ${RINDEXER_ROOT:?}/documentation/docs/pages
+      target: /work/docs/pages
+      read_only: true
+      bind: {create_host_path: false}
+    - type: bind
+      source: ${RINDEXER_ROOT:?}/documentation/docs/public
+      target: /work/docs/public
+      read_only: true
+      bind: {create_host_path: false}
+  tmpfs:
+    # esbuild executes its native helper from the disposable dependency copy.
+    - /work:rw,nosuid,nodev,exec,mode=1777,size=2048m
+    # Bind-mount parents are engine-created; the app owns its output parent.
+    - /work/docs:rw,nosuid,nodev,noexec,uid=65532,gid=65532,mode=0700,size=512m
+    - /tmp:rw,nosuid,nodev,noexec,mode=1777,size=256m
+
+services:
+  build:
+    <<: *docs
+    network_mode: none
+    command: [build]
+  dev:
+    <<: *docs
+    command: [dev]
+    ports:
+      - '127.0.0.1:${RINDEXER_DOCS_PORT:?}:5173'
+    networks: [docs]
+
+  preview:
+    <<: *docs
+    command: [preview]
+    ports:
+      # Vocs 1.4 preview binds port 4173 and accepts no host/port flags.
+      - '127.0.0.1:${RINDEXER_DOCS_PORT:?}:4173'
+    networks: [docs]
+
+networks:
+  docs:
+    # Internal-only networks suppress publication on the supported Docker engine.
+    # Browser-facing sessions get bridge egress; build has network_mode: none.
+    driver: bridge

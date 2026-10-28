@@ -12,7 +12,7 @@ include tools/make-timeout.mk
 # Rendering, execution and teardown always address the same file and project.
 compose = docker compose --env-file containers/development/images.env \
           --project-name "$$compose_project" --project-directory "$$checkout_root" \
-          -f compose/development.yml "$${compose_profile_args[@]}"
+          -f "$$compose_file" "$${compose_profile_args[@]}"
 
 # Establish one invocation's trusted image pins, temporary inputs and cleanup.
 # This block does not acquire images or start services. Set the teardown flag
@@ -32,6 +32,7 @@ done
 scratch_dir=$$(mktemp -d)
 compose_project="rindexer-dev-$$(id -u)-$$$$"
 compose_profile_args=()
+compose_file=compose/development.yml
 unset COMPOSE_PROFILES
 compose_cleanup_required=0
 cleanup() {
@@ -43,7 +44,7 @@ cleanup() {
     # Log retrieval and Compose teardown must not replace a failed command's
     # status. A teardown failure still turns an otherwise successful run red.
     if (( exit_status != 0 )); then
-      timeout --signal=TERM --kill-after=5s 5s $(compose) logs --no-color postgres >&2 || true
+      timeout --signal=TERM --kill-after=5s 5s $(compose) logs --no-color >&2 || true
     fi
     if ! timeout --signal=TERM --kill-after=5s 35s $(compose) down --volumes --remove-orphans; then
       if (( exit_status == 0 )); then
@@ -282,7 +283,7 @@ deps/check: tests/posture ## Verify prepared inputs and package the real GraphQL
 	@$(call offline_runner,$$dependency_image)
 	$(compose) run --rm --no-deps -T offline verify
 
-tests/checks: tests/posture ## Test prepared GraphQL inputs and generated typing archive admission
+tests/checks: tests/posture docs/checks ## Check docs container policy and prepared build/typing contracts
 	@$(call offline_runner,$$toolchain_image)
 	$(compose) run --rm --no-deps -T offline policy
 
@@ -611,3 +612,5 @@ tests/required-delivery/postgres: ## Verify required immediate and finalized str
 	$(compose) run --rm --no-deps -T offline required-delivery-compile
 	$(compose) up -d --no-build --pull never --wait --wait-timeout 90 postgres
 	$(compose) run --rm --no-deps -T postgres-tests required-delivery
+
+include containers/development/docs.mk

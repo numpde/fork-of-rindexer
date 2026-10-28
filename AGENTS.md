@@ -385,14 +385,18 @@ to it.
 
 ## Documentation site
 
-The site is [vocs](https://vocs.dev) under `documentation/` (Node >= 20):
+The site is [Vocs](https://vocs.dev) under `documentation/`. Run local docs tooling
+in containers, not host Node/npm. From the repository root:
 
 ```bash
-cd documentation
-npm i
-npm run dev      # local dev server
-npm run build    # validate the site builds — CI does NOT check docs, so do this manually
+make docs/deps/install  # explicit locked dependency preparation (network)
+make docs/dev           # foreground server, loopback port 5173
+make docs/build         # offline production build check
+make docs/preview       # build and serve the production site
 ```
+
+The shared positive `MAKE_TIMEOUT` applies to server sessions too. See
+`documentation/README.md` for ports, preparation and the container authority.
 
 Rules:
 
@@ -405,8 +409,9 @@ Rules:
   `start-building/tables/`, CLI flags → `references/cli.mdx`.
 - **New pages must be added to the `sidebar` array in `documentation/vocs.config.tsx`**
   — there is no auto-discovery.
-- No CI job builds or lints the docs, so breakage ships silently unless you run
-  `npm run build` yourself.
+- The Pages workflow builds and publishes docs, but deployment setup can fail before
+  compilation. Run `make docs/build` locally when docs change; `make docs/checks`
+  verifies the container workflow without starting Vocs.
 
 ## Release process — what you must never touch
 
@@ -453,6 +458,6 @@ section on the release branch.
    `documentation/docs/pages/docs/changelog.mdx` (or the change genuinely has zero
    user-visible effect).
 5. Docs updated for any new YAML field, CLI flag, env var, or metric; sidebar updated
-   for new pages; `npm run build` in `documentation/` if docs changed.
+   for new pages; `make docs/build` if docs changed.
 6. Example typings regenerated if you touched `core/src/generator/`.
 7. No version bumps, no `release/**` branch, no `Release vX.Y.Z` commit message.
