@@ -19,6 +19,9 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 use testcontainers_modules::postgres::Postgres;
 
+#[path = "support/anvil.rs"]
+mod anvil;
+
 // PingPong emits Ping(uint256 indexed id, address sender). Same bytecode as e2e_reorg.rs.
 const PING_PONG_BYTECODE: &str =
     "6080604052348015600e575f5ffd5b506101748061001c5f395ff3fe608060405234801561000f575f5ffd5b5060043610610029575f3560e01c8063773acdef1461002d575b5f5ffd5b610047600480360381019061004291906100bb565b610049565b005b807fc05b373e05c47417d9c7204807552389e512c0e21cbc01a03d1554561080ac6e336040516100799190610125565b60405180910390a250565b5f5ffd5b5f819050919050565b61009a81610088565b81146100a4575f5ffd5b50565b5f813590506100b581610091565b92915050565b5f602082840312156100d0576100cf610084565b5b5f6100dd848285016100a7565b91505092915050565b5f73ffffffffffffffffffffffffffffffffffffffff82169050919050565b5f61010f826100e6565b9050919050565b61011f81610105565b82525050565b5f6020820190506101385f830184610116565b9291505056fea2646970667358221220dc07dd9f297d16a6d4ac329e4565c9ecb79b34df9738da42d568df67b039348764736f6c634300081c0033";
@@ -164,7 +167,7 @@ impl TestEnv {
 
         // Auto-mining (no --block-time) so we can mine blocks on demand via anvil_mine
         // and emit events immediately.
-        let anvil_container = GenericImage::new("ghcr.io/foundry-rs/foundry", "latest")
+        let anvil_container = anvil::image()
             .with_exposed_port(8545_u16.into())
             .with_cmd(vec!["anvil --host 0.0.0.0".to_string()])
             .with_startup_timeout(Duration::from_secs(30))

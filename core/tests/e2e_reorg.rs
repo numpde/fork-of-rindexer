@@ -31,6 +31,9 @@ use testcontainers::{GenericImage, ImageExt};
 use testcontainers_modules::clickhouse::ClickHouse as ClickHouseImage;
 use testcontainers_modules::postgres::Postgres;
 
+#[path = "support/anvil.rs"]
+mod anvil;
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -200,7 +203,7 @@ impl TestEnv {
 
         // The foundry image entrypoint is `/bin/sh -c`, so the entire command
         // must be passed as a single string argument.
-        let anvil_container = GenericImage::new("ghcr.io/foundry-rs/foundry", "latest")
+        let anvil_container = anvil::image()
             .with_exposed_port(8545_u16.into())
             .with_cmd(vec!["anvil --host 0.0.0.0 --block-time 1".to_string()])
             .with_startup_timeout(std::time::Duration::from_secs(30))

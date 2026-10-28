@@ -45,6 +45,9 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 use testcontainers_modules::postgres::Postgres;
 
+#[path = "support/anvil.rs"]
+mod anvil;
+
 // PingPong emits Ping(uint256 indexed id, address sender). Same contract as
 // e2e_reorg.rs / e2e_parallel_fetch.rs — keeps ABI handling identical.
 const PING_PONG_BYTECODE: &str =
@@ -254,7 +257,7 @@ impl TestEnv {
         // few more event-bearing blocks before phase 2 begins, and phase 2
         // historical must run a short mini-pass. Auto-mining makes those
         // boundaries non-deterministic.
-        let anvil_container = GenericImage::new("ghcr.io/foundry-rs/foundry", "latest")
+        let anvil_container = anvil::image()
             .with_exposed_port(8545_u16.into())
             .with_cmd(vec!["anvil --host 0.0.0.0 --no-mining".to_string()])
             .with_startup_timeout(Duration::from_secs(30))
