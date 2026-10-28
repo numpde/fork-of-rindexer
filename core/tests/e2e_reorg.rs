@@ -404,20 +404,6 @@ impl TestEnv {
                  network VARCHAR(50) NOT NULL PRIMARY KEY,
                  last_synced_block NUMERIC NOT NULL
              );
-             CREATE TABLE IF NOT EXISTS rindexer_internal.derived_op_log (
-                 id BIGSERIAL PRIMARY KEY,
-                 derived_table VARCHAR(200) NOT NULL,
-                 network VARCHAR(50) NOT NULL,
-                 where_key VARCHAR(500) NOT NULL,
-                 column_name VARCHAR(100) NOT NULL,
-                 value JSONB NOT NULL,
-                 row_metadata JSONB NOT NULL DEFAULT '{}',
-                 block_number BIGINT NOT NULL,
-                 tx_index INTEGER NOT NULL,
-                 log_index INTEGER NOT NULL
-             );
-             CREATE INDEX IF NOT EXISTS idx_derived_op_log_reorg
-                 ON rindexer_internal.derived_op_log (derived_table, column_name, where_key, block_number);
              CREATE SCHEMA IF NOT EXISTS test_schema;
              CREATE TABLE IF NOT EXISTS test_schema.ping_pong_ping (
                  rindexer_id SERIAL PRIMARY KEY,
@@ -433,6 +419,25 @@ impl TestEnv {
         )
         .await
         .expect("failed to create tables");
+        // These explicit recovery fixtures seed typed keys and positions directly;
+        // production callback tests separately exercise generated journal writes.
+        pg.batch_execute(
+            "CREATE TABLE IF NOT EXISTS rindexer_internal.derived_op_log (
+            id BIGSERIAL PRIMARY KEY,
+            derived_table VARCHAR(200) NOT NULL,
+            network VARCHAR(50) NOT NULL,
+            where_key JSONB NOT NULL,
+            column_name VARCHAR(100) NOT NULL,
+            value JSONB NOT NULL,
+            row_metadata JSONB NOT NULL DEFAULT '{}',
+            block_number BIGINT NOT NULL,
+            tx_index BIGINT NOT NULL,
+            log_index BIGINT NOT NULL
+        ); CREATE INDEX IF NOT EXISTS idx_derived_op_log_reorg ON rindexer_internal.derived_op_log
+            (derived_table, column_name, where_key, block_number);",
+        )
+        .await
+        .expect("failed to create the typed recovery journal");
     }
 
     async fn insert_event(
@@ -3130,15 +3135,17 @@ async fn test_reorg_journal_max_recalculation() {
     .unwrap();
 
     // Journal entries: block1=100, block2=500, block3=300
-    let where_key = format!("trader={}", trader);
+    let where_key = json!({"trader": trader});
     for (block, value) in [(block1, 100i64), (block2, 500), (block3, 300)] {
         pg.execute(
             "INSERT INTO rindexer_internal.derived_op_log \
-             (derived_table, network, where_key, column_name, value, block_number, tx_index, log_index) \
-             VALUES ($1, $2, $3, $4, to_jsonb($5::numeric), $6, $7, $8)",
+             (derived_table, network, where_key, column_name, value, block_number, tx_index, log_index, row_metadata) \
+             VALUES ($1, $2, $3, $4, to_jsonb($5::numeric), $6, $7, $8, \
+             jsonb_build_object('rindexer_block_number', $6::bigint, 'rindexer_sequence_id', \
+             (($6::bigint)::numeric * 18446744073709551616 + ($7::bigint)::numeric * 4294967296 + $8::bigint)::text))",
             &[
-                &"test_schema.trade_stats", &network, &where_key.as_str(), &"max_trade",
-                &rust_decimal::Decimal::from(value), &(block as i64), &0i32, &0i32,
+                &"test_schema.trade_stats", &network, &where_key, &"max_trade",
+                &rust_decimal::Decimal::from(value), &(block as i64), &0i64, &0i64,
             ],
         )
         .await
@@ -3240,15 +3247,17 @@ async fn test_reorg_journal_set_recalculation() {
     .unwrap();
 
     // Journal: block1 set price=100, block2 set price=200, block3 set price=999
-    let where_key = format!("token={}", token);
-    for (block, value, tx_idx) in [(block1, 100i64, 0i32), (block2, 200, 0), (block3, 999, 0)] {
+    let where_key = json!({"token": token});
+    for (block, value, tx_idx) in [(block1, 100i64, 0i64), (block2, 200, 0), (block3, 999, 0)] {
         pg.execute(
             "INSERT INTO rindexer_internal.derived_op_log \
-             (derived_table, network, where_key, column_name, value, block_number, tx_index, log_index) \
-             VALUES ($1, $2, $3, $4, to_jsonb($5::numeric), $6, $7, $8)",
+             (derived_table, network, where_key, column_name, value, block_number, tx_index, log_index, row_metadata) \
+             VALUES ($1, $2, $3, $4, to_jsonb($5::numeric), $6, $7, $8, \
+             jsonb_build_object('rindexer_block_number', $6::bigint, 'rindexer_sequence_id', \
+             (($6::bigint)::numeric * 18446744073709551616 + ($7::bigint)::numeric * 4294967296 + $8::bigint)::text))",
             &[
-                &"test_schema.last_price", &network, &where_key.as_str(), &"price",
-                &rust_decimal::Decimal::from(value), &(block as i64), &tx_idx, &0i32,
+                &"test_schema.last_price", &network, &where_key, &"price",
+                &rust_decimal::Decimal::from(value), &(block as i64), &tx_idx, &0i64,
             ],
         )
         .await
@@ -3442,15 +3451,17 @@ async fn test_reorg_journal_min_recalculation() {
     .unwrap();
 
     // Journal: block1=500, block2=5, block3=200
-    let where_key = format!("tracker={}", tracker);
+    let where_key = json!({"tracker": tracker});
     for (block, value) in [(block1, 500i64), (block2, 5), (block3, 200)] {
         pg.execute(
             "INSERT INTO rindexer_internal.derived_op_log \
-             (derived_table, network, where_key, column_name, value, block_number, tx_index, log_index) \
-             VALUES ($1, $2, $3, $4, to_jsonb($5::numeric), $6, $7, $8)",
+             (derived_table, network, where_key, column_name, value, block_number, tx_index, log_index, row_metadata) \
+             VALUES ($1, $2, $3, $4, to_jsonb($5::numeric), $6, $7, $8, \
+             jsonb_build_object('rindexer_block_number', $6::bigint, 'rindexer_sequence_id', \
+             (($6::bigint)::numeric * 18446744073709551616 + ($7::bigint)::numeric * 4294967296 + $8::bigint)::text))",
             &[
-                &"test_schema.min_tracker", &network, &where_key.as_str(), &"min_value",
-                &rust_decimal::Decimal::from(value), &(block as i64), &0i32, &0i32,
+                &"test_schema.min_tracker", &network, &where_key, &"min_value",
+                &rust_decimal::Decimal::from(value), &(block as i64), &0i64, &0i64,
             ],
         )
         .await
@@ -3557,15 +3568,17 @@ async fn test_reorg_mixed_reversible_and_journal() {
     .unwrap();
 
     // Journal for max_trade (non-reversible)
-    let where_key = format!("user_addr={}", user);
+    let where_key = json!({"user_addr": user});
     for (block, value) in [(block1, 100i64), (block2, 500), (block3, 200)] {
         pg.execute(
             "INSERT INTO rindexer_internal.derived_op_log \
-             (derived_table, network, where_key, column_name, value, block_number, tx_index, log_index) \
-             VALUES ($1, $2, $3, $4, to_jsonb($5::numeric), $6, $7, $8)",
+             (derived_table, network, where_key, column_name, value, block_number, tx_index, log_index, row_metadata) \
+             VALUES ($1, $2, $3, $4, to_jsonb($5::numeric), $6, $7, $8, \
+             jsonb_build_object('rindexer_block_number', $6::bigint, 'rindexer_sequence_id', \
+             (($6::bigint)::numeric * 18446744073709551616 + ($7::bigint)::numeric * 4294967296 + $8::bigint)::text))",
             &[
-                &"test_schema.mixed_stats", &network, &where_key.as_str(), &"max_trade",
-                &rust_decimal::Decimal::from(value), &(block as i64), &0i32, &0i32,
+                &"test_schema.mixed_stats", &network, &where_key, &"max_trade",
+                &rust_decimal::Decimal::from(value), &(block as i64), &0i64, &0i64,
             ],
         )
         .await
@@ -4367,15 +4380,17 @@ async fn test_reorg_two_events_same_table_journal() {
     .unwrap();
 
     // Journal for max_trade (from Ping events): all 3 blocks
-    let where_key = format!("trader={}", trader);
+    let where_key = json!({"trader": trader});
     for (block, value) in [(block1, 100i64), (block2, 800), (block3, 50)] {
         pg.execute(
             "INSERT INTO rindexer_internal.derived_op_log \
-             (derived_table, network, where_key, column_name, value, block_number, tx_index, log_index) \
-             VALUES ($1, $2, $3, $4, to_jsonb($5::numeric), $6, $7, $8)",
+             (derived_table, network, where_key, column_name, value, block_number, tx_index, log_index, row_metadata) \
+             VALUES ($1, $2, $3, $4, to_jsonb($5::numeric), $6, $7, $8, \
+             jsonb_build_object('rindexer_block_number', $6::bigint, 'rindexer_sequence_id', \
+             (($6::bigint)::numeric * 18446744073709551616 + ($7::bigint)::numeric * 4294967296 + $8::bigint)::text))",
             &[
-                &"test_schema.trade_extremes", &network, &where_key.as_str(), &"max_trade",
-                &rust_decimal::Decimal::from(value), &(block as i64), &0i32, &0i32,
+                &"test_schema.trade_extremes", &network, &where_key, &"max_trade",
+                &rust_decimal::Decimal::from(value), &(block as i64), &0i64, &0i64,
             ],
         )
         .await
@@ -4386,11 +4401,13 @@ async fn test_reorg_two_events_same_table_journal() {
     for (block, value) in [(block1, 500i64), (block2, 20), (block3, 5)] {
         pg.execute(
             "INSERT INTO rindexer_internal.derived_op_log \
-             (derived_table, network, where_key, column_name, value, block_number, tx_index, log_index) \
-             VALUES ($1, $2, $3, $4, to_jsonb($5::numeric), $6, $7, $8)",
+             (derived_table, network, where_key, column_name, value, block_number, tx_index, log_index, row_metadata) \
+             VALUES ($1, $2, $3, $4, to_jsonb($5::numeric), $6, $7, $8, \
+             jsonb_build_object('rindexer_block_number', $6::bigint, 'rindexer_sequence_id', \
+             (($6::bigint)::numeric * 18446744073709551616 + ($7::bigint)::numeric * 4294967296 + $8::bigint)::text))",
             &[
-                &"test_schema.trade_extremes", &network, &where_key.as_str(), &"min_trade",
-                &rust_decimal::Decimal::from(value), &(block as i64), &0i32, &0i32,
+                &"test_schema.trade_extremes", &network, &where_key, &"min_trade",
+                &rust_decimal::Decimal::from(value), &(block as i64), &0i64, &0i64,
             ],
         )
         .await
