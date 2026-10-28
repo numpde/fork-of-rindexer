@@ -1,6 +1,7 @@
 import { defineConfig } from "vocs";
 
 export default defineConfig({
+  basePath: "/fork-of-rindexer",
   renderStrategy: "full-static",
   banner: {
     dismissable: false,
@@ -10,7 +11,7 @@ export default defineConfig({
     content: (
       <div role="note" style={{ whiteSpace: "normal", textAlign: "center", lineHeight: 1.4 }}>
         <strong>This fork's inherited docs are unmaintained.</strong>{" "}
-        <a href="/docs/fork-changes" style={{ color: "inherit" }}>
+        <a href="/fork-of-rindexer/docs/fork-changes" style={{ color: "inherit" }}>
           Fork changes &amp; migrations →
         </a>
       </div>
