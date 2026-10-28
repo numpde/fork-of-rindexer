@@ -575,3 +575,10 @@ tests/resume-without-start-block/postgres: ## Verify downtime recovery through p
 	$(compose) run --rm --no-deps -T offline postgres-resume-without-start-compile
 	$(compose) up -d --no-build --pull never --wait --wait-timeout 90 postgres
 	$(compose) run --rm --no-deps -T postgres-tests postgres-resume-without-start
+
+.PHONY: tests/historical-identity/postgres
+tests/historical-identity/postgres: ## Reject stale-fork historical logs through sequential and parallel PostgreSQL startup
+	@$(call offline_runner,$$dependency_image)
+	$(compose) run --rm --no-deps -T offline historical-identity-compile
+	$(compose) up -d --no-build --pull never --wait --wait-timeout 90 postgres
+	$(compose) run --rm --no-deps -T postgres-tests historical-identity

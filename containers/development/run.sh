@@ -51,6 +51,13 @@ case "$1" in
     exec cargo nextest run --frozen -p rindexer --lib --no-fail-fast --no-capture \
       -E 'test(/postgres_restart_without_start_block_recovers_downtime_exactly_once$/)'
     ;;
+  historical-identity-compile)
+    exec cargo nextest run --frozen -p rindexer --lib --no-run -E 'test(/postgres_historical_identity_/)'
+    ;;
+  historical-identity)
+    : "${RINDEXER_TEST_POSTGRES_URL:?missing explicit PostgreSQL fixture}"
+    exec cargo nextest run --frozen -p rindexer --lib --test-threads 1 --no-fail-fast -E 'test(/postgres_historical_identity_/)'
+    ;;
   runtime-image)
     cargo build --frozen --release -p rindexer_cli --no-default-features
     exec python3 -B containers/runtime/package.py >&3
