@@ -1,0 +1,35 @@
+# Fork changes & migrations
+
+This is the maintained documentation section for
+[`numpde/fork-of-rindexer`](https://github.com/numpde/fork-of-rindexer).
+We maintain this section, the fork migration notes linked below, and the fork's
+[changelog](/docs/changelog). The rest of this site is an **unmaintained snapshot
+of inherited upstream documentation** and may not describe this fork correctly.
+
+New documentation will cover differences from upstream here, rather than keeping
+a second general-purpose manual up to date. For general background, consult the
+[upstream documentation](https://rindexer.xyz); check this section for differences
+before applying that guidance to the fork.
+
+## Changes and upgrades
+
+Start with the [fork changelog](/docs/changelog) for changes and compatibility
+requirements. Before upgrading an existing indexer, read the migration notes that
+apply to its storage and configuration:
+
+- [PostgreSQL event replay](/docs/migrations/postgres-event-replay): application
+  receipts, replay behavior, and single-writer deployment limits.
+- [Sequence ordering](/docs/migrations/sequence-ordering): event ordering and
+  coordinated derived-state and journal rebuilds.
+- [Unsigned integer storage](/docs/migrations/unsigned-integer-storage) and
+  [signed integer storage](/docs/migrations/signed-integer-storage): PostgreSQL
+  encodings and repair requirements.
+- [ABI array storage](/docs/migrations/abi-array-storage): array representations
+  and schema compatibility.
+- [Raw event column names](/docs/migrations/raw-event-column-names): ABI field
+  names that overlap indexing metadata.
+- [Terminal indexing failures](/docs/migrations/terminal-event-failures): failures
+  that stop an affected stream and how to respond.
+
+These notes retain their existing URLs. Their place in this section identifies
+them as maintained fork documentation.

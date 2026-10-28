@@ -2,6 +2,20 @@ import { defineConfig } from "vocs";
 
 export default defineConfig({
   renderStrategy: "full-static",
+  banner: {
+    dismissable: false,
+    backgroundColor: "#fff3cd",
+    textColor: "#563d00",
+    height: "4rem",
+    content: (
+      <div role="note" style={{ whiteSpace: "normal", textAlign: "center", lineHeight: 1.4 }}>
+        <strong>This fork's inherited docs are unmaintained.</strong>{" "}
+        <a href="/docs/fork-changes" style={{ color: "inherit" }}>
+          Fork changes &amp; migrations →
+        </a>
+      </div>
+    ),
+  },
   head: (
     <>
       <meta property="og:type" content="website" />
@@ -24,6 +38,7 @@ export default defineConfig({
     "rindexer is a lighting-fast multi chain indexing solution written in Rust",
 
   topNav: [
+    { text: "Fork changes & migrations", link: "/docs/fork-changes" },
     { text: "Docs", link: "/docs/introduction/installation", match: "/docs" },
     { text: "Changelog", link: "/docs/changelog", match: "/docs" },
   ],
@@ -34,6 +49,40 @@ export default defineConfig({
     },
   ],
   sidebar: [
+    {
+      text: "Fork changes & migrations",
+      items: [
+        { text: "Overview", link: "/docs/fork-changes" },
+        {
+          text: "PostgreSQL Unsigned Integer Migration",
+          link: "/docs/migrations/unsigned-integer-storage",
+        },
+        {
+          text: "Sequence Ordering Migration",
+          link: "/docs/migrations/sequence-ordering",
+        },
+        {
+          text: "ABI Array Storage",
+          link: "/docs/migrations/abi-array-storage",
+        },
+        {
+          text: "PostgreSQL signed integer storage",
+          link: "/docs/migrations/signed-integer-storage",
+        },
+        {
+          text: "Terminal Indexing Failures",
+          link: "/docs/migrations/terminal-event-failures",
+        },
+        {
+          text: "Raw Event Column Names",
+          link: "/docs/migrations/raw-event-column-names",
+        },
+        {
+          text: "PostgreSQL Event Replay",
+          link: "/docs/migrations/postgres-event-replay",
+        },
+      ],
+    },
     {
       text: "Introduction",
       items: [
@@ -231,34 +280,6 @@ export default defineConfig({
         {
           text: "RPC Node Providers ",
           link: "/docs/references/rpc-node-providers",
-        },
-        {
-          text: "PostgreSQL Unsigned Integer Migration",
-          link: "/docs/migrations/unsigned-integer-storage",
-        },
-        {
-          text: "Sequence Ordering Migration",
-          link: "/docs/migrations/sequence-ordering",
-        },
-        {
-          text: "ABI Array Storage",
-          link: "/docs/migrations/abi-array-storage",
-        },
-        {
-          text: "PostgreSQL signed integer storage",
-          link: "/docs/migrations/signed-integer-storage",
-        },
-        {
-          text: "Terminal Indexing Failures",
-          link: "/docs/migrations/terminal-event-failures",
-        },
-        {
-          text: "Raw Event Column Names",
-          link: "/docs/migrations/raw-event-column-names",
-        },
-        {
-          text: "PostgreSQL Event Replay",
-          link: "/docs/migrations/postgres-event-replay",
         },
       ],
     },

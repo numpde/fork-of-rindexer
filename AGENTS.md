@@ -385,6 +385,13 @@ to it.
 
 ## Documentation site
 
+This fork maintains **Fork changes & migrations**
+(`documentation/docs/pages/docs/fork-changes/`), its linked migration notes, and the
+fork changelog. Other site pages are an unmaintained upstream snapshot. Put new
+fork documentation, including configuration changes, in the maintained section;
+the inherited-page paths elsewhere in these recipes are archival references. Keep
+the site-wide maintenance warning and its link visible.
+
 The site is [Vocs](https://vocs.dev) under `documentation/`. Run local docs tooling
 in containers, not host Node/npm. From the repository root:
 

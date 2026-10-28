@@ -1,5 +1,10 @@
 # Documentation
 
+Maintain **Fork changes & migrations** (`docs/pages/docs/fork-changes/`), its
+linked fork migration notes, and the fork changelog. Other site pages are a frozen
+upstream snapshot; put new fork-specific guidance in the maintained section. Keep
+the site-wide maintenance warning and its link visible.
+
 The site uses [Vocs](https://vocs.dev). Run these commands from the repository
 root with the selected local Docker engine and Compose. Node and npm run inside
 containers; neither needs to be installed on the host.
