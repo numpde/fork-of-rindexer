@@ -39,30 +39,138 @@ fn filter() -> RindexerEventFilter {
     )
     .unwrap()
 }
-fn address_rpc(chunk_size: usize) -> Arc<JsonRpcCachedProvider> {
-    let (provider, asserter) = JsonRpcCachedProvider::mock_with_asserter_and_address_filtering(
-        1,
-        AddressFiltering::MaxAddressPerGetLogsRequest(chunk_size),
-    );
-    if chunk_size == 1 {
-        asserter.push_success(&vec![log(100, 0, 1), log(500, 0, 0)]);
-        asserter.push_success(&vec![log(100, 0, 0), log(200, 0, 0)]);
-    } else {
-        asserter.push_success(&vec![
-            log(500, 0, 0),
-            log(100, 1, 2),
-            log(100, 0, 1),
-            log(100, 0, 0),
-            log(200, 0, 0),
-        ]);
+struct AddressRpc {
+    provider: Arc<JsonRpcCachedProvider>,
+    log_requests: Arc<AtomicUsize>,
+    server: tokio::task::JoinHandle<()>,
+}
+impl Drop for AddressRpc {
+    fn drop(&mut self) {
+        self.server.abort();
     }
-    provider
+}
+
+fn header(number: u64) -> AnyRpcBlock {
+    AnyRpcBlock::new(
+        Block::new(
+            AnyRpcHeader::from_sealed(
+                AnyHeader {
+                    number,
+                    parent_hash: B256::repeat_byte(number.saturating_sub(1) as u8),
+                    timestamp: number * 10,
+                    ..Default::default()
+                }
+                .seal(B256::repeat_byte(number as u8)),
+            ),
+            BlockTransactions::Full(vec![]),
+        )
+        .into(),
+    )
+}
+
+async fn address_rpc(chunk_size: usize) -> AddressRpc {
+    use axum::{routing::post, Json, Router};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let log_requests = Arc::new(AtomicUsize::new(0));
+    let observed = log_requests.clone();
+    // Header proofs must not consume the log-ordering script. Route by method
+    // and height so batching and ancestry boundaries remain production choices.
+    let app = Router::new().route(
+        "/",
+        post(move |Json(request): Json<serde_json::Value>| {
+            let observed = observed.clone();
+            async move {
+                let batch = request.is_array();
+                let requests = if let serde_json::Value::Array(requests) = request {
+                    requests
+                } else {
+                    vec![request]
+                };
+                let replies = requests
+                    .into_iter()
+                    .map(|request| {
+                        let result = match request["method"].as_str().unwrap() {
+                            "eth_chainId" => serde_json::json!("0x1"),
+                            "eth_getBlockByNumber" => {
+                                let number = u64::from_str_radix(
+                                    request["params"][0].as_str().unwrap().trim_start_matches("0x"),
+                                    16,
+                                )
+                                .unwrap();
+                                serde_json::to_value(header(number)).unwrap()
+                            }
+                            "eth_getLogs" => {
+                                observed.fetch_add(1, Ordering::SeqCst);
+                                let mut logs = if chunk_size > 1 {
+                                    vec![
+                                        log(500, 0, 0),
+                                        log(100, 1, 2),
+                                        log(100, 0, 1),
+                                        log(100, 0, 0),
+                                        log(200, 0, 0),
+                                    ]
+                                } else if request["params"][0]["address"]
+                                    .to_string()
+                                    .contains(&Address::repeat_byte(1).to_string())
+                                {
+                                    vec![log(100, 0, 1), log(500, 0, 0)]
+                                } else {
+                                    vec![log(100, 0, 0), log(200, 0, 0)]
+                                };
+                                let bound = |name: &str| {
+                                    u64::from_str_radix(
+                                        request["params"][0][name]
+                                            .as_str()
+                                            .unwrap()
+                                            .trim_start_matches("0x"),
+                                        16,
+                                    )
+                                    .unwrap()
+                                };
+                                logs.retain(|log| {
+                                    log.block_number.is_some_and(|number| {
+                                        number >= bound("fromBlock") && number <= bound("toBlock")
+                                    })
+                                });
+                                serde_json::to_value(logs).unwrap()
+                            }
+                            method => panic!("unexpected ordering-fixture RPC method {method}"),
+                        };
+                        serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":result})
+                    })
+                    .collect::<Vec<_>>();
+                Json(if batch {
+                    serde_json::Value::Array(replies)
+                } else {
+                    replies.into_iter().next().unwrap()
+                })
+            }
+        }),
+    );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let provider = crate::provider::create_client(
+        &url,
+        1,
+        None,
+        None,
+        None,
+        Default::default(),
+        Some(AddressFiltering::MaxAddressPerGetLogsRequest(chunk_size)),
+        None,
+    )
+    .await
+    .unwrap();
+    AddressRpc { provider, log_requests, server }
 }
 
 #[tokio::test]
 async fn address_query_results_are_ordered_for_one_and_multiple_chunks() {
     for chunk_size in [1, 32] {
-        let logs = address_rpc(chunk_size).get_logs(&filter()).await.unwrap();
+        let rpc = address_rpc(chunk_size).await;
+        let logs = rpc.provider.get_logs(&filter()).await.unwrap();
         let actual = logs
             .iter()
             .map(|log| {
@@ -80,10 +188,11 @@ async fn address_query_results_are_ordered_for_one_and_multiple_chunks() {
 #[tokio::test]
 async fn sequential_address_fetch_advances_past_the_highest_log() {
     let (tx, mut rx) = mpsc::channel(4);
+    let rpc = address_rpc(1).await;
     let result = fetch_historic_logs_stream(
         false,
         BlockClock::new(None, None, Arc::new(MockChainProvider::new(1))),
-        address_rpc(1).as_ref(),
+        rpc.provider.as_ref(),
         &tx,
         &B256::ZERO,
         filter(),
@@ -95,6 +204,7 @@ async fn sequential_address_fetch_advances_past_the_highest_log() {
     .await
     .unwrap();
     assert_eq!(result.next.from_block(), U64::from(501));
+    assert_eq!(rpc.log_requests.load(Ordering::SeqCst), 2);
     let logs = rx.recv().await.unwrap().unwrap().logs;
     assert_eq!(
         logs.iter().map(|log| log.block_number.unwrap()).collect::<Vec<_>>(),
@@ -162,10 +272,11 @@ async fn run_worker(
 
 #[tokio::test]
 async fn parallel_address_fetch_completes_without_refetching_its_delivered_prefix() {
-    let provider = address_rpc(1);
-    let config = config(provider, Arc::new(MockChainProvider::new(1)), false).await;
+    let rpc = address_rpc(1).await;
+    let config = config(rpc.provider.clone(), Arc::new(MockChainProvider::new(1)), false).await;
     let batch = run_worker(config, filter()).await;
     assert!(batch.is_final);
+    assert_eq!(rpc.log_requests.load(Ordering::SeqCst), 2);
     assert_eq!(batch.results.len(), 1);
     let logs = &batch.results[0].as_ref().unwrap().logs;
     assert_eq!(
@@ -175,21 +286,11 @@ async fn parallel_address_fetch_completes_without_refetching_its_delivered_prefi
 }
 
 async fn missing_timestamp_config() -> Arc<EventProcessingConfig> {
-    let header = AnyRpcBlock::new(
-        Block::new(
-            AnyRpcHeader::from_sealed(
-                AnyHeader { number: 101, timestamp: 1010, ..Default::default() }
-                    .seal(B256::repeat_byte(101)),
-            ),
-            BlockTransactions::Full(vec![]),
-        )
-        .into(),
-    );
     config(
         Arc::new(
             MockChainProvider::new(1)
                 .with_block_number(101)
-                .with_blocks(vec![header])
+                .with_blocks(vec![header(100), header(101)])
                 .with_logs(vec![log(100, 0, 0)]),
         ),
         Arc::new(MockChainProvider::new(1).with_block_batches(vec![vec![]])),

@@ -41,6 +41,26 @@ pub(crate) struct Fixture {
     checkpoints: CallbackCheckpoints,
 }
 
+// Fetched fixtures establish canonical identity before exercising callback
+// draining or recovery ordering. Logs determine their own block's identity.
+fn snapshot_headers(logs: &[Log], last: u64) -> Vec<alloy::network::AnyRpcBlock> {
+    let mut parent = B256::ZERO;
+    (1..=last)
+        .map(|number| {
+            let hash = logs
+                .iter()
+                .find(|log| log.block_number == Some(number))
+                .and_then(|log| log.block_hash)
+                .unwrap_or(B256::repeat_byte(number as u8));
+            let mut block = crate::indexer::tables::view_call_cache_tests::header(hash, number);
+            block.header.inner.number = number;
+            block.header.inner.parent_hash = parent;
+            parent = hash;
+            block
+        })
+        .collect()
+}
+
 impl Fixture {
     async fn new(callback: EventCallbackType) -> Self {
         Self::with_logs(
@@ -59,7 +79,10 @@ impl Fixture {
 
     pub(crate) async fn with_logs(callback: EventCallbackType, logs: Vec<Log>) -> Self {
         let directory = tempfile::tempdir().expect("checkpoint directory");
-        let provider = Arc::new(MockChainProvider::new(1).with_block_number(10).with_logs(logs));
+        let headers = snapshot_headers(&logs, 10);
+        let provider = Arc::new(
+            MockChainProvider::new(1).with_block_number(10).with_blocks(headers).with_logs(logs),
+        );
         let network = NetworkContract {
             id: "checkpoint".to_string(),
             network: "ethereum".to_string(),
@@ -992,6 +1015,7 @@ async fn assert_stream_failure_drains_admitted_work(failure: StreamFailure) {
     config.end_block = U64::from(4);
     let provider = MockChainProvider::new(1)
         .with_block_number(4)
+        .with_blocks(snapshot_headers(&logs, 4))
         .with_max_block_range(1)
         .with_logs(logs)
         .with_initial_log_successes(1)
