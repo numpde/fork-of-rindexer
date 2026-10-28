@@ -100,3 +100,9 @@ jobs:
         run: bash .github/scripts/pull-anvil.sh
       - name: Run coverage
         run: cargo llvm-cov nextest -p rindexer -p rindexer_cli --all-features --lcov --output-path lcov.info
+      - name: Preserve coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          if-no-files-found: error
