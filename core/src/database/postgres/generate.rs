@@ -43,7 +43,7 @@ pub fn generate_derived_op_log_table_sql() -> String {
         id BIGSERIAL PRIMARY KEY,
         derived_table VARCHAR(200) NOT NULL,
         network VARCHAR(50) NOT NULL,
-        where_key VARCHAR(500) NOT NULL,
+        where_key JSONB NOT NULL,
         column_name VARCHAR(100) NOT NULL,
         value JSONB NOT NULL,
         row_metadata JSONB NOT NULL DEFAULT '{}',
@@ -51,6 +51,17 @@ pub fn generate_derived_op_log_table_sql() -> String {
         tx_index BIGINT NOT NULL,
         log_index BIGINT NOT NULL
     );
+    DO $journal_key$
+    BEGIN
+        IF (SELECT atttypid FROM pg_attribute
+            WHERE attrelid = 'rindexer_internal.derived_op_log'::regclass
+            AND attname = 'where_key' AND NOT attisdropped) <> 'jsonb'::regtype THEN
+            IF EXISTS (SELECT 1 FROM rindexer_internal.derived_op_log LIMIT 1) THEN
+                RAISE EXCEPTION 'Cannot upgrade nonempty recovery journal: legacy text keys are ambiguous. Stop all writers and rebuild derived state, journals, receipts and progress from verified canonical history before resuming';
+            END IF;
+            ALTER TABLE rindexer_internal.derived_op_log ALTER COLUMN where_key TYPE JSONB USING '{}'::jsonb;
+        END IF;
+    END $journal_key$;
     CREATE INDEX IF NOT EXISTS idx_derived_op_log_reorg
         ON rindexer_internal.derived_op_log (derived_table, column_name, where_key, block_number);"#
         .to_string()

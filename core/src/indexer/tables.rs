@@ -4973,15 +4973,9 @@ async fn journal_non_reversible_ops(
                     format!("Cannot journal {derived_table}: prepared input has no key {key}")
                 })?;
                 let parameter = insert.bind(value.clone());
-                let prefix = if key_parts.is_empty() { "" } else { "," };
-                key_parts
-                    .push(format!("'{prefix}{}=' || {parameter}::text", key.replace('\'', "''")));
+                key_parts.push(format!("'{}', {parameter}", key.replace('\'', "''")));
             }
-            values.push(if key_parts.is_empty() {
-                "''".to_string()
-            } else {
-                key_parts.join(" || ")
-            });
+            values.push(format!("jsonb_build_object({})", key_parts.join(", ")));
             insert.values.push(format!("({})", values.join(", ")));
         }
     }

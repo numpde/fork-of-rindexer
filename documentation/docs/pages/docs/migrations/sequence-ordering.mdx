@@ -79,3 +79,19 @@ Journal payloads are encoded through typed PostgreSQL parameters. JSON conversio
 happens in PostgreSQL, preserving the exact decimal values of `uint256` and
 `int256`; nonnumeric `set` values (including addresses, strings and booleans) retain
 their types and are restored using the target table's row type.
+
+## Structured journal row identities
+
+PostgreSQL journal `where_key` values are now `JSONB` objects whose field names
+and typed values match the derived row's key columns. Text values containing
+commas, equal signs, quotes or Unicode remain separate values. Writers and recovery
+construct these objects through PostgreSQL's JSON conversion.
+
+An empty legacy journal can be converted automatically. Startup rejects a nonempty
+legacy text-key journal because distinct source rows may already share its encoded
+key. Preserve that evidence until the reviewed canonical rebuild is ready. Stop all
+writers sharing the journal and rebuild affected derived state and journal records
+together, coordinating raw history, application receipts and cursors as described
+above. Casting concatenated strings into JSON or splitting on delimiters cannot
+recover the original keys. Deploy the complete coordinated recovery upgrade before
+rebuilding, so the rebuild produces the final journal representation once.

@@ -1526,27 +1526,15 @@ impl ReorgTask {
         })
     }
 
-    /// Build a WHERE clause joining derived table rows to journal where_key.
-    /// The journal stores where_key as "col1=val1,col2=val2", so we match using
-    /// string concatenation on the derived table side.
+    /// PostgreSQL builds the same typed JSON object on both sides of the join;
+    /// commas, equal signs and SQL quoting inside a value cannot change its key.
     fn journal_where_key_join(where_columns: &[String], dt_alias: &str, sub_alias: &str) -> String {
-        if where_columns.is_empty() {
-            return "TRUE".to_string();
-        }
-
-        let concat_parts: Vec<String> = where_columns
+        let pairs = where_columns
             .iter()
-            .enumerate()
-            .map(|(i, col)| {
-                if i == 0 {
-                    format!("'{}=' || {}.{}::TEXT", col, dt_alias, col)
-                } else {
-                    format!("',{}=' || {}.{}::TEXT", col, dt_alias, col)
-                }
-            })
-            .collect();
-
-        format!("{}.where_key = {}", sub_alias, concat_parts.join(" || "))
+            .map(|column| format!("'{column}', {dt_alias}.\"{column}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{sub_alias}.where_key = jsonb_build_object({pairs})")
     }
 
     /// Build a ClickHouse expression that reconstructs the where_key string

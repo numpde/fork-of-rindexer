@@ -460,3 +460,33 @@ async fn postgres_composite_journal_keys_do_not_mix_rows_during_rollback() {
     drop(callback);
     fixture.finish().await;
 }
+
+#[tokio::test]
+async fn postgres_journal_key_schema_admits_empty_legacy_journal() {
+    let fixture = Fixture::new().await;
+    fixture.client.batch_execute("ALTER TABLE rindexer_internal.derived_op_log ALTER COLUMN where_key TYPE TEXT USING where_key::text").await.unwrap();
+    fixture
+        .client
+        .batch_execute(&crate::database::postgres::generate::generate_derived_op_log_table_sql())
+        .await
+        .unwrap();
+    let kind: String = fixture.client.query_one("SELECT atttypid::regtype::text FROM pg_attribute WHERE attrelid='rindexer_internal.derived_op_log'::regclass AND attname='where_key'", &[]).await.unwrap().get(0);
+    assert_eq!(kind, "jsonb");
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_journal_key_schema_rejects_nonempty_legacy_journal() {
+    let fixture = Fixture::new().await;
+    fixture.client.batch_execute("ALTER TABLE rindexer_internal.derived_op_log ALTER COLUMN where_key TYPE TEXT USING where_key::text;
+        INSERT INTO rindexer_internal.derived_op_log (derived_table,network,where_key,column_name,value,block_number,tx_index,log_index) VALUES ('legacy','ethereum','a=x,b=y,b=z','amount','1'::jsonb,99,0,0)").await.unwrap();
+    assert!(fixture.client.batch_execute(&crate::database::postgres::generate::generate_derived_op_log_table_sql()).await.is_err(), "nonempty legacy keys cannot be migrated without reconstructing their source identities");
+    let count: i64 = fixture
+        .client
+        .query_one("SELECT count(*) FROM rindexer_internal.derived_op_log", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(count, 1, "failed admission preserves legacy evidence for reviewed recovery");
+    fixture.finish().await;
+}
