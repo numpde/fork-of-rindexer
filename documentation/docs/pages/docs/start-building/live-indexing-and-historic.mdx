@@ -35,6 +35,14 @@ contracts:
     - Approval
 ```
 
+Historical fetching validates each nonempty log response against connected block
+headers anchored at the requested range end, in both sequential and parallel mode.
+A mismatched hash or incomplete header proof retries without dispatching that
+response or advancing its checkpoint. Providers must retain the required headers;
+this adds header RPC work in bounded batches. Empty responses still cannot prove
+that a provider returned every matching event. Upgrading does not repair orphaned
+rows or missing intervals already hidden behind committed progress.
+
 # Live indexing
 
 If you want to index live data you can just remove the [start_block](/docs/start-building/yaml-config/contracts#start_block)

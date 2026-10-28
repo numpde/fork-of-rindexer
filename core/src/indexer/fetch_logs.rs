@@ -529,7 +529,7 @@ async fn fetch_historic_logs_stream<P: ChainProvider>(
         );
     }
 
-    match cached_provider.get_logs(&current_filter).await.and_then(require_log_block_numbers) {
+    match fetch_historical_logs(cached_provider, &current_filter).await {
         Ok(logs) => {
             debug!(
                 "{} - {} - topic_id {}, Logs: {} from {} to {}",
@@ -1083,10 +1083,10 @@ fn classify_fetch_error(err: &ProviderError) -> FetchErrorKind {
 /// error result with no next state; retryable failures supply their next range.
 /// The error kind lets workers update adaptive concurrency after a failed attempt.
 #[allow(clippy::too_many_arguments)]
-async fn fetch_logs_once<P: ChainProvider + ?Sized>(
+async fn fetch_logs_once(
     timestamps: bool,
     block_clock: &BlockClock,
-    cached_provider: &P,
+    cached_provider: &dyn ChainProvider,
     current_filter: RindexerEventFilter,
     max_block_range_limitation: Option<U64>,
     snapshot_to_block: U64,
@@ -1127,7 +1127,7 @@ async fn fetch_logs_once<P: ChainProvider + ?Sized>(
         );
     }
 
-    match cached_provider.get_logs(&current_filter).await.and_then(require_log_block_numbers) {
+    match fetch_historical_logs(cached_provider, &current_filter).await {
         Ok(logs) => {
             let logs_empty = logs.is_empty();
             let last_log = logs.last().cloned();
@@ -1312,28 +1312,70 @@ async fn fetch_logs_against_observed_head(
     if logs.iter().any(|log| log.removed) {
         return Ok(logs);
     }
+    validate_logs_against_observed_head(provider, filter, logs, head_number, head_hash).await
+}
+
+/// Backfill has no polled live tip. Anchor each nonempty response at its requested
+/// range end, then prove the returned identities against that connected ancestry.
+async fn fetch_historical_logs(
+    provider: &dyn ChainProvider,
+    filter: &RindexerEventFilter,
+) -> Result<Vec<Log>, ProviderError> {
+    let logs = require_log_block_numbers(provider.get_logs(filter).await?)?;
+    if logs.is_empty() {
+        return Ok(logs);
+    }
+    if logs.iter().any(|log| log.removed) {
+        return Err(ProviderError::CustomError(
+            "Cannot validate historical logs: response contains removed logs".into(),
+        ));
+    }
+    let to = filter.to_block();
+    let headers =
+        crate::indexer::reorg::fetch_canonical_headers(provider, &[to]).await.map_err(|error| {
+            ProviderError::CustomError(format!(
+                "Cannot validate historical range ending at {to}: {error:#}"
+            ))
+        })?;
+    validate_logs_against_observed_head(
+        provider,
+        filter,
+        logs,
+        to.to::<u64>(),
+        headers[0].header.hash,
+    )
+    .await
+}
+
+async fn validate_logs_against_observed_head(
+    provider: &dyn ChainProvider,
+    filter: &RindexerEventFilter,
+    logs: Vec<Log>,
+    head_number: u64,
+    head_hash: B256,
+) -> Result<Vec<Log>, ProviderError> {
     let from = filter.from_block().to::<u64>();
     let to = filter.to_block().to::<u64>();
     if from > to || to > head_number {
         return Err(ProviderError::CustomError(format!(
-            "Cannot validate live logs for range {from}..={to} against observed head {head_number}: range is outside that head"
+            "Cannot validate logs for range {from}..={to} against observed head {head_number}: range is outside that head"
         )));
     }
     let mut identities = BTreeMap::new();
     for log in &logs {
         let (Some(number), Some(hash)) = (log.block_number, log.block_hash) else {
             return Err(ProviderError::CustomError(format!(
-                "Cannot validate live logs for range {from}..={to}: returned log is missing its block number or hash"
+                "Cannot validate logs for range {from}..={to}: returned log is missing its block number or hash"
             )));
         };
         if number < from || number > to {
             return Err(ProviderError::CustomError(format!(
-                "Cannot validate live logs for range {from}..={to}: returned log belongs to block {number}"
+                "Cannot validate logs for range {from}..={to}: returned log belongs to block {number}"
             )));
         }
         if identities.insert(number, hash).is_some_and(|previous| previous != hash) {
             return Err(ProviderError::CustomError(format!(
-                "Cannot validate live logs at block {number}: response mixes different block hashes"
+                "Cannot validate logs at block {number}: response mixes different block hashes"
             )));
         }
     }
@@ -1345,7 +1387,7 @@ async fn fetch_logs_against_observed_head(
     if first_log_block == head_number {
         if identities[&head_number] != head_hash {
             return Err(ProviderError::CustomError(format!(
-                "Cannot validate live logs at observed head {head_number}: expected block hash {head_hash}, received {}",
+                "Cannot validate logs at observed head {head_number}: expected block hash {head_hash}, received {}",
                 identities[&head_number]
             )));
         }
@@ -1364,13 +1406,13 @@ async fn fetch_logs_against_observed_head(
             .await
             .map_err(|error| {
                 ProviderError::CustomError(format!(
-                    "Cannot validate live logs against observed head {head_number}: {error:#}"
+                    "Cannot validate logs against observed head {head_number}: {error:#}"
                 ))
             })?;
         let last = headers.last().expect("nonempty validated header batch");
         if last.header.hash != expected_hash {
             return Err(ProviderError::CustomError(format!(
-                "Cannot validate live log ancestry at block {end}: expected hash {expected_hash}, received {}",
+                "Cannot validate log ancestry at block {end}: expected hash {expected_hash}, received {}",
                 last.header.hash
             )));
         }
@@ -1378,7 +1420,7 @@ async fn fetch_logs_against_observed_head(
             let header = &headers[(number - start) as usize].header;
             if claimed != header.hash {
                 return Err(ProviderError::CustomError(format!(
-                    "Cannot validate live logs at block {number}: header hash is {}, returned log hash is {claimed}", header.hash
+                    "Cannot validate logs at block {number}: header hash is {}, returned log hash is {claimed}", header.hash
                 )));
             }
         }
@@ -2794,7 +2836,7 @@ mod tests {
     fn make_log_at_block(block_number: u64) -> Log {
         Log {
             inner: PrimitiveLog { address: Default::default(), data: Default::default() },
-            block_hash: None,
+            block_hash: Some(B256::ZERO),
             block_number: Some(block_number),
             block_timestamp: None,
             transaction_hash: None,
@@ -2845,7 +2887,9 @@ mod tests {
     #[tokio::test]
     async fn historic_with_logs_advances_past_last_log() {
         let logs = vec![make_log_at_block(150), make_log_at_block(175)];
-        let mock = MockChainProvider::new(1).with_logs(logs);
+        let mock = MockChainProvider::new(1)
+            .with_logs(logs)
+            .with_blocks((100..=200).map(make_block).collect());
         let (tx, _rx) = mpsc::channel(4);
         let filter = RindexerEventFilter::empty_for_test()
             .set_from_block(U64::from(100))
@@ -2946,7 +2990,7 @@ mod tests {
         // dispatched twice (visible in the failing e2e harness as
         // "Found 1 duplicate tx_hash entries").
         let log = make_log_at_block(7);
-        let mock = MockChainProvider::new(1).with_logs(vec![log]);
+        let mock = MockChainProvider::new(1).with_logs(vec![log]).with_blocks(vec![make_block(7)]);
         let (tx, _rx) = mpsc::channel(4);
         let filter = RindexerEventFilter::empty_for_test()
             .set_from_block(U64::from(7))
@@ -3909,7 +3953,8 @@ mod tests {
     async fn final_historic_retry_stays_within_end_block(timestamps: bool, parallel: bool) {
         let provider = RecordingLiveProvider::recording(
             MockChainProvider::new(1)
-                .with_logs(vec![make_log_at_block(100), make_log_at_block(102)]),
+                .with_logs(vec![make_log_at_block(100), make_log_at_block(102)])
+                .with_blocks((100..=102).map(make_block).collect()),
         );
         let provider =
             if timestamps { provider } else { provider.with_transient_first_logs_error() };
@@ -4524,7 +4569,9 @@ mod tests {
         #[tokio::test]
         async fn fetch_logs_once_with_logs_advances_past_last_log() {
             let logs = vec![make_log_at_block(120), make_log_at_block(180)];
-            let mock = MockChainProvider::new(1).with_logs(logs);
+            let mock = MockChainProvider::new(1)
+                .with_logs(logs)
+                .with_blocks((100..=200).map(make_block).collect());
             let filter = RindexerEventFilter::empty_for_test()
                 .set_from_block(U64::from(100))
                 .set_to_block(U64::from(200));
