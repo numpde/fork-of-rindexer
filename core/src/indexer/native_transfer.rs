@@ -9,7 +9,7 @@ use alloy::consensus::Transaction;
 use alloy::network::{ReceiptResponse, TransactionResponse};
 use alloy::transports::{RpcError, TransportErrorKind};
 use alloy::{
-    primitives::{Address, Bytes, U256, U64},
+    primitives::{Address, Bytes, B256, U256, U64},
     rpc::types::trace::parity::{Action, LocalizedTransactionTrace},
 };
 use futures::future::try_join_all;
@@ -92,6 +92,7 @@ pub struct NativeTransfer {
 pub(crate) struct NativeBlockRequest {
     pub(crate) block_number: U64,
     pub(crate) generation: u64,
+    pub(crate) expected_hash: B256,
 }
 
 /// Producer and consumer share completion state; fetching ahead never finishes a prefix.
@@ -121,19 +122,20 @@ pub fn native_block_channel(
     )
 }
 
-/// Each request keeps the generation sampled before its range's RPC validation.
+/// Queue the validated identities with the generation sampled before RPC work.
+/// Re-fetching a height later must not replace this ownership proof.
 async fn push_range(
     block_tx: &NativeBlockSender,
-    last: U64,
-    latest: U64,
+    identities: &[(u64, B256)],
     generation: u64,
     network: &str,
 ) {
-    for block in last.to::<u64>()..=latest.to::<u64>() {
+    for &(block, expected_hash) in identities {
         if generation != crate::indexer::reorg::reorg_generation(network) {
             break;
         }
-        let request = NativeBlockRequest { block_number: U64::from(block), generation };
+        let request =
+            NativeBlockRequest { block_number: U64::from(block), generation, expected_hash };
         if let Err(error) = block_tx.sender.send(request).await {
             if is_running() {
                 error!("Failed to send block via channel: {}", error);
@@ -146,10 +148,8 @@ async fn push_range(
 /// Result of a reorg check over a pending block range.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum NativeTransferReorgOutcome {
-    /// No coordinator configured; range can be emitted as-is.
-    NoCoordinator,
-    /// All blocks in the range are canonical. Safe to emit.
-    Canonical,
+    /// Connected headers validated for this range, retained for queue ownership.
+    Canonical(Vec<(u64, B256)>),
     /// A reorg was handled. `rewind_to` is the first canonical block to re-fetch
     /// (inclusive), matching the publisher's first-unfinished boundary.
     Rewound { rewind_to: u64 },
@@ -174,41 +174,26 @@ pub(crate) async fn native_transfer_detect_reorg_in_range(
     from_block: u64,
     to_block: u64,
 ) -> NativeTransferReorgOutcome {
-    let Some(coordinator) = coordinator else {
-        return NativeTransferReorgOutcome::NoCoordinator;
-    };
-
     let block_numbers: Vec<U64> = (from_block..=to_block).map(U64::from).collect();
-    let blocks = match provider.get_block_by_number_batch(&block_numbers, false).await {
-        Ok(b) => b,
-        Err(e) => {
-            error!(
-                network,
-                from_block,
-                to_block,
-                error = %e,
-                "Native transfer reorg pre-check: block header fetch failed",
-            );
-            return NativeTransferReorgOutcome::Failed;
-        }
-    };
+    let blocks =
+        match crate::indexer::reorg::fetch_canonical_headers(provider, &block_numbers).await {
+            Ok(b) => b,
+            Err(e) => {
+                error!(
+                    network,
+                    from_block,
+                    to_block,
+                    error = %e,
+                    "Native transfer reorg pre-check: block header fetch failed",
+                );
+                return NativeTransferReorgOutcome::Failed;
+            }
+        };
 
-    // Guard against short reads (RPC lag, chain-tip reorg). Advancing the caller's
-    // cursor on a partial batch would leave a silent gap: blocks requested but not
-    // returned would never be fed to the coordinator, and their native-transfer
-    // rows would never be emitted. Treat as a transient failure so the caller
-    // backs off and retries the same range.
-    if blocks.len() != block_numbers.len() {
-        warn!(
-            network,
-            from_block,
-            to_block,
-            requested = block_numbers.len(),
-            received = blocks.len(),
-            "Native transfer reorg pre-check: short read from provider, retrying",
-        );
-        return NativeTransferReorgOutcome::Failed;
-    }
+    let identities = blocks.iter().map(|block| (block.header.number, block.header.hash)).collect();
+    let Some(coordinator) = coordinator else {
+        return NativeTransferReorgOutcome::Canonical(identities);
+    };
 
     // Mutex held across reorg handling (DB rollback, stream publishes in
     // parallel, user on_reorg callback firing). On a real reorg this blocks
@@ -254,7 +239,7 @@ pub(crate) async fn native_transfer_detect_reorg_in_range(
         }
     }
 
-    NativeTransferReorgOutcome::Canonical
+    NativeTransferReorgOutcome::Canonical(identities)
 }
 
 /// Block publisher.
@@ -377,11 +362,9 @@ pub async fn native_transfer_block_fetch(
                     .await;
 
                     match outcome {
-                        NativeTransferReorgOutcome::Canonical
-                        | NativeTransferReorgOutcome::NoCoordinator => {
+                        NativeTransferReorgOutcome::Canonical(identities) => {
                             debug!("Pushing trace blocks {} - {}", from_block, to_block);
-                            push_range(&block_tx, from_block, to_block, plan_generation, &network)
-                                .await;
+                            push_range(&block_tx, &identities, plan_generation, &network).await;
                             next_block = to_block.saturating_add(U64::from(1));
                         }
                         NativeTransferReorgOutcome::Rewound { rewind_to } => {
@@ -455,13 +438,11 @@ pub async fn native_transfer_block_processor(
         if buffer.is_empty() {
             continue;
         }
-        let numbers: Vec<U64> = buffer.iter().map(|request| request.block_number).collect();
-        let processed_block = native_transfer_block_consumer_at_generation(
+        let processed_block = consume_native_block_requests(
             provider.clone(),
-            &numbers,
+            &buffer,
             &network_name,
             &config,
-            buffer[0].generation,
             Some(&block_rx.recovery),
         )
         .await;
@@ -547,33 +528,42 @@ pub async fn native_transfer_block_consumer(
     network_name: &str,
     config: &Arc<TraceProcessingConfig>,
 ) -> Result<(), ProcessEventError> {
+    if block_numbers.is_empty() {
+        return Ok(());
+    }
     let generation = crate::indexer::reorg::reorg_generation(network_name);
-    native_transfer_block_consumer_at_generation(
-        provider,
-        block_numbers,
-        network_name,
-        config,
-        generation,
-        None,
-    )
-    .await
+    let headers = crate::indexer::reorg::fetch_canonical_headers(provider.as_ref(), block_numbers)
+        .await.map_err(|error| ProviderError::CustomError(format!("Cannot establish native-transfer block identity on network {network_name:?}: {error:#}")))?;
+    let requests = headers
+        .into_iter()
+        .map(|block| NativeBlockRequest {
+            block_number: U64::from(block.header.number),
+            expected_hash: block.header.hash,
+            generation,
+        })
+        .collect::<Vec<_>>();
+    consume_native_block_requests(provider, &requests, network_name, config, None).await
 }
 
-async fn native_transfer_block_consumer_at_generation(
+async fn consume_native_block_requests(
     provider: Arc<dyn ChainProvider>,
-    block_numbers: &[U64],
+    requests: &[NativeBlockRequest],
     network_name: &str,
     config: &Arc<TraceProcessingConfig>,
-    generation: u64,
     recovery: Option<&ReorgSubscription>,
 ) -> Result<(), ProcessEventError> {
     if let Some(failure) = config.terminal_failure() {
         return Err(failure.into());
     }
-    if block_numbers.is_empty() {
+    if requests.is_empty() {
         return Ok(());
     }
-    let blocks = provider.get_block_by_number_batch(block_numbers, true).await?;
+    let block_numbers = requests.iter().map(|request| request.block_number).collect::<Vec<_>>();
+    let expected = requests
+        .iter()
+        .map(|request| (request.block_number.to::<u64>(), request.expected_hash))
+        .collect::<HashMap<_, _>>();
+    let blocks = provider.get_block_by_number_batch(&block_numbers, true).await?;
     let (from_block, to_block) = block_numbers
         .iter()
         .fold((U64::MAX, U64::ZERO), |(min, max), &num| (cmp::min(min, num), cmp::max(max, num)));
@@ -586,6 +576,12 @@ async fn native_transfer_block_consumer_at_generation(
         if !remaining.remove(&number) {
             return Err(ProviderError::CustomError(format!(
                 "Cannot process native-transfer blocks on network {network_name:?}: RPC response contains unrequested or repeated block {number}; the requested range cannot be checkpointed"
+            )).into());
+        }
+        let expected_hash = expected[&number];
+        if block.header.hash != expected_hash {
+            return Err(ProviderError::CustomError(format!(
+                "Cannot process native-transfer blocks on network {network_name:?}, block {number}: validated hash {expected_hash} differs from full-block hash {}; no callbacks or checkpoint can complete this range", block.header.hash
             )).into());
         }
         let alloy::rpc::types::BlockTransactions::Full(transactions) = &block.transactions else {
@@ -722,7 +718,8 @@ async fn native_transfer_block_consumer_at_generation(
     if let Some(failure) = config.terminal_failure() {
         return Err(failure.into());
     }
-    if generation != crate::indexer::reorg::reorg_generation(network_name) {
+    let generation = crate::indexer::reorg::reorg_generation(network_name);
+    if requests.iter().any(|request| request.generation != generation) {
         return Err(ProviderError::CustomError(format!(
             "Cannot apply native-transfer batch on network {network_name:?}: a reorg completed while fetching; retry the block range"
         )).into());
@@ -1109,7 +1106,12 @@ mod tests {
         alloy::network::AnyRpcBlock::new(
             Block::new(
                 AnyRpcHeader::from_sealed(
-                    AnyHeader { number: block_number, ..Default::default() }.seal(block_hash),
+                    AnyHeader {
+                        number: block_number,
+                        parent_hash: B256::repeat_byte(block_number.saturating_sub(1) as u8),
+                        ..Default::default()
+                    }
+                    .seal(block_hash),
                 ),
                 BlockTransactions::Full(vec![rpc_tx]),
             )
@@ -1213,6 +1215,7 @@ mod tests {
             .send(NativeBlockRequest {
                 block_number: U64::from(42),
                 generation: crate::indexer::reorg::reorg_generation("ethereum"),
+                expected_hash: B256::repeat_byte(42),
             })
             .await
             .unwrap();
@@ -1484,16 +1487,23 @@ mod tests {
                     )
                 })
                 .collect();
+            let requests = blocks
+                .iter()
+                .map(|block| NativeBlockRequest {
+                    block_number: U64::from(block.header.number),
+                    expected_hash: block.header.hash,
+                    generation: crate::indexer::reorg::reorg_generation("ethereum"),
+                })
+                .collect::<Vec<_>>();
             let receipts = successful_receipts(&blocks);
             let provider = Arc::new(
                 MockChainProvider::new(1).with_blocks(blocks).with_receipt_response(receipts),
             );
-            let error = native_transfer_block_consumer_at_generation(
+            let error = consume_native_block_requests(
                 provider,
-                &numbers,
+                &requests,
                 "ethereum",
                 &config,
-                crate::indexer::reorg::reorg_generation("ethereum"),
                 Some(&sender.recovery),
             )
             .await
@@ -1765,7 +1775,10 @@ mod tests {
         )
         .await;
 
-        assert_eq!(outcome, NativeTransferReorgOutcome::Canonical);
+        assert_eq!(
+            outcome,
+            NativeTransferReorgOutcome::Canonical(vec![(12, b256(12)), (13, b256(13))])
+        );
     }
 
     #[tokio::test]
@@ -1869,7 +1882,6 @@ mod tests {
     }
 
     async fn assert_native_queue_identity(stale: bool, empty: bool) {
-        use alloy::primitives::B256;
         use futures::FutureExt;
         use std::sync::atomic::{AtomicUsize, Ordering};
         let calls = Arc::new(AtomicUsize::new(0));
@@ -1975,10 +1987,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_transfer_no_coordinator_short_circuits() {
-        // Without a coordinator configured, the helper must return NoCoordinator
-        // so the caller emits the range as-is.
-        let provider: Arc<dyn ChainProvider> = Arc::new(MockChainProvider::new(1));
+    async fn native_transfer_no_coordinator_still_retains_validated_identities() {
+        let provider: Arc<dyn ChainProvider> =
+            Arc::new(MockChainProvider::new(1).with_blocks(vec![
+                make_block_with_parent(12, b256(12), b256(11)),
+                make_block_with_parent(13, b256(13), b256(12)),
+            ]));
 
         let outcome = native_transfer_detect_reorg_in_range(
             provider.as_ref(),
@@ -1992,7 +2006,10 @@ mod tests {
         )
         .await;
 
-        assert_eq!(outcome, NativeTransferReorgOutcome::NoCoordinator);
+        assert_eq!(
+            outcome,
+            NativeTransferReorgOutcome::Canonical(vec![(12, b256(12)), (13, b256(13))])
+        );
     }
 }
 

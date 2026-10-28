@@ -433,3 +433,24 @@ Handwritten Rust callers of `native_block_channel` and
 from a saved checkpoint, use checked addition once to obtain the next block;
 handle exhausted block-number space explicitly. Generated projects use the engine
 startup path and do not need to change their YAML ranges.
+
+
+## Validated block identities
+
+The block-based native indexer queues each height together with the hash of its
+validated header and its recovery generation. Fetching full blocks later must
+return those hashes. Internally consistent transactions and receipts from another
+fork do not satisfy that check. Validation covers empty blocks too: a block with
+no native transfer still cannot advance progress under another hash.
+
+A mismatch retries without callbacks or checkpoint advancement. Reorg recovery,
+when enabled for the network, retires requests from the obsolete generation and
+schedules the replacement prefix. Enable reorg recovery for unfinalized history;
+without it, a genuine fork can require an operator restart and reviewed recovery.
+Providers must serve complete connected headers, including when recovery is
+disabled. Direct Rust callers of `native_transfer_block_consumer` also validate
+headers before fetching full blocks and must request a contiguous range.
+
+Upgrading prevents new identity mismatches from being committed. Review and
+rebuild any previously contaminated native raw history, derived effects, receipts
+and progress together; the stronger check does not repair old data automatically.

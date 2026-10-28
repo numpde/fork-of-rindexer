@@ -383,6 +383,12 @@ async fn postgres_native_queue_recovery_preserves_replacement_prefix_on_anvil() 
             .send(NativeBlockRequest {
                 block_number: U64::from(number),
                 generation: planned_generation,
+                expected_hash: old_headers
+                    .iter()
+                    .find(|block| block.header.number == number)
+                    .unwrap()
+                    .header
+                    .hash,
             })
             .await
             .unwrap();
@@ -499,12 +505,15 @@ async fn postgres_native_queue_recovery_preserves_replacement_prefix_on_anvil() 
     Arc::get_mut(&mut restarted).unwrap().start_block = U64::from(saved + 1);
     let (requests, queue) = native_block_channel("ethereum", U64::from(saved + 1), 32);
     let planned_generation = crate::indexer::reorg::reorg_generation("ethereum");
-    for number in saved + 1..=110 {
+    let required = (saved + 1..=110).map(U64::from).collect::<Vec<_>>();
+    for block in provider.get_block_by_number_batch(&required, false).await.unwrap() {
+        let number = block.header.number;
         requests
             .sender
             .send(NativeBlockRequest {
                 block_number: U64::from(number),
                 generation: planned_generation,
+                expected_hash: block.header.hash,
             })
             .await
             .unwrap();
