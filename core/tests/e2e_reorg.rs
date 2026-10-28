@@ -2674,6 +2674,44 @@ async fn test_reorg_reversal_transfer_batch_iterate() {
     .await
     .unwrap();
 
+    // Retain the canonical mints that establish the balances before the
+    // orphaned transfer; metadata recovery must not treat these as orphan-only rows.
+    let zero_address = "0x0000000000000000000000000000000000000000";
+    for (log_index, user, amounts) in [(0, sender, [20u64, 30]), (1, recipient, [1, 2])] {
+        let values = amounts.map(|amount| amount.to_string()).to_vec();
+        pg.execute(
+            "INSERT INTO test_schema.erc1155_transfer_batch
+             (operator, \"from\", \"to\", ids, values, tx_hash, block_number,
+              block_hash, network, tx_index, log_index)
+             VALUES ($1, $2, $3, ARRAY['101', '202']::VARCHAR(78)[], $4,
+                     $5, $6, $5, $7, 0, $8)",
+            &[
+                &sender,
+                &zero_address,
+                &user,
+                &values,
+                &zero_tx,
+                &Decimal::from(block2 - 1),
+                &network,
+                &log_index.to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+        ch.execute(&format!(
+            "INSERT INTO test_schema.erc1155_transfer_batch
+             (operator, `from`, `to`, ids, values, tx_hash, block_number, block_hash,
+              network, tx_index, log_index)
+             VALUES ('{sender}', '{zero_address}', '{user}', [101, 202], [{}, {}],
+                     '{zero_tx}', {}, '{block_hash}', '{network}', 0, {log_index})",
+            amounts[0],
+            amounts[1],
+            block2 - 1
+        ))
+        .await
+        .unwrap();
+    }
+
     pg.execute(
         "INSERT INTO rindexer_internal.test_schema_transfer_batch
          (network, last_synced_block) VALUES ($1, $2)",
@@ -2789,10 +2827,10 @@ async fn test_reorg_reversal_transfer_batch_iterate() {
         .unwrap();
 
     let rindexer_pg = env.rindexer_pg().await;
-    pg.batch_execute(
+    pg.batch_execute(&format!(
         "UPDATE test_schema.erc1155_transfer_batch
-         SET values = ARRAY['7']::VARCHAR(78)[]",
-    )
+         SET values = ARRAY['7']::VARCHAR(78)[] WHERE block_number = {block2}"
+    ))
     .await
     .unwrap();
     let mut failed_window = BlockChainWindow::try_new(256).unwrap();
@@ -2818,11 +2856,11 @@ async fn test_reorg_reversal_transfer_batch_iterate() {
         .await
         .unwrap()
         .get(0);
-    assert_eq!(raw_rows, 1, "failed preflight must not delete stale event rows");
-    pg.batch_execute(
+    assert_eq!(raw_rows, 3, "failed preflight must preserve canonical and orphan events");
+    pg.batch_execute(&format!(
         "UPDATE test_schema.erc1155_transfer_batch
-         SET values = ARRAY['7', '11']::VARCHAR(78)[]",
-    )
+         SET values = ARRAY['7', '11']::VARCHAR(78)[] WHERE block_number = {block2}"
+    ))
     .await
     .unwrap();
 
@@ -2841,7 +2879,7 @@ async fn test_reorg_reversal_transfer_batch_iterate() {
     assert_eq!(result.events_deleted, 1);
     let balances = pg
         .query(
-            "SELECT trim(user_address), token_id, balance
+            "SELECT trim(user_address), token_id, balance, rindexer_block_number
              FROM test_schema.custody_balances
              ORDER BY user_address, token_id",
             &[],
@@ -2849,7 +2887,10 @@ async fn test_reorg_reversal_transfer_batch_iterate() {
         .await
         .unwrap()
         .into_iter()
-        .map(|row| (row.get::<_, String>(0), row.get::<_, Decimal>(1), row.get::<_, Decimal>(2)))
+        .map(|row| {
+            assert_eq!(row.get::<_, i64>(3), (block2 - 1) as i64);
+            (row.get::<_, String>(0), row.get::<_, Decimal>(1), row.get::<_, Decimal>(2))
+        })
         .collect::<Vec<_>>();
     for (user, token_id, expected) in
         [(sender, 101u64, 20u64), (sender, 202, 30), (recipient, 101, 1), (recipient, 202, 2)]
@@ -2875,10 +2916,10 @@ async fn test_reorg_reversal_transfer_batch_iterate() {
         .await
         .unwrap()
         .get(0);
-    assert_eq!(remaining_events, 0, "orphaned raw events should be deleted");
+    assert_eq!(remaining_events, 2, "only canonical mint events should survive rollback");
     let remaining_ch_events: u64 =
         ch.query_one("SELECT count() FROM test_schema.erc1155_transfer_batch FINAL").await.unwrap();
-    assert_eq!(remaining_ch_events, 0, "ClickHouse orphaned raw events should be deleted");
+    assert_eq!(remaining_ch_events, 2, "ClickHouse must retain the canonical mint events");
     let checkpoint: Decimal = pg
         .query_one(
             "SELECT last_synced_block
@@ -2927,7 +2968,9 @@ async fn test_reorg_reversal_expands_postgres_jsonb_tuple_arrays() {
              tx_hash CHAR(66) NOT NULL,
              block_number NUMERIC NOT NULL,
              block_hash CHAR(66) NOT NULL,
-             network VARCHAR(50) NOT NULL
+             network VARCHAR(50) NOT NULL,
+             tx_index NUMERIC NOT NULL,
+             log_index VARCHAR(78) NOT NULL
          );
          CREATE TABLE test_schema.account_balances (
              network VARCHAR(50) NOT NULL,
@@ -2951,9 +2994,23 @@ async fn test_reorg_reversal_expands_postgres_jsonb_tuple_arrays() {
     let zero_hash = "0x0000000000000000000000000000000000000000000000000000000000000000";
     pg.execute(
         "INSERT INTO test_schema.account_batch
-         (accounts, values, tx_hash, block_number, block_hash, network)
-         VALUES ($1, ARRAY['1']::VARCHAR(78)[], $2, $3, $2, $4)",
+         (accounts, values, tx_hash, block_number, block_hash, network, tx_index, log_index)
+         VALUES ($1, ARRAY['1']::VARCHAR(78)[], $2, $3, $2, $4, 0, '0')",
         &[&accounts, &zero_hash, &Decimal::from(block), &network],
+    )
+    .await
+    .unwrap();
+    // These canonical contributions explain the pre-fork balances. Recovery must
+    // retain them and restore their block marker after reversing the orphan.
+    let canonical_accounts = json!([
+        {"owner": owner_a, "tokenAmount": "10"},
+        {"owner": owner_b, "tokenAmount": "20"}
+    ]);
+    pg.execute(
+        "INSERT INTO test_schema.account_batch
+         (accounts, values, tx_hash, block_number, block_hash, network, tx_index, log_index)
+         VALUES ($1, ARRAY['1', '2']::VARCHAR(78)[], $2, $3, $2, $4, 0, '0')",
+        &[&canonical_accounts, &zero_hash, &Decimal::from(block - 1), &network],
     )
     .await
     .unwrap();
@@ -3060,7 +3117,7 @@ async fn test_reorg_reversal_expands_postgres_jsonb_tuple_arrays() {
     );
     let raw_rows: i64 =
         pg.query_one("SELECT count(*) FROM test_schema.account_batch", &[]).await.unwrap().get(0);
-    assert_eq!(raw_rows, 1, "failed reversal must roll back raw deletion");
+    assert_eq!(raw_rows, 2, "failed reversal must preserve canonical and orphan raw rows");
     let checkpoint: Decimal = pg
         .query_one(
             "SELECT last_synced_block
@@ -3078,16 +3135,19 @@ async fn test_reorg_reversal_expands_postgres_jsonb_tuple_arrays() {
         .expect("JSONB tuple-array rollback failed");
 
     let balances = pg
-        .query("SELECT trim(owner), balance FROM test_schema.account_balances ORDER BY owner", &[])
+        .query("SELECT trim(owner), balance, rindexer_block_number FROM test_schema.account_balances ORDER BY owner", &[])
         .await
         .unwrap();
     assert_eq!(balances[0].get::<_, String>(0), owner_a);
     assert_eq!(balances[0].get::<_, Decimal>(1), Decimal::from(10u64));
     assert_eq!(balances[1].get::<_, String>(0), owner_b);
     assert_eq!(balances[1].get::<_, Decimal>(1), Decimal::from(20u64));
+    for row in &balances {
+        assert_eq!(row.get::<_, i64>(2), (block - 1) as i64);
+    }
     let raw_rows: i64 =
         pg.query_one("SELECT count(*) FROM test_schema.account_batch", &[]).await.unwrap().get(0);
-    assert_eq!(raw_rows, 0);
+    assert_eq!(raw_rows, 1, "the canonical tuple-array event must survive rollback");
 }
 
 // ---------------------------------------------------------------------------
