@@ -302,3 +302,81 @@ fn table_conditions_reject_unknown_references_in_their_actual_namespace() {
         assert!(error.contains(message), "{condition}: {error}");
     }
 }
+
+fn mixed_insert_manifest(operation: &str, reorg_enabled: bool, include_insert: bool) -> String {
+    let mut operations = vec![];
+    if include_insert {
+        operations.push(serde_json::json!({"type":"insert", "set":[
+            {"column":"id", "action":"set", "value":"$from"},
+            {"column":"amount", "action":"set", "value":"$value"}
+        ]}));
+    }
+    if !operation.is_empty() {
+        operations.push(serde_json::json!({"type":operation, "where":{"id":"$from"},
+            "set": if operation == "delete" { vec![] } else { vec![serde_json::json!({"column":"amount", "action":"add", "value":"$value"})] }
+        }));
+    }
+    serde_yaml::to_string(&serde_json::json!({
+        "name":"recovery", "project_type":"no-code", "storage":{"postgres":{"enabled":true}},
+        "networks":[{"name":"mainnet", "chain_id":1, "rpc":"http://unused.invalid",
+            "reorg_handling":{"enabled":reorg_enabled}}],
+        "contracts":[{"name":"Token", "abi":"./abis/token.json",
+            "details":[{"network":"mainnet", "address":"0x0000000000000000000000000000000000000001", "start_block":"99"}],
+            "tables":[{"name":"balances", "columns":[{"name":"id", "type":"address"},
+                {"name":"amount", "type":"uint256", "default":"0"}],
+                "events":[{"event":"Transfer", "operations":operations}]}]
+        }]
+    })).unwrap()
+}
+
+#[test]
+fn read_manifest_rejects_insert_with_mutable_operations_during_reorg_recovery() {
+    for operation in ["update", "upsert", "delete"] {
+        let directory = tempfile::tempdir().unwrap();
+        write_abi(directory.path());
+        let path = manifest_path(directory.path());
+        fs::write(&path, mixed_insert_manifest(operation, true, true)).unwrap();
+        let error = read_manifest(&path).expect_err(
+            "recovery must reject mixed inserts before an orphan update can delete canonical creation",
+        ).to_string();
+        assert!(
+            error.contains("balances") && error.contains("insert") && error.contains("reorg"),
+            "{operation}: {error}"
+        );
+    }
+}
+
+#[test]
+fn read_manifest_keeps_supported_insert_and_mutable_recovery_shapes() {
+    for (operation, enabled, insert) in
+        [("", true, true), ("update", true, false), ("update", false, true)]
+    {
+        let directory = tempfile::tempdir().unwrap();
+        write_abi(directory.path());
+        let path = manifest_path(directory.path());
+        fs::write(&path, mixed_insert_manifest(operation, enabled, insert)).unwrap();
+        read_manifest(&path)
+            .expect("insert-only, mutable-only and non-reorg mixed tables remain valid");
+    }
+}
+
+#[test]
+fn read_manifest_rejects_native_insert_with_mutable_reorg_operations() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut manifest: serde_json::Value =
+        serde_yaml::from_str(&mixed_insert_manifest("update", true, true)).unwrap();
+    let mut tables = manifest["contracts"][0]["tables"].take();
+    tables[0]["events"][0]["event"] = "NativeTransfer".into();
+    manifest["contracts"] = serde_json::json!([]);
+    manifest["native_transfers"] = serde_json::json!({"enabled":true,
+        "networks":[{"network":"mainnet", "start_block":"99"}], "tables":tables});
+    let path = manifest_path(directory.path());
+    fs::write(&path, serde_yaml::to_string(&manifest).unwrap()).unwrap();
+    let error = read_manifest(&path)
+        .expect_err("native tables need the same recovery admission rule")
+        .to_string();
+    assert!(
+        error.contains("balances") && error.contains("insert") && error.contains("reorg"),
+        "{error}"
+    );
+}
