@@ -59,16 +59,26 @@ impl SingleBlockRpc {
         let responses = server.mock("POST", "/").with_header("content-type", "application/json")
             .with_body_from_request(move |request| {
                 let request: Value = serde_json::from_slice(request.body().unwrap()).unwrap();
+                let batch = request.is_array();
+                let requests = if let Value::Array(requests) = request { requests } else { vec![request] };
+                let replies = requests.into_iter().map(|request| {
                 let id = request["id"].clone();
                 if request["method"] == "eth_chainId" {
-                    return json!({"jsonrpc":"2.0","id":id,"result":"0x1"}).to_string().into_bytes();
+                    return json!({"jsonrpc":"2.0","id":id,"result":"0x1"});
+                }
+                if request["method"] == "eth_getBlockByNumber" {
+                    let number = u64::from_str_radix(request["params"][0].as_str().unwrap().trim_start_matches("0x"),16).unwrap();
+                    let mut block=crate::indexer::tables::view_call_cache_tests::header(B256::repeat_byte(number as u8),number);
+                    block.header.inner.number=number;
+                    block.header.inner.parent_hash=B256::repeat_byte(number.saturating_sub(1) as u8);
+                    return json!({"jsonrpc":"2.0","id":id,"result":block});
                 }
                 assert_eq!(request["method"], "eth_getLogs");
                 let block = |key| u64::from_str_radix(request["params"][0][key].as_str().unwrap().trim_start_matches("0x"),16).unwrap();
                 let (from,to) = (block("fromBlock"),block("toBlock"));
                 recorded.lock().unwrap().push((from,to));
                 if from != to {
-                    return json!({"jsonrpc":"2.0","id":id,"error":{"code":-32001,"message":"Unable to complete request at this time."}}).to_string().into_bytes();
+                    return json!({"jsonrpc":"2.0","id":id,"error":{"code":-32001,"message":"Unable to complete request at this time."}});
                 }
                 let log = Log {
                     inner: alloy::primitives::Log { address: Address::ZERO, data: LogData::new_unchecked(vec![B256::ZERO],Bytes::new()) },
@@ -76,7 +86,9 @@ impl SingleBlockRpc {
                     transaction_hash: Some(B256::repeat_byte(from as u8)), transaction_index: Some(0), log_index: Some(0),
                     ..Default::default()
                 };
-                json!({"jsonrpc":"2.0","id":id,"result":[log]}).to_string().into_bytes()
+                json!({"jsonrpc":"2.0","id":id,"result":[log]})
+                }).collect::<Vec<_>>();
+                (if batch { Value::Array(replies) } else { replies.into_iter().next().unwrap() }).to_string().into_bytes()
             }).create_async().await;
         let provider = create_client_for_network(
             "unknown-retry",
