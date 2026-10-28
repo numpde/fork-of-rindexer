@@ -12,7 +12,9 @@ use super::generate_tables_sql;
 use crate::database::{
     postgres::{
         client::{PostgresClient, TEST_DATABASE_URL_LOCK},
-        generate::{generate_columns_with_data_types, generate_reorg_block_hashes_table_sql},
+        generate::{
+            generate_column_names_only_with_base_properties, generate_reorg_block_hashes_table_sql,
+        },
         schema_sync::{detect_schema_changes, SchemaChange},
     },
     unsigned_integer_tests::{decoded, event, postgres_fixture_url},
@@ -153,7 +155,9 @@ fn metadata(block: u64) -> HashMap<String, EthereumSqlTypeWrapper> {
         ),
         (
             injected_columns::RINDEXER_SEQUENCE_ID.to_string(),
-            EthereumSqlTypeWrapper::U128(u128::from(block)),
+            EthereumSqlTypeWrapper::U128(crate::manifest::contract::compute_sequence_id(
+                block, 0, 0,
+            )),
         ),
     ])
 }
@@ -300,8 +304,18 @@ events:
             inputs.remove(0)
         })
         .collect::<Vec<_>>();
-    let columns = generate_columns_with_data_types(&inputs).join(", ");
-    postgres.batch_execute(&format!("CREATE TABLE {SCHEMA}.events ({columns}, network TEXT, block_number NUMERIC, tx_hash TEXT)")).await?;
+    let source_columns = generate_column_names_only_with_base_properties(&inputs).join(", ");
+    let event = crate::abi::EventInfo::new(serde_json::from_value(json!({
+        "type":"event", "name":"events", "anonymous":false, "inputs":inputs,
+    }))?)?;
+    postgres
+        .batch_execute(&super::generate_event_table_sql_with_comments(
+            &[event],
+            "Values",
+            SCHEMA,
+            vec![],
+        ))
+        .await?;
     let full_name = format!("{SCHEMA}.totals");
     for (block, amount16, amount32) in [(1, 1, 1), (2, 65534, 4294967294i64)] {
         let mut columns = metadata(block);
@@ -324,7 +338,7 @@ events:
         )
         .await
         .map_err(anyhow::Error::msg)?;
-        postgres.batch_execute(&format!("INSERT INTO {SCHEMA}.events VALUES (65535, 4294967295, {amount16}, {amount32}, 'ethereum', {block}, 'tx{block}')")).await?;
+        postgres.batch_execute(&format!("INSERT INTO {SCHEMA}.events ({source_columns}) VALUES ('0x{:040x}',65535,4294967295,{amount16},{amount32},'0x{block:064x}',{block},NULL,'0x{block:064x}','ethereum',0,'0')",1)).await?;
     }
     let types = HashMap::from([
         ("key16".to_string(), ColumnType::Uint16),
