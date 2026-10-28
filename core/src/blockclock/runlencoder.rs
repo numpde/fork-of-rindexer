@@ -723,7 +723,7 @@ mod tests {
     ///
     /// Spotcheck the files on each run to ensure we don't contain errors.
     #[tokio::test]
-    // #[ignore]
+    #[ignore = "manual probe requiring an external RPC and its rate-limit budget"]
     async fn spotcheck_file() -> anyhow::Result<()> {
         let rpc_url = "https://arb-mainnet.g.alchemy.com/v2/LfCdXVQaAS7hctR3N78Sj";
         let network_id = 42161;
