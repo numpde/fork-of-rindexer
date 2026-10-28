@@ -12,7 +12,7 @@ containers; neither needs to be installed on the host.
 ```bash
 make docs/deps/install  # explicit networked preparation from package-lock.json
 make docs/build         # offline production build check
-make docs/dev           # live edits: http://127.0.0.1:5173
+make docs/dev           # live edits: http://127.0.0.1:5173/fork-of-rindexer/
 make docs/preview       # build and serve the production site at the same address
 ```
 
@@ -31,9 +31,11 @@ do not publish ports on the supported Docker engine. No Docker socket or host
 credentials enter a docs container. Pages/public directories are inputs,
 including local files placed there: keep secrets out of those trees.
 
-Use `DOCS_PORT=5174 make docs/dev` for another loopback port. Servers run in the
-foreground: Ctrl-C stops the container and removes its network. The shared Make
-limit defaults to 30 minutes and also applies to servers; extend it deliberately,
+The `/fork-of-rindexer/` prefix applies to local dev and preview as well as Pages.
+Use `DOCS_PORT=5174 make docs/dev` for another loopback port; keep the same path
+prefix in the browser URL. Servers run in the foreground: Ctrl-C stops the
+container and removes its network. The shared Make limit defaults to 30 minutes
+and also applies to servers; extend it deliberately,
 for example `make MAKE_TIMEOUT=2h docs/dev`.
 
 `make docs/checks` checks the real rendered composition and entrypoints using the
