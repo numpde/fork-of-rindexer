@@ -3,9 +3,7 @@ use super::journal_recovery_tests::at;
 use super::*;
 use crate::{
     indexer::reorg::{
-        BlockChainWindow, DerivedColumnJournal, DerivedColumnRollback, DerivedTableInfo,
-        DerivedTableRollbackOp, EventTableInfo, ReorgBlockHashPersistence, ReorgContext,
-        ReorgCoordinator,
+        BlockChainWindow, EventTableInfo, ReorgBlockHashPersistence, ReorgContext, ReorgCoordinator,
     },
     manifest::contract::{ColumnType, OperationType, SetAction},
     provider::mock::MockChainProvider,
@@ -51,65 +49,41 @@ async fn rollback_with_ancestor(fixture: &Fixture, branch: u8) -> anyhow::Result
         crate::indexer::tables::view_call_cache_tests::header(B256::repeat_byte(branch), 1099);
     ancestor.header.inner.number = 99;
     let schema = generate_indexer_contract_schema_name(&fixture.params.indexer_name, "Contract");
-    let mut coordinator =
-        ReorgCoordinator::new(
-            "ethereum".into(),
-            BlockChainWindow::try_new(8).unwrap(),
-            Arc::new(ReorgBlockHashPersistence::new(Some(fixture.client.clone()), None)),
-            Arc::new(MockChainProvider::new(1).with_blocks(vec![
-                ancestor,
-                crate::indexer::tables::view_call_cache_tests::header(B256::repeat_byte(101), 1101),
-            ])),
-            vec![EventTableInfo::try_new(
-                schema.clone(),
-                "value".into(),
-                generate_internal_event_table_name(&schema, "Value"),
-                fixture.params.indexer_name.clone(),
-                "Contract".into(),
-                "Value".into(),
-            )
-            .unwrap()],
-            vec![DerivedTableInfo::try_new(
-                fixture.params.tables[0].full_table_name.clone(),
-                false,
-                vec![DerivedTableRollbackOp::try_new(
-                    format!("{schema}.value"),
-                    vec![],
-                    vec![DerivedColumnRollback::try_new(
-                        "amount".into(),
-                        "value".into(),
-                        SetAction::Add,
-                    )
-                    .unwrap()],
-                    None,
-                )
-                .unwrap()],
-                if fixture.params.tables[0]
-                    .table
-                    .columns
-                    .iter()
-                    .any(|column| column.name == "latest")
-                {
-                    vec![DerivedColumnJournal::try_new("latest".into(), SetAction::Set, vec![])
-                        .unwrap()]
-                } else {
-                    vec![]
-                },
-            )
-            .unwrap()],
-            vec![],
-        )
-        .unwrap();
-    let mut plan = crate::indexer::reorg::task::DerivedTableRollbackPlan::default();
-    plan.try_add_operation(
-        fixture.params.tables[0].full_table_name.clone(),
-        0,
-        vec![],
-        [("value".into(), ColumnType::Uint256)].into(),
-        [("amount".into(), ColumnType::Uint256)].into(),
+    let mut derived = std::collections::HashMap::new();
+    let mut plans = std::collections::HashMap::new();
+    crate::indexer::start::build_derived_tables_for_event(
+        "Value",
+        &fixture.params.indexer_name,
+        "Contract",
+        "ethereum",
+        &[("value".into(), ColumnType::Uint256)].into(),
+        &fixture.params.tables,
+        &mut derived,
+        &mut plans,
     )
     .unwrap();
-    coordinator = coordinator.with_rollback_plan(plan);
+    let mut coordinator = ReorgCoordinator::new(
+        "ethereum".into(),
+        BlockChainWindow::try_new(8).unwrap(),
+        Arc::new(ReorgBlockHashPersistence::new(Some(fixture.client.clone()), None)),
+        Arc::new(MockChainProvider::new(1).with_blocks(vec![
+            ancestor,
+            crate::indexer::tables::view_call_cache_tests::header(B256::repeat_byte(101), 1101),
+        ])),
+        vec![EventTableInfo::try_new(
+            schema.clone(),
+            "value".into(),
+            generate_internal_event_table_name(&schema, "Value"),
+            fixture.params.indexer_name.clone(),
+            "Contract".into(),
+            "Value".into(),
+        )
+        .unwrap()],
+        derived.remove("ethereum").unwrap(),
+        vec![],
+    )
+    .unwrap()
+    .with_rollback_plan(plans.remove("ethereum").unwrap());
     let task = coordinator.try_create_reorg_task_for_block_range(100, 100).unwrap();
     coordinator
         .handle_reorg(
@@ -274,4 +248,46 @@ async fn postgres_arithmetic_recovery_orders_sources_for_a_partial_metadata_targ
     assert_eq!(row.get::<_, i64>(1), 99);
     drop(callback);
     fixture.finish().await;
+}
+
+async fn separate_column_recovery(action: &str, latest: serde_json::Value) {
+    let fixture = Fixture::with_table(serde_json::to_value(params().event).unwrap(), "Contract", json!({
+        "name":"totals","global":true,"timestamp":true,
+        "columns":[{"name":"amount","type":"uint256","default":"0"},latest],
+        "events":[{"event":"Value","operations":[
+            {"type":"upsert","if":"value == 10","set":[{"column":"amount","action":"add","value":"$value"}]},
+            {"type":"update","if":"value == 20","set":[{"column":"latest","action":action,"value":"$value"}]}
+        ]}]
+    })).await;
+    let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+    callback(vec![input(&fixture, 99, 99, 10)]).await.unwrap();
+    let canonical = state(&fixture).await;
+    callback(vec![input(&fixture, 100, 100, 20)]).await.unwrap();
+    assert_ne!(state(&fixture).await, canonical, "the orphan must change the row");
+    rollback(&fixture).await;
+    assert_eq!(
+        state(&fixture).await,
+        canonical,
+        "every column and all metadata must match the pre-orphan row"
+    );
+    drop(callback);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_arithmetic_recovery_separate_column_set_restores_default() {
+    separate_column_recovery("set", json!({"name":"latest","type":"uint256","default":"7"})).await;
+}
+#[tokio::test]
+async fn postgres_arithmetic_recovery_separate_column_max_restores_default() {
+    separate_column_recovery("max", json!({"name":"latest","type":"uint256","default":"7"})).await;
+}
+#[tokio::test]
+async fn postgres_arithmetic_recovery_separate_column_min_restores_default() {
+    separate_column_recovery("min", json!({"name":"latest","type":"uint256","default":"42"})).await;
+}
+#[tokio::test]
+async fn postgres_arithmetic_recovery_separate_column_set_restores_null() {
+    separate_column_recovery("set", json!({"name":"latest","type":"uint256","nullable":true}))
+        .await;
 }
