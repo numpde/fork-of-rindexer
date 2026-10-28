@@ -96,9 +96,3 @@ jobs:
         run: cargo install -q cargo-llvm-cov cargo-nextest --locked
       - name: Run coverage
         run: cargo llvm-cov nextest -p rindexer -p rindexer_cli --all-features --lcov --output-path lcov.info
-      - name: Upload to Codecov
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: lcov.info
-          fail_ci_if_error: true
