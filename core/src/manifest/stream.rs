@@ -214,8 +214,19 @@ pub struct CloudflareQueuesStreamConfig {
     pub queues: Vec<CloudflareQueuesStreamQueueConfig>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamDeliveryGuarantee {
+    #[default]
+    BestEffort,
+    AtLeastOnce,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct StreamsConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_guarantee: Option<StreamDeliveryGuarantee>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sns: Option<SNSStreamConfig>,
 
@@ -339,5 +350,22 @@ impl StreamsConfig {
         if !full_path.exists() {
             fs::create_dir_all(&full_path).await.expect("Failed to create directory for stream");
         }
+    }
+}
+
+#[cfg(test)]
+mod delivery_guarantee_tests {
+    use super::*;
+    #[test]
+    fn required_delivery_configuration_is_optional_and_round_trip_safe() {
+        let omitted: StreamsConfig = serde_yaml::from_str("webhooks: []").unwrap();
+        assert!(omitted.delivery_guarantee.is_none());
+        assert!(!serde_yaml::to_string(&omitted).unwrap().contains("delivery_guarantee"));
+        let required: StreamsConfig =
+            serde_yaml::from_str("delivery_guarantee: at_least_once\nwebhooks: []").unwrap();
+        let round_trip: StreamsConfig =
+            serde_yaml::from_str(&serde_yaml::to_string(&required).unwrap()).unwrap();
+        assert_eq!(round_trip.delivery_guarantee, Some(StreamDeliveryGuarantee::AtLeastOnce));
+        assert!(serde_yaml::from_str::<StreamsConfig>("delivery_guarantee: exactly_once").is_err());
     }
 }

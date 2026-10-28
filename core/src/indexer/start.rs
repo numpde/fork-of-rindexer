@@ -763,6 +763,10 @@ pub(super) async fn start_indexing_contract_events(
     let mut processed_network_contracts: Vec<ProcessedNetworkContract> = Vec::new();
     let mut dependency_event_processing_configs: Vec<ContractEventsDependenciesConfig> = Vec::new();
 
+    super::required_delivery::validate(manifest, &registry, &trace_registry, postgres.as_deref())
+        .await
+        .map_err(StartIndexingError::ReorgRecovery)?;
+
     let mut block_tasks = FuturesUnordered::new();
 
     if let Some(true) = manifest.timestamps {
@@ -1053,6 +1057,9 @@ pub(super) async fn start_indexing_contract_events(
             network_coordinators.insert(network_name.clone(), Arc::new(Mutex::new(coordinator)));
         }
     }
+
+    super::required_delivery::start(&registry, postgres.as_ref(), &cancel_token)
+        .map_err(StartIndexingError::ReorgRecovery)?;
 
     while let Some(res) = block_tasks.next().await {
         let (

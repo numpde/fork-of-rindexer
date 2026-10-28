@@ -1,6 +1,11 @@
+#[path = "outbox.rs"]
+mod outbox;
+
+use crate::database::postgres::stream_outbox::{DeliveryDestination, DeliverySource};
+
 use std::{
     collections::{BTreeMap, HashMap},
-    sync::{Arc, Mutex as StdMutex},
+    sync::{Arc, Mutex as StdMutex, OnceLock},
     time::Instant,
 };
 
@@ -23,7 +28,8 @@ use crate::{
     manifest::stream::{
         CloudflareQueuesStreamConfig, CloudflareQueuesStreamQueueConfig, RabbitMQStreamConfig,
         RabbitMQStreamQueueConfig, RedisStreamConfig, RedisStreamStreamConfig,
-        SNSStreamTopicConfig, StreamEvent, StreamsConfig, WebhookStreamConfig,
+        SNSStreamTopicConfig, StreamDeliveryGuarantee, StreamDeliveryMode, StreamEvent,
+        StreamsConfig, WebhookStreamConfig,
     },
     metrics::streams::{self as stream_metrics, stream_type},
     streams::{
@@ -80,6 +86,9 @@ pub enum StreamError {
 
     #[error("Task failed: {0}")]
     JoinError(JoinError),
+
+    #[error("Required delivery must be recorded with its PostgreSQL source transaction; use no-code contract-event indexing with raw event storage")]
+    RequiredDeliveryContext,
 }
 
 #[derive(Debug, Clone)]
@@ -128,6 +137,10 @@ pub(crate) struct BufferKey {
 
 #[derive(Debug)]
 pub struct StreamsClients {
+    delivery_guarantee: StreamDeliveryGuarantee,
+    delivery_source: OnceLock<Result<DeliverySource, String>>,
+    delivery_workers:
+        StdMutex<HashMap<String, (tokio_util::sync::CancellationToken, tokio::task::AbortHandle)>>,
     sns: Option<SNSStream>,
     webhook: Option<WebhookStream>,
     rabbitmq: Option<RabbitMQStream>,
@@ -229,6 +242,9 @@ impl StreamsClients {
         };
 
         Self {
+            delivery_guarantee: stream_config.delivery_guarantee.unwrap_or_default(),
+            delivery_source: OnceLock::new(),
+            delivery_workers: StdMutex::new(HashMap::new()),
             sns,
             webhook,
             rabbitmq,
@@ -266,6 +282,9 @@ impl StreamsClients {
     #[cfg(test)]
     pub(crate) fn empty_for_test() -> Self {
         Self {
+            delivery_guarantee: StreamDeliveryGuarantee::BestEffort,
+            delivery_source: OnceLock::new(),
+            delivery_workers: StdMutex::new(HashMap::new()),
             sns: None,
             webhook: None,
             rabbitmq: None,
@@ -867,6 +886,9 @@ impl StreamsClients {
         is_trace_event: bool,
         force_send_network_wide: bool,
     ) -> Result<usize, StreamError> {
+        if self.requires_durable_delivery() {
+            return Err(StreamError::RequiredDeliveryContext);
+        }
         if !self.has_any_streams() {
             return Ok(0);
         }
@@ -876,179 +898,31 @@ impl StreamsClients {
             let chunks = Arc::new(self.chunk_data(data_array));
             let mut streams: Vec<StreamPublishes> = Vec::new();
 
-            if let Some(sns) = &self.sns {
-                for (idx, config) in sns.config.iter().enumerate() {
-                    if Self::should_send_for_config(
-                        &config.events,
-                        &event_message.event_name,
-                        is_trace_event,
+            for destination in
+                self.matched_destinations(event_message, is_trace_event, force_send_network_wide)
+            {
+                let label = stream_type::ALL
+                    .iter()
+                    .copied()
+                    .find(|label| *label == destination.stream_type)
+                    .expect("matched destination uses a registered stream type");
+                if destination.finalized
+                    && Self::should_buffer(
+                        Some(&StreamDeliveryMode::Finalized),
+                        event_message,
                         force_send_network_wide,
-                    ) && config.networks.contains(&event_message.network)
-                    {
-                        if Self::should_buffer(
-                            config.delivery.as_ref(),
-                            event_message,
-                            force_send_network_wide,
-                        ) {
-                            self.buffer_event(stream_type::SNS, idx, event_message).await;
-                            continue;
-                        }
-                        streams.push(self.sns_stream_tasks(
-                            config,
-                            Arc::clone(&sns.client),
-                            &id,
-                            event_message,
-                            Arc::clone(&chunks),
-                            force_send_network_wide,
-                        ));
-                    }
-                }
-            };
-
-            if let Some(webhook) = &self.webhook {
-                for (idx, config) in webhook.config.iter().enumerate() {
-                    if Self::should_send_for_config(
-                        &config.events,
-                        &event_message.event_name,
-                        is_trace_event,
+                    )
+                {
+                    self.buffer_event(label, destination.config_index, event_message).await;
+                } else {
+                    streams.push(self.destination_tasks(
+                        label,
+                        destination.config_index,
+                        &id,
+                        event_message,
+                        chunks.clone(),
                         force_send_network_wide,
-                    ) && config.networks.contains(&event_message.network)
-                    {
-                        if Self::should_buffer(
-                            config.delivery.as_ref(),
-                            event_message,
-                            force_send_network_wide,
-                        ) {
-                            self.buffer_event(stream_type::WEBHOOK, idx, event_message).await;
-                            continue;
-                        }
-                        streams.push(self.webhook_stream_tasks(
-                            config,
-                            Arc::clone(&webhook.client),
-                            &id,
-                            event_message,
-                            Arc::clone(&chunks),
-                            force_send_network_wide,
-                        ));
-                    }
-                }
-            }
-
-            if let Some(rabbitmq) = &self.rabbitmq {
-                for (idx, config) in rabbitmq.config.exchanges.iter().enumerate() {
-                    if Self::should_send_for_config(
-                        &config.events,
-                        &event_message.event_name,
-                        is_trace_event,
-                        force_send_network_wide,
-                    ) && config.networks.contains(&event_message.network)
-                    {
-                        if Self::should_buffer(
-                            config.delivery.as_ref(),
-                            event_message,
-                            force_send_network_wide,
-                        ) {
-                            self.buffer_event(stream_type::RABBITMQ, idx, event_message).await;
-                            continue;
-                        }
-                        streams.push(self.rabbitmq_stream_tasks(
-                            config,
-                            Arc::clone(&rabbitmq.client),
-                            &id,
-                            event_message,
-                            Arc::clone(&chunks),
-                            force_send_network_wide,
-                        ));
-                    }
-                }
-            }
-
-            #[cfg(feature = "kafka")]
-            if let Some(kafka) = &self.kafka {
-                for (idx, config) in kafka.config.topics.iter().enumerate() {
-                    if Self::should_send_for_config(
-                        &config.events,
-                        &event_message.event_name,
-                        is_trace_event,
-                        force_send_network_wide,
-                    ) && config.networks.contains(&event_message.network)
-                    {
-                        if Self::should_buffer(
-                            config.delivery.as_ref(),
-                            event_message,
-                            force_send_network_wide,
-                        ) {
-                            self.buffer_event(stream_type::KAFKA, idx, event_message).await;
-                            continue;
-                        }
-                        streams.push(self.kafka_stream_tasks(
-                            config,
-                            Arc::clone(&kafka.client),
-                            &id,
-                            event_message,
-                            Arc::clone(&chunks),
-                            force_send_network_wide,
-                        ));
-                    }
-                }
-            }
-
-            if let Some(redis) = &self.redis {
-                for (idx, config) in redis.config.streams.iter().enumerate() {
-                    if Self::should_send_for_config(
-                        &config.events,
-                        &event_message.event_name,
-                        is_trace_event,
-                        force_send_network_wide,
-                    ) && config.networks.contains(&event_message.network)
-                    {
-                        if Self::should_buffer(
-                            config.delivery.as_ref(),
-                            event_message,
-                            force_send_network_wide,
-                        ) {
-                            self.buffer_event(stream_type::REDIS, idx, event_message).await;
-                            continue;
-                        }
-                        streams.push(self.redis_stream_tasks(
-                            config,
-                            Arc::clone(&redis.client),
-                            &id,
-                            event_message,
-                            Arc::clone(&chunks),
-                            force_send_network_wide,
-                        ));
-                    }
-                }
-            }
-
-            if let Some(cloudflare_queues) = &self.cloudflare_queues {
-                for (idx, config) in cloudflare_queues.config.queues.iter().enumerate() {
-                    if Self::should_send_for_config(
-                        &config.events,
-                        &event_message.event_name,
-                        is_trace_event,
-                        force_send_network_wide,
-                    ) && config.networks.contains(&event_message.network)
-                    {
-                        if Self::should_buffer(
-                            config.delivery.as_ref(),
-                            event_message,
-                            force_send_network_wide,
-                        ) {
-                            self.buffer_event(stream_type::CLOUDFLARE_QUEUES, idx, event_message)
-                                .await;
-                            continue;
-                        }
-                        streams.push(self.cloudflare_queues_stream_tasks(
-                            config,
-                            Arc::clone(&cloudflare_queues.client),
-                            &id,
-                            event_message,
-                            Arc::clone(&chunks),
-                            force_send_network_wide,
-                        ));
-                    }
+                    ));
                 }
             }
 
@@ -1083,6 +957,43 @@ impl StreamsClients {
             Ok(streamed_total)
         } else {
             unreachable!("Event data should be an array");
+        }
+    }
+
+    pub(crate) fn reorg_message(
+        network: &str,
+        fork_block: u64,
+        depth: u64,
+        events_deleted: u64,
+        affected_tx_hashes: &[B256],
+        affected_tables: &[AffectedTable],
+    ) -> EventMessage {
+        let reorg_payload = json!({
+            "type": "reorg",
+            "network": network,
+            "fork_block": fork_block,
+            "depth": depth,
+            "events_deleted": events_deleted,
+            "affected_tx_hashes": affected_tx_hashes.iter().map(|h| format!("{:#x}", h)).collect::<Vec<_>>(),
+            "affected_events": affected_tables.iter().map(|t| json!({
+                "indexer": t.indexer_name,
+                "contract": t.contract_name,
+                "event": t.event_name,
+                "schema": t.schema,
+                "table": t.table_name,
+                "rows_deleted": t.rows_deleted,
+            })).collect::<Vec<_>>(),
+        });
+
+        EventMessage {
+            event_name: "__rindexer_reorg".to_string(),
+            event_data: Value::Array(vec![reorg_payload]),
+            event_signature_hash: B256::ZERO,
+            network: network.to_string(),
+            // Synthetic reorg notifications are never buffered for finalized
+            // delivery — `should_buffer` treats `block_number == 0` as a
+            // sentinel for "always dispatch immediately".
+            block_number: 0,
         }
     }
 
@@ -1131,33 +1042,14 @@ impl StreamsClients {
             return Ok(0);
         }
 
-        let reorg_payload = json!({
-            "type": "reorg",
-            "network": network,
-            "fork_block": fork_block,
-            "depth": depth,
-            "events_deleted": events_deleted,
-            "affected_tx_hashes": affected_tx_hashes.iter().map(|h| format!("{:#x}", h)).collect::<Vec<_>>(),
-            "affected_events": affected_tables.iter().map(|t| json!({
-                "indexer": t.indexer_name,
-                "contract": t.contract_name,
-                "event": t.event_name,
-                "schema": t.schema,
-                "table": t.table_name,
-                "rows_deleted": t.rows_deleted,
-            })).collect::<Vec<_>>(),
-        });
-
-        let event_message = EventMessage {
-            event_name: "__rindexer_reorg".to_string(),
-            event_data: Value::Array(vec![reorg_payload]),
-            event_signature_hash: B256::ZERO,
-            network: network.to_string(),
-            // Synthetic reorg notifications are never buffered for finalized
-            // delivery — `should_buffer` treats `block_number == 0` as a
-            // sentinel for "always dispatch immediately".
-            block_number: 0,
-        };
+        let event_message = Self::reorg_message(
+            network,
+            fork_block,
+            depth,
+            events_deleted,
+            affected_tx_hashes,
+            affected_tables,
+        );
 
         self.stream_with_mode(
             format!("reorg_{}_{}", network, fork_block),
@@ -1259,6 +1151,92 @@ impl StreamsClients {
         Self::refresh_depth_gauge_under_lock(&map, network);
     }
 
+    /// Both legacy sends and durable obligations use the same publisher adapter.
+    fn destination_tasks(
+        &self,
+        stream_type: &str,
+        config_index: usize,
+        id: &str,
+        event_message: &EventMessage,
+        chunks: Arc<Vec<Vec<Value>>>,
+        force_send_network_wide: bool,
+    ) -> StreamPublishes {
+        match stream_type {
+            stream_type::SNS => {
+                let sns = self.sns.as_ref().expect("sns buffer without sns config");
+                self.sns_stream_tasks(
+                    &sns.config[config_index],
+                    Arc::clone(&sns.client),
+                    id,
+                    event_message,
+                    chunks,
+                    force_send_network_wide,
+                )
+            }
+            stream_type::WEBHOOK => {
+                let webhook = self.webhook.as_ref().expect("webhook buffer without webhook config");
+                self.webhook_stream_tasks(
+                    &webhook.config[config_index],
+                    Arc::clone(&webhook.client),
+                    id,
+                    event_message,
+                    chunks,
+                    force_send_network_wide,
+                )
+            }
+            stream_type::RABBITMQ => {
+                let rabbitmq =
+                    self.rabbitmq.as_ref().expect("rabbitmq buffer without rabbitmq config");
+                self.rabbitmq_stream_tasks(
+                    &rabbitmq.config.exchanges[config_index],
+                    Arc::clone(&rabbitmq.client),
+                    id,
+                    event_message,
+                    chunks,
+                    force_send_network_wide,
+                )
+            }
+            #[cfg(feature = "kafka")]
+            stream_type::KAFKA => {
+                let kafka = self.kafka.as_ref().expect("kafka buffer without kafka config");
+                self.kafka_stream_tasks(
+                    &kafka.config.topics[config_index],
+                    Arc::clone(&kafka.client),
+                    id,
+                    event_message,
+                    chunks,
+                    force_send_network_wide,
+                )
+            }
+            stream_type::REDIS => {
+                let redis = self.redis.as_ref().expect("redis buffer without redis config");
+                self.redis_stream_tasks(
+                    &redis.config.streams[config_index],
+                    Arc::clone(&redis.client),
+                    id,
+                    event_message,
+                    chunks,
+                    force_send_network_wide,
+                )
+            }
+            stream_type::CLOUDFLARE_QUEUES => {
+                let cf = self
+                    .cloudflare_queues
+                    .as_ref()
+                    .expect("cloudflare_queues buffer without cloudflare_queues config");
+                self.cloudflare_queues_stream_tasks(
+                    &cf.config.queues[config_index],
+                    Arc::clone(&cf.client),
+                    id,
+                    event_message,
+                    chunks,
+                    force_send_network_wide,
+                )
+            }
+            other => unreachable!("unknown stream_type in BufferKey: {other}"),
+        }
+    }
+
     /// Re-publish a block's worth of previously-buffered events through the
     /// stream-type-specific `*_stream_tasks` helper. Does NOT re-enter
     /// `stream_with_mode` — that would re-buffer indefinitely.
@@ -1288,81 +1266,14 @@ impl StreamsClients {
                 key.stream_type, key.config_index, key.network, block_number
             );
 
-            let tasks: StreamPublishes = match key.stream_type {
-                stream_type::SNS => {
-                    let sns = self.sns.as_ref().expect("sns buffer without sns config");
-                    self.sns_stream_tasks(
-                        &sns.config[key.config_index],
-                        Arc::clone(&sns.client),
-                        &id,
-                        &event_message,
-                        chunks,
-                        false,
-                    )
-                }
-                stream_type::WEBHOOK => {
-                    let webhook =
-                        self.webhook.as_ref().expect("webhook buffer without webhook config");
-                    self.webhook_stream_tasks(
-                        &webhook.config[key.config_index],
-                        Arc::clone(&webhook.client),
-                        &id,
-                        &event_message,
-                        chunks,
-                        false,
-                    )
-                }
-                stream_type::RABBITMQ => {
-                    let rabbitmq =
-                        self.rabbitmq.as_ref().expect("rabbitmq buffer without rabbitmq config");
-                    self.rabbitmq_stream_tasks(
-                        &rabbitmq.config.exchanges[key.config_index],
-                        Arc::clone(&rabbitmq.client),
-                        &id,
-                        &event_message,
-                        chunks,
-                        false,
-                    )
-                }
-                #[cfg(feature = "kafka")]
-                stream_type::KAFKA => {
-                    let kafka = self.kafka.as_ref().expect("kafka buffer without kafka config");
-                    self.kafka_stream_tasks(
-                        &kafka.config.topics[key.config_index],
-                        Arc::clone(&kafka.client),
-                        &id,
-                        &event_message,
-                        chunks,
-                        false,
-                    )
-                }
-                stream_type::REDIS => {
-                    let redis = self.redis.as_ref().expect("redis buffer without redis config");
-                    self.redis_stream_tasks(
-                        &redis.config.streams[key.config_index],
-                        Arc::clone(&redis.client),
-                        &id,
-                        &event_message,
-                        chunks,
-                        false,
-                    )
-                }
-                stream_type::CLOUDFLARE_QUEUES => {
-                    let cf = self
-                        .cloudflare_queues
-                        .as_ref()
-                        .expect("cloudflare_queues buffer without cloudflare_queues config");
-                    self.cloudflare_queues_stream_tasks(
-                        &cf.config.queues[key.config_index],
-                        Arc::clone(&cf.client),
-                        &id,
-                        &event_message,
-                        chunks,
-                        false,
-                    )
-                }
-                other => unreachable!("unknown stream_type in BufferKey: {other}"),
-            };
+            let tasks = self.destination_tasks(
+                key.stream_type,
+                key.config_index,
+                &id,
+                &event_message,
+                chunks,
+                false,
+            );
             all_tasks.extend(tasks);
         }
 
@@ -1478,6 +1389,9 @@ mod tests {
 
     fn empty_clients() -> StreamsClients {
         StreamsClients {
+            delivery_guarantee: StreamDeliveryGuarantee::BestEffort,
+            delivery_source: OnceLock::new(),
+            delivery_workers: StdMutex::new(HashMap::new()),
             sns: None,
             webhook: None,
             rabbitmq: None,
@@ -1492,6 +1406,9 @@ mod tests {
 
     fn webhook_clients(config: Vec<WebhookStreamConfig>) -> StreamsClients {
         StreamsClients {
+            delivery_guarantee: StreamDeliveryGuarantee::BestEffort,
+            delivery_source: OnceLock::new(),
+            delivery_workers: StdMutex::new(HashMap::new()),
             sns: None,
             webhook: Some(WebhookStream { config, client: Arc::new(Webhook::new()) }),
             rabbitmq: None,
@@ -1514,6 +1431,9 @@ mod tests {
             queues,
         };
         StreamsClients {
+            delivery_guarantee: StreamDeliveryGuarantee::BestEffort,
+            delivery_source: OnceLock::new(),
+            delivery_workers: StdMutex::new(HashMap::new()),
             sns: None,
             webhook: None,
             rabbitmq: None,

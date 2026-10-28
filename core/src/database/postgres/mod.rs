@@ -8,3 +8,5 @@ pub mod relationship;
 pub mod schema_sync;
 pub mod setup;
 pub mod write_mode;
+
+pub(crate) mod stream_outbox;

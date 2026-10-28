@@ -219,7 +219,10 @@ impl ReorgCoordinator {
             self.streams_clients.iter().map(Arc::clone).collect();
         let network = self.network.clone();
         let futures = snapshot.into_iter().filter_map(|clients_arc| {
-            clients_arc.as_ref().as_ref()?;
+            let client = clients_arc.as_ref().as_ref()?;
+            if client.requires_durable_delivery() {
+                return None;
+            }
             let network = network.clone();
             Some(async move {
                 let clients = clients_arc.as_ref().as_ref().expect("filter_map above ensures Some");
@@ -478,12 +481,13 @@ impl ReorgCoordinator {
             }
             let reorg_task = self.pending_recovery.tasks.front().expect("pending recovery");
             let result = reorg_task
-                .execute_with_rollback_plan(
+                .execute_with_deliveries(
                     &mut self.window,
                     ctx.postgres,
                     ctx.clickhouse,
                     self.provider.as_ref(),
                     &self.rollback_plan,
+                    &self.streams_clients,
                 )
                 .await?;
             // No await separates commit, invalidation and removal of the request.

@@ -1587,6 +1587,27 @@ impl ReorgTask {
         provider: Option<&Arc<dyn ChainProvider>>,
         rollback_plan: &DerivedTableRollbackPlan,
     ) -> anyhow::Result<ReorgTaskResult> {
+        self.execute_with_deliveries(window, postgres, clickhouse, provider, rollback_plan, &[])
+            .await
+    }
+
+    pub(super) async fn execute_with_deliveries(
+        &self,
+        window: &mut BlockChainWindow,
+        postgres: Option<&PostgresClient>,
+        clickhouse: Option<&Arc<ClickhouseClient>>,
+        provider: Option<&Arc<dyn ChainProvider>>,
+        rollback_plan: &DerivedTableRollbackPlan,
+        deliveries: &[Arc<Option<crate::streams::StreamsClients>>],
+    ) -> anyhow::Result<ReorgTaskResult> {
+        anyhow::ensure!(
+            postgres.is_some()
+                || !deliveries
+                    .iter()
+                    .filter_map(|client| client.as_ref().as_ref())
+                    .any(|client| client.requires_durable_delivery()),
+            "Cannot recover required stream delivery without PostgreSQL"
+        );
         // Validate network before any SQL interpolation
         super::validate_sql_value(&self.network, "reorg task network")?;
 
@@ -1652,6 +1673,24 @@ impl ReorgTask {
             None => None,
         };
         let pg = pg_transaction.as_ref();
+
+        // Build the per-table summary for downstream stream consumers. Only
+        // source event tables that were rolled back appear here — derived
+        // tables are intentionally excluded.
+        let affected_tables: Vec<AffectedTable> = self
+            .event_tables
+            .iter()
+            .map(|t| AffectedTable {
+                schema: t.schema.clone(),
+                table_name: t.table_name.clone(),
+                // TODO(future): per-table counts from DB layer; total is on
+                // `events_deleted`.
+                rows_deleted: 0,
+                indexer_name: t.indexer_name.clone(),
+                contract_name: t.contract_name.clone(),
+                event_name: t.event_name.clone(),
+            })
+            .collect();
 
         let reversal_snapshots = self.snapshot_for_reversal(pg, clickhouse, rollback_plan).await?;
 
@@ -1770,6 +1809,19 @@ impl ReorgTask {
                 }
             }
 
+            if let Some(pg)=pg {
+                let mut routes=Vec::new();
+                for client in deliveries.iter().filter_map(|client|client.as_ref().as_ref()).filter(|client|client.requires_durable_delivery()) {
+                    for destination in client.network_destinations(&self.network) {
+                        let route=(client.delivery_source()?.clone(),destination);
+                        if !routes.contains(&route) { routes.push(route); }
+                    }
+                }
+                let hashes=affected_tx_hashes.iter().filter_map(|hash|hash.parse::<B256>().ok()).collect::<Vec<_>>();
+                let message=crate::streams::StreamsClients::reorg_message(&self.network,self.fork_point,self.detection_point.saturating_sub(self.fork_point)+1,total_deleted,&hashes,&affected_tables);
+                let tables=self.event_tables.iter().map(|table|table.full_name.clone()).collect::<Vec<_>>();
+                crate::database::postgres::stream_outbox::rollback(pg,&self.network,self.fork_point,&canonical,&tables,routes,&message).await?;
+            }
             Ok((total_deleted, affected_tx_hashes))
         }
         .await;
@@ -1808,24 +1860,6 @@ impl ReorgTask {
             duration_secs = duration,
             "Reorg task completed"
         );
-
-        // Build the per-table summary for downstream stream consumers. Only
-        // source event tables that were rolled back appear here — derived
-        // tables are intentionally excluded.
-        let affected_tables: Vec<AffectedTable> = self
-            .event_tables
-            .iter()
-            .map(|t| AffectedTable {
-                schema: t.schema.clone(),
-                table_name: t.table_name.clone(),
-                // TODO(future): per-table counts from DB layer; total is on
-                // `events_deleted`.
-                rows_deleted: 0,
-                indexer_name: t.indexer_name.clone(),
-                contract_name: t.contract_name.clone(),
-                event_name: t.event_name.clone(),
-            })
-            .collect();
 
         Ok(ReorgTaskResult {
             events_deleted: total_deleted,

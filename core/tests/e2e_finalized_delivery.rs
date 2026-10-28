@@ -32,6 +32,7 @@ fn webhook_config(endpoint: &str, delivery: Option<StreamDeliveryMode>) -> Webho
 
 async fn streams_clients_for(webhooks: Vec<WebhookStreamConfig>) -> StreamsClients {
     let config = StreamsConfig {
+        delivery_guarantee: None,
         sns: None,
         webhooks: Some(webhooks),
         rabbitmq: None,

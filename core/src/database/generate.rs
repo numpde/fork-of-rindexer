@@ -412,6 +412,7 @@ pub fn generate_tables_for_indexer_sql(
     sql.push_str(&generate_reorg_block_hashes_table_sql());
     sql.push_str(&generate_derived_op_log_table_sql());
     sql.push_str(crate::database::postgres::event_applications::schema_sql());
+    sql.push_str(crate::database::postgres::stream_outbox::SCHEMA_SQL);
 
     for contract in &indexer.contracts {
         let contract_name = contract.before_modify_name_if_filter_readonly();
@@ -602,6 +603,11 @@ pub fn drop_tables_for_indexer_sql(project_path: &Path, indexer: &Indexer) -> Co
     // reset so namespace cleanup is valid for both old and new databases.
     let mut sql = "CREATE SCHEMA IF NOT EXISTS rindexer_internal;".to_string();
     sql.push_str(crate::database::postgres::event_applications::schema_sql());
+    sql.push_str(crate::database::postgres::stream_outbox::SCHEMA_SQL);
+    sql.push_str(&format!("DO $required_delivery$ BEGIN
+        IF EXISTS (SELECT 1 FROM rindexer_internal.stream_outbox WHERE source_indexer='{}' AND acknowledged_at IS NULL AND NOT invalidated) THEN
+            RAISE EXCEPTION 'Cannot reset indexer data while required stream deliveries are pending; restore and drain or explicitly review the retained outbox before resetting';
+        END IF; END $required_delivery$;", indexer.name.replace('\'', "''")));
     sql.push_str(&format!(
         "DROP TABLE IF EXISTS rindexer_internal.{}_last_known_indexes_dropping_sql CASCADE;",
         camel_to_snake(&indexer.name)

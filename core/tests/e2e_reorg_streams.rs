@@ -120,6 +120,7 @@ async fn stream_reorg_reaches_redis() {
     };
 
     let clients = StreamsClients::new(StreamsConfig {
+        delivery_guarantee: None,
         sns: None,
         webhooks: None,
         rabbitmq: None,
@@ -253,6 +254,7 @@ async fn stream_reorg_reaches_rabbitmq() {
     };
 
     let clients = StreamsClients::new(StreamsConfig {
+        delivery_guarantee: None,
         sns: None,
         webhooks: None,
         rabbitmq: Some(rabbit_config),
@@ -355,6 +357,7 @@ async fn stream_reorg_reaches_kafka() {
     };
 
     let clients = StreamsClients::new(StreamsConfig {
+        delivery_guarantee: None,
         sns: None,
         webhooks: None,
         rabbitmq: None,
@@ -438,6 +441,7 @@ async fn stream_reorg_reaches_cloudflare_queues() {
 
     // Construct via public API so we exercise the full `StreamsClients::new` path.
     let mut clients = StreamsClients::new(StreamsConfig {
+        delivery_guarantee: None,
         sns: None,
         webhooks: None,
         rabbitmq: None,

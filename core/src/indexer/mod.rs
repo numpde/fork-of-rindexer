@@ -33,3 +33,5 @@ pub struct Indexer {
 
     pub native_transfers: NativeTransfers,
 }
+
+mod required_delivery;

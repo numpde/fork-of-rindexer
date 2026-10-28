@@ -431,6 +431,7 @@ async fn apply_postgres_events(
     raw_rows: &[Vec<EthereumSqlTypeWrapper>],
     table_events: &[(Vec<LogParam>, String, TxMetadata)],
     cursor: Option<&BulkCursorUpdate>,
+    messages: &[(u64, Value)],
 ) -> CallbackExecutionResult<usize> {
     if !is_running() {
         return Err("Shutdown requested".into());
@@ -492,6 +493,14 @@ async fn apply_postgres_events(
         return Err("Shutdown requested".into());
     }
     let staged: Result<Option<CursorAdvance>, String> = async {
+        if let Some(clients) = params.streams_clients.as_ref().as_ref().filter(|clients| clients.requires_durable_delivery()) {
+            for (index,application) in applications.iter().enumerate().filter(|(index,_)| new_events[*index]) {
+                let (_,data)=messages.get(index).ok_or_else(||"Cannot record required delivery: source event payload is missing".to_string())?;
+                let message=EventMessage {event_name:params.event_info.name.clone(),event_signature_hash:params.event.selector(),network:application.tx_information.network.clone(),block_number:application.tx_information.block_number,event_data:Value::Array(vec![data.clone()])};
+                clients.enqueue_required_event(&transaction,&params.sql_event_table_name,&application.tx_information,&message).await.map_err(|error|format!("Cannot record required stream delivery in the source transaction: {error:#}"))?;
+            }
+        }
+
         apply_table_operations(&prepared, Some(PgWriteMode::Tx(&transaction)), None, None)
             .await
             .inspect_err(|error| log_table_failure(params, error))?;
@@ -551,10 +560,34 @@ async fn apply_postgres_events(
 }
 
 fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
+    let binding_error = params
+        .streams_clients
+        .as_ref()
+        .as_ref()
+        .filter(|clients| clients.requires_durable_delivery())
+        .and_then(|clients| {
+            clients
+                .bind_delivery_source(
+                    crate::database::postgres::stream_outbox::DeliverySource {
+                        indexer: params.indexer_name.clone(),
+                        contract: params.contract_name.clone(),
+                    },
+                    params.postgres.is_some()
+                        && params.clickhouse.is_none()
+                        && params.csv.is_none()
+                        && params.store_raw_events,
+                )
+                .err()
+        });
     let shared_callback = Arc::new(move |results| {
         let params = Arc::clone(&params);
+        let binding_error = binding_error.clone();
 
         async move {
+            if let Some(error)=binding_error { return Err(CallbackError::Permanent(error)); }
+            if matches!(&results, CallbackResult::Trace(_)) && params.streams_clients.as_ref().as_ref().is_some_and(StreamsClients::requires_durable_delivery) {
+                return Err(CallbackError::Permanent("Required stream delivery currently supports no-code contract events; native-transfer/Rust callbacks are unsupported".to_string()));
+            }
             let event_length = match &results {
                 CallbackResult::Event(event) => event.len(),
                 CallbackResult::Trace(event) => event.len(),
@@ -777,11 +810,10 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
                 && params.postgres.is_some()
                 && params.clickhouse.is_none()
                 && params.csv.is_none()
-                // streams/chat dispatch AFTER the storage write — with the
-                // cursor already committed, a crash in that window would skip
-                // their messages on restart (at-most-once). Legacy keeps them
-                // at-least-once: a crash re-fetches and re-dispatches.
-                && params.streams_clients.is_none()
+                // Required stream obligations already share this transaction.
+                // Best-effort streams and chat still dispatch afterward, so their
+                // whole-callback cursor must remain outside the storage commit.
+                && (params.streams_clients.is_none() || params.streams_clients.as_ref().as_ref().is_some_and(StreamsClients::requires_durable_delivery))
                 && params.chat_clients.is_none()
                 // factory discovery events: child-address bookkeeping persists
                 // AFTER the callback — atomic cursor would make a crash there
@@ -803,7 +835,7 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
                         }
                     });
                     Some(apply_postgres_events(postgres, &params, &applications, &sql_bulk_data,
-                        &table_events_data, cursor.as_ref()).await?)
+                        &table_events_data, cursor.as_ref(), &event_message_data).await?)
                 }
                 _ => None,
             };
@@ -853,7 +885,7 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
                 events_by_block.entry(blk).or_default().push(ev);
             }
 
-            if let Some(streams_clients) = params.streams_clients.as_ref() {
+            if let Some(streams_clients) = params.streams_clients.as_ref().as_ref().filter(|clients|!clients.requires_durable_delivery()) {
                 let is_trace_event = match results {
                     CallbackResult::Event(_) => false,
                     CallbackResult::Trace(_) => true,

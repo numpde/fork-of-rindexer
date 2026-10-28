@@ -24,3 +24,89 @@ Supported stream providers:
 - [SNS/SQS](/docs/start-building/streams/sns) - Find out more about [Simple Notification Service](https://aws.amazon.com/sns/) and [Simple Queue Service](https://aws.amazon.com/sqs/)
 - [Redis Streams](/docs/start-building/streams/redis) - Find out more about [Redis Streams](https://redis.io/docs/latest/develop/data-types/streams/)
 - [Cloudflare Queues](/docs/start-building/streams/cloudflare-queues) - Find out more about [Cloudflare Queues](https://developers.cloudflare.com/queues/)
+
+## Delivery guarantees
+
+`streams.delivery_guarantee` is optional. Its default, `best_effort`, retains the
+existing behavior: publisher retries are bounded, exhausted failures can be dropped,
+and `delivery: finalized` buffers are in memory. A completed indexing checkpoint
+alone does not establish external delivery in that mode.
+
+For required delivery, add this to an existing no-code contract entry:
+
+```yaml
+streams:
+  delivery_guarantee: at_least_once
+  webhooks:
+    - endpoint: https://example.com/indexer-events
+      shared_secret: ${WEBHOOK_SECRET}
+      networks: [ethereum]
+      events:
+        - event_name: Transfer
+      delivery: finalized # or instant; instant is the destination default
+```
+
+Required delivery supports PostgreSQL-only contract-event indexing with raw event
+storage and application receipts. Enable `reorg_handling.enabled: true` on each
+participating network. Startup rejects unsupported source/storage configurations;
+native-transfer and custom Rust callbacks cannot use this mode. Chat delivery is
+outside this stream guarantee. Existing best-effort configurations remain valid.
+
+Each newly applied event records its per-destination obligations in
+`rindexer_internal.stream_outbox` in the same transaction as its raw row, derived
+effects, application receipt and eligible cursor update. An enqueue failure aborts
+that transaction. A committed checkpoint establishes a durable obligation; it does
+not mean the destination has acknowledged the message. Workers retry while the
+indexer runs, including after restart with no new chain events. Keep a running
+indexer to drain pending work; stopping the process preserves pending records.
+
+Immediate jobs are eligible after commit. Finalized jobs remain in PostgreSQL
+until the validated persisted head reaches the source block plus its configured
+safe distance. Pending records use the current distance, including changes that
+tighten or relax it. They survive a stopped indexing generation. Recovery cancels
+old attempts, retires orphaned source records and commits durable
+`__rindexer_reorg` notifications with storage rollback. Required notifications
+bypass event-name filters and are prioritized before replacement delivery.
+Failure to enqueue a retraction aborts the rollback for retry.
+
+Delivery is **at least once**. A destination may accept a message before its
+acknowledgment is lost. Deduplicate using `x-rindexer-id` (or the corresponding
+publisher message ID), which remains stable for that committed delivery record
+across retries and restart. Process reorg notifications idempotently as well.
+A fresh canonical application after rollback receives new delivery IDs. This is
+not an exactly-once guarantee for external effects. Remote acceptance cannot be
+undone by cancellation: an in-flight message may arrive after a retraction.
+Reconcile from the reported fork and verify source block identity instead of
+using arrival order as canonical-chain evidence.
+
+Routing must remain compatible while pending obligations or recoverable delivered
+records reference it. Startup refuses silent retargeting, removal or downgrade to
+best effort. Restore the original project/contract names and destination settings
+to drain existing work before changing them. Authentication credentials can rotate
+without changing the destination. Acknowledged payloads are cleared; completed or
+invalidated records below the oldest retained recovery block are pruned. Pending
+canonical obligations are never pruned automatically.
+
+Monitor pending work independently of indexing progress, for example:
+
+```sql
+SELECT source_indexer, source_contract, network, count(*) AS pending
+FROM rindexer_internal.stream_outbox
+WHERE acknowledged_at IS NULL AND NOT invalidated
+GROUP BY source_indexer, source_contract, network;
+```
+
+Publisher retry-exhaustion logs/metrics describe a failed attempt group; required
+outbox records remain pending for later attempts. Explicit indexer resets refuse
+to erase data with pending required deliveries. Review downstream state before a
+coordinated rebuild. Enabling this option does not recreate messages already lost
+behind existing application receipts and cursors; repair those through verified
+replay rather than deleting receipts alone.
+
+Required delivery currently permits one publish attempt in flight across the
+process, with a 30-second attempt deadline. Failed destinations receive a retry
+delay so another healthy destination can continue; later records for the failed
+destination remain behind its unacknowledged predecessor. This bounds publisher
+and PostgreSQL connection use; measure backlog growth for high-volume subscriptions. The existing
+single-writer, stop-before-start deployment requirement still applies: the outbox
+does not add distributed fencing for indexing or recovery.

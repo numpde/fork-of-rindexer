@@ -1,5 +1,6 @@
 //! Required delivery must survive a stopped generation without replaying applied effects.
 use super::*;
+use crate::event::callback_registry::EventCallbackType;
 use crate::{
     blockclock::BlockClock,
     event::{
@@ -19,6 +20,7 @@ use axum::{
     routing::post,
     Json, Router,
 };
+use serde_json::Value;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Mutex as StdMutex, Weak,
@@ -29,6 +31,9 @@ use tokio_util::sync::CancellationToken;
 struct EndpointState {
     failing: AtomicBool,
     attempts: StdMutex<Vec<(String, bool)>>,
+    messages: StdMutex<Vec<Value>>,
+    hanging: AtomicBool,
+    release: tokio::sync::Notify,
 }
 struct Endpoint {
     url: String,
@@ -47,7 +52,7 @@ impl Endpoint {
                 post(
                     |State(state): State<Arc<EndpointState>>,
                      headers: HeaderMap,
-                     Json(_): Json<serde_json::Value>| async move {
+                     Json(message): Json<serde_json::Value>| async move {
                         let failed = state.failing.load(Ordering::SeqCst);
                         let id = headers
                             .get(crate::streams::STREAM_MESSAGE_ID_KEY)
@@ -55,7 +60,11 @@ impl Endpoint {
                             .to_str()
                             .unwrap()
                             .to_string();
+                        state.messages.lock().unwrap().push(message);
                         state.attempts.lock().unwrap().push((id, !failed));
+                        if state.hanging.load(Ordering::SeqCst) {
+                            state.release.notified().await;
+                        }
                         if failed {
                             StatusCode::SERVICE_UNAVAILABLE
                         } else {
@@ -84,11 +93,14 @@ struct Running {
     clients: Weak<Option<crate::streams::StreamsClients>>,
 }
 impl Running {
-    async fn stop(self) {
+    async fn stop_tasks(&mut self) {
         self.cancel.cancel();
-        for handle in self.handles {
+        for handle in self.handles.drain(..) {
             tokio::time::timeout(Duration::from_secs(3), handle).await.unwrap().unwrap().unwrap();
         }
+    }
+    async fn stop(mut self) {
+        self.stop_tasks().await;
         drop(self.coordinators);
         tokio::time::timeout(Duration::from_secs(3), async {
             while self.clients.upgrade().is_some() {
@@ -110,6 +122,28 @@ async fn start_with_delivery(
     delivery: &str,
     head: u64,
 ) -> Running {
+    try_start(
+        fixture,
+        endpoint,
+        delivery,
+        Chain { head, hash: B256::repeat_byte(100), value: Some(10) },
+    )
+    .await
+    .unwrap()
+}
+
+struct Chain {
+    head: u64,
+    hash: B256,
+    value: Option<u64>,
+}
+async fn try_start(
+    fixture: &Fixture,
+    endpoint: &Endpoint,
+    delivery: &str,
+    chain: Chain,
+) -> Result<Running, crate::indexer::start::StartIndexingError> {
+    let Chain { head, hash, value } = chain;
     let streams=serde_json::from_value(json!({"delivery_guarantee":"at_least_once","webhooks":[{
         "endpoint":endpoint.url,"shared_secret":"test","delivery":delivery,"networks":["ethereum"],"events":[{"event_name":"Value"}]
     }]})).unwrap();
@@ -120,9 +154,15 @@ async fn start_with_delivery(
     let callback = no_code_callback(Arc::new(params)).event_callback;
     let mut registry = super::super::permanent_failure_tests::registry(&fixture.params, callback);
     registry.events[0].streams_clients = clients;
-    let mut log = fixture.events(&[10]).remove(0).log;
-    log.block_number = Some(100);
-    log.block_hash = Some(B256::repeat_byte(100));
+    let logs = value
+        .into_iter()
+        .map(|value| {
+            let mut log = fixture.events(&[value]).remove(0).log;
+            log.block_number = Some(100);
+            log.block_hash = Some(hash);
+            log
+        })
+        .collect();
     let headers = (99..=head)
         .map(|number| {
             let mut block = crate::indexer::tables::view_call_cache_tests::header(
@@ -130,12 +170,16 @@ async fn start_with_delivery(
                 number,
             );
             block.header.inner.number = number;
-            block.header.inner.parent_hash = B256::repeat_byte((number - 1) as u8);
+            if number == 100 {
+                block.header.hash = hash;
+            }
+            block.header.inner.parent_hash =
+                if number == 101 { hash } else { B256::repeat_byte((number - 1) as u8) };
             block
         })
         .collect();
     let provider = Arc::new(
-        MockChainProvider::new(1).with_block_number(head).with_blocks(headers).with_logs(vec![log]),
+        MockChainProvider::new(1).with_block_number(head).with_blocks(headers).with_logs(logs),
     );
     let id = registry.events[0].id.clone();
     registry.events[0].contract.details.push(NetworkContract {
@@ -171,9 +215,8 @@ async fn start_with_delivery(
         cancel.clone(),
         progress,
     )
-    .await
-    .unwrap();
-    Running { cancel, handles, coordinators, clients: weak }
+    .await?;
+    Ok(Running { cancel, handles, coordinators, clients: weak })
 }
 
 #[tokio::test]
@@ -297,4 +340,486 @@ async fn postgres_required_stream_healthy_endpoint_delivers_current_event() {
     fixture.finish().await;
     assert!(delivered);
     assert_eq!(position, (1, "10".into(), "100".into()));
+}
+
+async fn callback_with_required_delivery(
+    fixture: &Fixture,
+    endpoint: &Endpoint,
+) -> EventCallbackType {
+    let mut params = fixture.params.clone();
+    params.streams_clients=Arc::new(Some(crate::streams::StreamsClients::new(serde_json::from_value(json!({"delivery_guarantee":"at_least_once","webhooks":[{
+        "endpoint":endpoint.url,"shared_secret":"test","networks":["ethereum"],"events":[{"event_name":"Value"}]
+    }]})).unwrap()).await));
+    no_code_callback(Arc::new(params)).event_callback
+}
+
+#[tokio::test]
+async fn postgres_required_stream_enqueue_failure_aborts_all_source_effects() {
+    let fixture = Fixture::new().await;
+    let endpoint = Endpoint::start().await;
+    let callback = callback_with_required_delivery(&fixture, &endpoint).await;
+    let before = fixture.position().await;
+    fixture.client.batch_execute("ALTER TABLE rindexer_internal.stream_outbox ADD CONSTRAINT reject_delivery CHECK(false)").await.unwrap();
+    assert!(callback(fixture.events(&[10])).await.is_err());
+    assert_eq!(fixture.position().await, before);
+    let count: i64 = fixture
+        .client
+        .query_one("SELECT count(*) FROM rindexer_internal.event_applications", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(count, 0, "failed enqueue must not claim application success");
+    fixture
+        .client
+        .batch_execute(
+            "ALTER TABLE rindexer_internal.stream_outbox DROP CONSTRAINT reject_delivery",
+        )
+        .await
+        .unwrap();
+    callback(fixture.events(&[10])).await.unwrap();
+    callback(fixture.events(&[10])).await.unwrap();
+    assert_eq!(fixture.position().await.0, 1);
+    let count: i64 = fixture
+        .client
+        .query_one("SELECT count(*) FROM rindexer_internal.stream_outbox", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(count, 1, "receipt suppression must not create another obligation");
+    drop(callback);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_required_stream_reset_cannot_erase_pending_delivery() {
+    let fixture = Fixture::new().await;
+    let endpoint = Endpoint::start().await;
+    let callback = callback_with_required_delivery(&fixture, &endpoint).await;
+    callback(fixture.events(&[10])).await.unwrap();
+    let before = fixture.position().await;
+    let sql = crate::database::generate::drop_tables_for_indexer_sql(
+        fixture._directory.path(),
+        &fixture.indexer,
+    );
+    assert!(fixture.client.batch_execute(sql.as_str()).await.is_err());
+    assert_eq!(fixture.position().await, before);
+    drop(callback);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_required_stream_rejects_retargeting_pending_delivery() {
+    let fixture = Fixture::new().await;
+    let original = Endpoint::start().await;
+    let replacement = Endpoint::start().await;
+    let callback = callback_with_required_delivery(&fixture, &original).await;
+    callback(fixture.events(&[10])).await.unwrap();
+    drop(callback);
+    let result = try_start(
+        &fixture,
+        &replacement,
+        "instant",
+        Chain { head: 100, hash: B256::repeat_byte(100), value: None },
+    )
+    .await;
+    assert!(result.is_err(), "startup must not send pending work to a different endpoint");
+    assert!(replacement.state.attempts.lock().unwrap().is_empty());
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_required_stream_reorg_cancels_inflight_and_durably_retracts_before_restart() {
+    use crate::indexer::reorg::ReorgContext;
+    let fixture = Fixture::new().await;
+    let endpoint = Endpoint::start().await;
+    endpoint.state.hanging.store(true, Ordering::SeqCst);
+    let running = start(&fixture, &endpoint).await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while endpoint.state.attempts.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let replacement = B256::repeat_byte(0xea);
+    let coordinator = running.coordinators.get("ethereum").unwrap().clone();
+    let mut owner = coordinator.lock().await;
+    let mut task = owner.try_create_reorg_task_for_block_range(100, 100).unwrap();
+    task.canonical_blocks = vec![(100, replacement, B256::repeat_byte(99))];
+    // Retire the in-flight publisher through recovery's cancellation protocol;
+    // do not abort its task manually to make the writer barrier available.
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        owner.handle_reorg(
+            task,
+            &ReorgContext {
+                postgres: Some(&fixture.client),
+                clickhouse: None,
+                registry: None,
+                trace_registry: None,
+            },
+        ),
+    )
+    .await
+    .expect("recovery must acquire its writer barrier while publication is blocked")
+    .unwrap();
+    running.cancel.cancel();
+    drop(owner);
+    drop(coordinator);
+    running.stop().await;
+    let rows=fixture.client.query("SELECT source_table IS NULL, invalidated FROM rindexer_internal.stream_outbox ORDER BY created_sequence",&[]).await.unwrap();
+    assert!(
+        rows.iter().any(|row| !row.get::<_, bool>(0) && row.get::<_, bool>(1)),
+        "orphaned source obligations must be retired"
+    );
+    assert!(
+        rows.iter().any(|row| row.get::<_, bool>(0) && !row.get::<_, bool>(1)),
+        "retraction must commit with rollback"
+    );
+    endpoint.state.hanging.store(false, Ordering::SeqCst);
+    endpoint.state.failing.store(false, Ordering::SeqCst);
+    endpoint.state.release.notify_waiters();
+    let old = endpoint.state.messages.lock().unwrap().len();
+    let restarted = try_start(
+        &fixture,
+        &endpoint,
+        "instant",
+        Chain { head: 100, hash: replacement, value: None },
+    )
+    .await
+    .unwrap();
+    let delivered = tokio::time::timeout(Duration::from_secs(3), async {
+        while endpoint.state.messages.lock().unwrap().len() == old {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok();
+    restarted.stop().await;
+    let messages = endpoint.state.messages.lock().unwrap()[old..].to_vec();
+    assert!(delivered);
+    assert!(
+        messages.iter().all(|message| message["event_name"] == "__rindexer_reorg"),
+        "old source payloads cannot escape after rollback"
+    );
+    assert_eq!(fixture.position().await.0, 0);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_required_stream_ack_failure_retries_the_same_delivery_id() {
+    let fixture = Fixture::new().await;
+    let endpoint = Endpoint::start().await;
+    endpoint.state.failing.store(false, Ordering::SeqCst);
+    fixture.client.batch_execute("ALTER TABLE rindexer_internal.stream_outbox ADD CONSTRAINT reject_ack CHECK(acknowledged_at IS NULL)").await.unwrap();
+    let running = start(&fixture, &endpoint).await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let accepted = !endpoint.state.attempts.lock().unwrap().is_empty();
+            if accepted && fixture.position().await.2 == "100" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    running.stop().await;
+    let old = endpoint.state.attempts.lock().unwrap().len();
+    let id = endpoint.state.attempts.lock().unwrap()[0].0.clone();
+    fixture
+        .client
+        .batch_execute("ALTER TABLE rindexer_internal.stream_outbox DROP CONSTRAINT reject_ack")
+        .await
+        .unwrap();
+    let restarted = start(&fixture, &endpoint).await;
+    let retried = tokio::time::timeout(Duration::from_secs(3), async {
+        while endpoint.state.attempts.lock().unwrap().len() == old {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok();
+    restarted.stop().await;
+    assert!(retried, "a published record without a committed acknowledgment remains pending");
+    assert!(endpoint.state.attempts.lock().unwrap().iter().all(|(attempt, _)| attempt == &id));
+    assert_eq!(fixture.position().await, (1, "10".into(), "100".into()));
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_required_stream_failed_retraction_enqueue_rolls_back_recovery() {
+    use crate::indexer::reorg::ReorgContext;
+    let fixture = Fixture::new().await;
+    let endpoint = Endpoint::start().await;
+    let mut running = start_with_delivery(&fixture, &endpoint, "finalized", 100).await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while fixture.position().await.2 != "100" {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    running.stop_tasks().await;
+    let before = fixture.position().await;
+    fixture.client.batch_execute("ALTER TABLE rindexer_internal.stream_outbox ADD CONSTRAINT reject_retraction CHECK(source_table IS NOT NULL)").await.unwrap();
+    let coordinator = running.coordinators.get("ethereum").unwrap().clone();
+    let mut owner = coordinator.lock().await;
+    let mut task = owner.try_create_reorg_task_for_block_range(100, 100).unwrap();
+    task.canonical_blocks = vec![(100, B256::repeat_byte(0xea), B256::repeat_byte(99))];
+    let context = ReorgContext {
+        postgres: Some(&fixture.client),
+        clickhouse: None,
+        registry: None,
+        trace_registry: None,
+    };
+    assert!(owner.handle_reorg(task, &context).await.is_err());
+    assert_eq!(
+        fixture.position().await,
+        before,
+        "retraction and raw/derived rollback must commit together"
+    );
+    let count:i64=fixture.client.query_one("SELECT count(*) FROM rindexer_internal.stream_outbox WHERE NOT invalidated AND source_table IS NOT NULL",&[]).await.unwrap().get(0);
+    assert_eq!(count, 1);
+    fixture
+        .client
+        .batch_execute(
+            "ALTER TABLE rindexer_internal.stream_outbox DROP CONSTRAINT reject_retraction",
+        )
+        .await
+        .unwrap();
+    owner.retry_pending_reorg(&context).await.unwrap();
+    assert_eq!(fixture.position().await.0, 0);
+    let count: i64 = fixture
+        .client
+        .query_one(
+            "SELECT count(*) FROM rindexer_internal.stream_outbox WHERE source_table IS NULL",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(count, 1, "retry must retain one durable retraction");
+    drop(owner);
+    drop(coordinator);
+    running.stop().await;
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_required_stream_rejects_unsupported_source_context_before_startup() {
+    let fixture = Fixture::new().await;
+    for mode in ["no-postgres", "no-raw-events", "rust-handler"] {
+        let clients = Arc::new(Some(
+            crate::streams::StreamsClients::new(
+                serde_json::from_value(json!({"delivery_guarantee":"at_least_once","webhooks":[]}))
+                    .unwrap(),
+            )
+            .await,
+        ));
+        let mut params = fixture.params.clone();
+        params.streams_clients = clients.clone();
+        if mode == "no-postgres" {
+            params.postgres = None;
+        }
+        if mode == "no-raw-events" {
+            params.store_raw_events = false;
+        }
+        let callback: EventCallbackType = if mode == "rust-handler" {
+            Arc::new(|_| Box::pin(async { Ok(()) }))
+        } else {
+            no_code_callback(Arc::new(params)).event_callback
+        };
+        let mut registry =
+            super::super::permanent_failure_tests::registry(&fixture.params, callback);
+        registry.events[0].streams_clients = clients;
+        let manifest = serde_json::from_value(
+            json!({"name":"Replay","project_type":"no-code","contracts":[],"networks":[]}),
+        )
+        .unwrap();
+        assert!(
+            crate::indexer::required_delivery::validate(
+                &manifest,
+                &registry,
+                &TraceCallbackRegistry::new(),
+                Some(&fixture.client)
+            )
+            .await
+            .is_err(),
+            "{mode} cannot enable required delivery"
+        );
+    }
+    assert_eq!(fixture.position().await.0, 0);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_required_stream_admission_tracks_only_destination_networks() {
+    let fixture = Fixture::new().await;
+    for destination in ["ethereum", "missing"] {
+        let clients=Arc::new(Some(crate::streams::StreamsClients::new(serde_json::from_value(json!({"delivery_guarantee":"at_least_once","webhooks":[{
+            "endpoint":"http://unused.invalid","shared_secret":"test","networks":[destination],"events":[{"event_name":"Value"}]
+        }]})).unwrap()).await));
+        let mut params = fixture.params.clone();
+        params.streams_clients = clients.clone();
+        let callback = no_code_callback(Arc::new(params)).event_callback;
+        let mut registry =
+            super::super::permanent_failure_tests::registry(&fixture.params, callback);
+        registry.events[0].streams_clients = clients;
+        for network in ["ethereum", "other"] {
+            let provider = Arc::new(MockChainProvider::new(1));
+            let id = registry.events[0].id.clone();
+            registry.events[0].contract.details.push(NetworkContract {
+                id,
+                network: network.into(),
+                indexing_contract_setup: IndexingContractSetup::Address(AddressDetails {
+                    address: ValueOrArray::Value(Address::ZERO),
+                    indexed_filters: None,
+                }),
+                cached_provider: provider.clone(),
+                block_clock: BlockClock::new(None, None, provider),
+                decoder: noop_decoder(),
+                start_block: None,
+                end_block: None,
+                disable_logs_bloom_checks: true,
+            });
+        }
+        let manifest=serde_json::from_value(json!({"name":"Replay","project_type":"no-code","contracts":[],"networks":[
+            {"name":"ethereum","chain_id":1,"rpc":"http://unused.invalid","reorg_handling":{"enabled":true}},
+            {"name":"other","chain_id":2,"rpc":"http://unused.invalid"}
+        ]})).unwrap();
+        let result = crate::indexer::required_delivery::validate(
+            &manifest,
+            &registry,
+            &TraceCallbackRegistry::new(),
+            Some(&fixture.client),
+        )
+        .await;
+        assert_eq!(result.is_ok(),destination=="ethereum","unselected networks need no delivery worker, while an entirely missing destination is a startup error");
+    }
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_required_stream_failed_destination_does_not_starve_healthy_destination() {
+    use crate::event::callback_registry::FailedStream;
+    let fixture = Fixture::new().await;
+    let failing = Endpoint::start().await;
+    let healthy = Endpoint::start().await;
+    healthy.state.failing.store(false, Ordering::SeqCst);
+    let streams=serde_json::from_value(json!({"delivery_guarantee":"at_least_once","webhooks":[
+        {"endpoint":failing.url,"shared_secret":"test","networks":["ethereum"],"events":[{"event_name":"Value"}]},
+        {"endpoint":healthy.url,"shared_secret":"test","networks":["ethereum"],"events":[{"event_name":"Value"}]}
+    ]})).unwrap();
+    let clients = Arc::new(Some(crate::streams::StreamsClients::new(streams).await));
+    let weak = Arc::downgrade(&clients);
+    let mut params = fixture.params.clone();
+    params.streams_clients = clients.clone();
+    let callback = no_code_callback(Arc::new(params)).event_callback;
+    callback(fixture.events(&[10])).await.unwrap();
+    let registry = crate::event::callback_registry::EventCallbackRegistry::new();
+    let cancel = CancellationToken::new();
+    crate::streams::StreamsClients::start_delivery_worker(
+        &clients,
+        fixture.client.clone(),
+        "ethereum".into(),
+        cancel.clone(),
+        registry.failure_state(),
+        FailedStream {
+            id: "delivery-fairness".into(),
+            indexer: "Replay".into(),
+            contract: "Contract".into(),
+            event: "Value".into(),
+            network: "ethereum".into(),
+            from_block: 2,
+            to_block: 2,
+        },
+    );
+    let delivered = tokio::time::timeout(Duration::from_secs(3), async {
+        while healthy.state.attempts.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok();
+    cancel.cancel();
+    drop(callback);
+    drop(clients);
+    drop(registry);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while weak.upgrade().is_some() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(delivered,"one failed destination cannot indefinitely block another destination's committed obligation");
+    assert_eq!(fixture.position().await.0, 1);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_required_stream_finalized_uses_current_distance_for_pending_records() {
+    use crate::event::callback_registry::FailedStream;
+    let fixture = Fixture::new().await;
+    let endpoint = Endpoint::start().await;
+    endpoint.state.failing.store(false, Ordering::SeqCst);
+    let streams=serde_json::from_value(json!({"delivery_guarantee":"at_least_once","webhooks":[{
+        "endpoint":endpoint.url,"shared_secret":"test","delivery":"finalized","networks":["ethereum"],"events":[{"event_name":"Value"}]
+    }]})).unwrap();
+    let clients = Arc::new(Some(crate::streams::StreamsClients::new(streams).await));
+    let weak = Arc::downgrade(&clients);
+    let client = clients.as_ref().as_ref().unwrap();
+    client.register_network_reorg_distance("ethereum".into(), 20);
+    let mut params = fixture.params.clone();
+    params.streams_clients = clients.clone();
+    let callback = no_code_callback(Arc::new(params)).event_callback;
+    callback(fixture.events(&[10])).await.unwrap();
+    fixture.client.batch_execute(&format!("INSERT INTO rindexer_internal.reorg_block_hashes (network,block_number,block_hash,parent_hash) VALUES ('ethereum',100,'{:#x}','{:#x}')",B256::repeat_byte(100),B256::repeat_byte(99))).await.unwrap();
+    client.register_network_reorg_distance("ethereum".into(), 200);
+    let cancel = CancellationToken::new();
+    let registry = crate::event::callback_registry::EventCallbackRegistry::new();
+    crate::streams::StreamsClients::start_delivery_worker(
+        &clients,
+        fixture.client.clone(),
+        "ethereum".into(),
+        cancel.clone(),
+        registry.failure_state(),
+        FailedStream {
+            id: "finality-policy".into(),
+            indexer: "Replay".into(),
+            contract: "Contract".into(),
+            event: "Value".into(),
+            network: "ethereum".into(),
+            from_block: 2,
+            to_block: 2,
+        },
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let released_too_early = !endpoint.state.attempts.lock().unwrap().is_empty();
+    client.register_network_reorg_distance("ethereum".into(), 0);
+    let released = tokio::time::timeout(Duration::from_secs(2), async {
+        while endpoint.state.attempts.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok();
+    cancel.cancel();
+    drop(callback);
+    drop(clients);
+    drop(registry);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while weak.upgrade().is_some() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    fixture.finish().await;
+    assert!(
+        !released_too_early,
+        "a stricter current finality distance must protect previously queued records"
+    );
+    assert!(released, "relaxing the current distance must make the same pending record eligible");
 }
