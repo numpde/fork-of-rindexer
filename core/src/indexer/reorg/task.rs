@@ -1304,6 +1304,27 @@ impl ReorgTask {
             // combines networks. Their block heights are independent fork boundaries.
             let source_network_filter = self.network_filter(false);
 
+            // Remember exactly which columns lost contributions before deleting their
+            // source records. A surviving row can have no history for one column
+            // because its creator left that column at the database default.
+            let orphaned_columns =
+                format!("_rindexer_journal_{}", generate_random_id(20).to_ascii_lowercase());
+            if let Some(pg) = pg {
+                pg.batch_execute(&format!(
+                    "CREATE TEMP TABLE {orphaned_columns} ON COMMIT DROP AS
+                     SELECT DISTINCT where_key, column_name FROM rindexer_internal.derived_op_log
+                     WHERE derived_table = '{}' AND block_number >= {}{}",
+                    dt.full_table_name, self.fork_point, source_network_filter,
+                ))
+                .await
+                .with_context(|| {
+                    format!(
+                        "Cannot retain invalidated column identities for {}",
+                        dt.full_table_name
+                    )
+                })?;
+            }
+
             // Delete journal entries in the reorg range
             let pg_delete = format!(
                 "DELETE FROM rindexer_internal.derived_op_log \
@@ -1356,9 +1377,27 @@ impl ReorgTask {
                         network_filter,
                         Self::journal_where_key_join(&jc.where_columns, "dt", "sub"),
                     );
-                    pg.batch_execute(&delete).await.with_context(|| {
-                        format!("Cannot remove orphan-only journal row from {}", dt.full_table_name)
-                    })?;
+                    // Arithmetic recovery already established row survival from all
+                    // canonical contributors, including other networks' block heights.
+                    if dt.rollback_ops.is_empty() {
+                        pg.batch_execute(&delete).await.with_context(|| {
+                            format!(
+                                "Cannot remove orphan-only journal row from {}",
+                                dt.full_table_name
+                            )
+                        })?;
+                    }
+                    pg.batch_execute(&format!(
+                        "UPDATE {} dt SET {} = DEFAULT
+                         WHERE EXISTS (SELECT 1 FROM {orphaned_columns} sub
+                             WHERE sub.column_name = '{}' AND {})
+                         AND NOT EXISTS (SELECT 1 FROM rindexer_internal.derived_op_log sub
+                             WHERE sub.derived_table = '{}' AND sub.column_name = '{}'{} AND {}){}",
+                        dt.full_table_name, quote_pg_ident(&jc.derived_column), jc.derived_column,
+                        Self::journal_where_key_join(&jc.where_columns, "dt", "sub"),
+                        dt.full_table_name, jc.derived_column, network_filter,
+                        Self::journal_where_key_join(&jc.where_columns, "dt", "sub"), network_join,
+                    )).await.with_context(|| format!("Cannot restore column baseline {}.{} after invalidating its last journal entry", dt.full_table_name, jc.derived_column))?;
                     let update_sql = if matches!(jc.action, SetAction::Set) {
                         format!(
                             "UPDATE {} AS dt SET {} = (jsonb_populate_record(dt, jsonb_build_object('{}', sub.value))).{} \

@@ -33,3 +33,16 @@ apply to its storage and configuration:
 
 These notes retain their existing URLs. Their place in this section identifies
 them as maintained fork documentation.
+
+## Derived recovery with separate column operations
+
+PostgreSQL recovery now restores a column's database default (or NULL for a
+nullable column without a default) when all of that column's journal entries are
+orphaned but the row has a surviving canonical contribution. This covers separate
+operations that create a row through arithmetic and later set a different column.
+It also applies to `max` and `min` columns with no surviving journal entries.
+
+The fix preserves the canonical row's sequence and provenance. It does not repair
+state left wrong by an earlier completed rollback; review affected ranges and
+coordinate canonical repair with derived state, journals, application receipts
+and cursors.

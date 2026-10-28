@@ -5,7 +5,7 @@ use crate::{
     indexer::reorg::{
         BlockChainWindow, EventTableInfo, ReorgBlockHashPersistence, ReorgContext, ReorgCoordinator,
     },
-    manifest::contract::{ColumnType, OperationType, SetAction},
+    manifest::contract::{ColumnType, OperationType},
     provider::mock::MockChainProvider,
 };
 use alloy::primitives::{Address, U256};

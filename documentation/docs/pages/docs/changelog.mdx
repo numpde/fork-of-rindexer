@@ -55,6 +55,7 @@
 
 ### Bug fixes
 -------------------------------------------------
+- fix: PostgreSQL reorg recovery restores a surviving derived row’s column default or NULL when rollback removes that column’s entire journal history, including separate arithmetic and `set`/`max`/`min` operations. Recovery leaves unrelated rows unchanged; already-corrupted state still needs verified canonical repair.
 - fix: PostgreSQL reorg recovery now restores arithmetic-only and mixed derived rows' canonical sequence, block, transaction, contract address and optional timestamp alongside reversed values, allowing same-position replacement updates. Rows with no surviving canonical contribution are removed. Recovery needs retained canonical raw events; missing timestamps require matching RPC headers, and a failed identity lookup leaves the rollback uncommitted. Previously corrupted derived state still needs a verified rebuild.
 - fix: the single-host PostgreSQL launcher accepts `RINDEXER_DOCKER_CONTEXT=rootless` in its private runtime env file, validates the local socket and pins it through start, status and stop. Omitted selectors retain `default`; ambient engine overrides are ignored and unavailable engines never fall back. Changing engines does not migrate existing database volumes.
 - fix: report a stopped indexing generation in health immediately after a stream task panics, including while admitted callbacks finish cleanup.
