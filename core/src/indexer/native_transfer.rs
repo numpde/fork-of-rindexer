@@ -1868,6 +1868,112 @@ mod tests {
         );
     }
 
+    async fn assert_native_queue_identity(stale: bool, empty: bool) {
+        use alloy::primitives::B256;
+        use futures::FutureExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let (_directory, config, _, path) = callback_case(Arc::new(move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            async { Ok(()) }.boxed()
+        }))
+        .await;
+        let mut canonical =
+            make_block_with_native_transfer(42, Address::ZERO, Address::repeat_byte(1), U256::ONE);
+        if empty {
+            canonical.transactions = alloy::rpc::types::BlockTransactions::Full(vec![]);
+        }
+        let mut returned = canonical.clone();
+        if stale {
+            let stale_hash = B256::repeat_byte(43);
+            returned.header.hash = stale_hash;
+            if let alloy::rpc::types::BlockTransactions::Full(transactions) =
+                &mut returned.transactions
+            {
+                for transaction in transactions {
+                    transaction.block_hash = Some(stale_hash);
+                }
+            }
+        }
+        let receipts = successful_receipts(std::slice::from_ref(&returned));
+        let provider = Arc::new(
+            MockChainProvider::new(1)
+                .with_blocks(vec![canonical.clone()])
+                .with_block_batches(vec![vec![canonical], vec![returned]])
+                .with_receipt_response(receipts),
+        );
+        let coordinator = make_test_coordinator("ethereum", &[], provider.clone());
+        let generation = crate::indexer::reorg::reorg_generation("ethereum");
+        let (sender, receiver) = native_block_channel("ethereum", U64::from(42), 1);
+        let completion = sender.recovery.clone();
+        let cancel = CancellationToken::new();
+        let publisher = tokio::spawn(native_transfer_block_fetch(
+            provider.clone(),
+            sender,
+            U64::from(42),
+            Some(U64::from(42)),
+            U64::ZERO,
+            "ethereum".into(),
+            cancel.clone(),
+            None,
+            "test".into(),
+            Some(coordinator),
+            None,
+            Arc::new(TraceCallbackRegistry::new()),
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while receiver.receiver.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("production publisher queues its validated block");
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), publisher).await.unwrap().unwrap().unwrap();
+        let processor = tokio::spawn(native_transfer_block_processor(
+            "ethereum".into(),
+            provider,
+            config.clone(),
+            receiver,
+        ));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        config.cancel_token.cancel();
+        tokio::time::timeout(Duration::from_secs(2), processor).await.unwrap().unwrap().unwrap();
+        assert_eq!(
+            crate::indexer::reorg::reorg_generation("ethereum"),
+            generation,
+            "identity validation must work without a generation change"
+        );
+        if stale {
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "neither block nor transfer callbacks may accept a different validated hash"
+            );
+            assert_eq!(std::fs::read_to_string(path).unwrap(), "1");
+            assert_eq!(completion.first_unfinished(), Some(42));
+        } else {
+            assert!(calls.load(Ordering::SeqCst) > 0);
+            assert_eq!(std::fs::read_to_string(path).unwrap(), "42");
+            assert_eq!(completion.first_unfinished(), Some(43));
+        }
+    }
+
+    #[tokio::test]
+    async fn native_queue_identity_rejects_self_consistent_stale_transfers() {
+        assert_native_queue_identity(true, false).await;
+    }
+    #[tokio::test]
+    async fn native_queue_identity_rejects_stale_empty_block_checkpoint() {
+        assert_native_queue_identity(true, true).await;
+    }
+    #[tokio::test]
+    async fn native_queue_identity_accepts_matching_empty_and_full_blocks() {
+        assert_native_queue_identity(false, true).await;
+        assert_native_queue_identity(false, false).await;
+    }
+
     #[tokio::test]
     async fn native_transfer_no_coordinator_short_circuits() {
         // Without a coordinator configured, the helper must return NoCoordinator

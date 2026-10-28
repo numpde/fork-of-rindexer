@@ -596,3 +596,11 @@ tests/arithmetic-recovery/postgres: ## Verify arithmetic rollback values, orderi
 	$(compose) run --rm --no-deps -T offline arithmetic-recovery-compile
 	$(compose) up -d --no-build --pull never --wait --wait-timeout 90 postgres
 	$(compose) run --rm --no-deps -T postgres-tests arithmetic-recovery
+
+.PHONY: tests/native-identity/native tests/native-identity/docker
+tests/native-identity/native: ## Verify native queued block identity with native Rust tools
+	env CARGO_BUILD_JOBS=1 cargo nextest run --frozen -p rindexer --lib --test-threads 1 --no-fail-fast -E 'test(/native_queue_identity_/)'
+
+tests/native-identity/docker: ## Verify native queued block identity in the prepared offline container
+	@$(call offline_runner,$$dependency_image)
+	$(compose) run --rm --no-deps -T offline native-identity
