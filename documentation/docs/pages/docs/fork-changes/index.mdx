@@ -46,3 +46,21 @@ The fix preserves the canonical row's sequence and provenance. It does not repai
 state left wrong by an earlier completed rollback; review affected ranges and
 coordinate canonical repair with derived state, journals, application receipts
 and cursors.
+
+## Insert-created rows and reorg recovery
+
+A derived table on a reorg-enabled network must not mix `insert` with `upsert`,
+`update` or `delete`. Startup now rejects this previously accepted configuration,
+including tables under `native_transfers`. Recovery cannot reliably reconstruct
+an insert-created baseline after reverting a later mutation; it could previously
+delete a canonically created row.
+
+Use keyed `upsert` operations for mutable state, or move append-only `insert`
+operations into a separate table. Review the intended key and duplicate semantics
+when changing an insert to an upsert. Insert-only tables, mutable-only tables and
+mixed tables on networks without reorg handling retain their existing behavior.
+
+For an existing deployment, stop the writer and verify affected canonical ranges
+before resuming. Changing the manifest does not repair a row lost in an earlier
+rollback. Coordinate any required rebuild with derived state, recovery journals,
+application receipts and cursors; see the [sequence-ordering migration](/docs/migrations/sequence-ordering).

@@ -351,6 +351,20 @@ impl Table {
         !ops.is_empty() && ops.iter().all(|op| op.operation_type == OperationType::Insert)
     }
 
+    pub(crate) fn validate_reorg_operation_mix(&self) -> Result<(), String> {
+        if self.all_operations().any(|op| op.operation_type == OperationType::Insert)
+            && !self.is_insert_only()
+        {
+            return Err(format!(
+                "Table '{}' mixes insert with mutable operations on a reorg-enabled network. \
+                 Recovery cannot reconstruct insert-created row baselines; use keyed upserts \
+                 instead of inserts, or move append-only inserts to a separate table.",
+                self.name
+            ));
+        }
+        Ok(())
+    }
+
     /// Get all operations (from both events and cron).
     pub fn all_operations(&self) -> impl Iterator<Item = &TableOperation> {
         let event_ops = self.events.iter().flat_map(|e| e.operations.iter());
