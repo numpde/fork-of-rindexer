@@ -582,3 +582,10 @@ tests/historical-identity/postgres: ## Reject stale-fork historical logs through
 	$(compose) run --rm --no-deps -T offline historical-identity-compile
 	$(compose) up -d --no-build --pull never --wait --wait-timeout 90 postgres
 	$(compose) run --rm --no-deps -T postgres-tests historical-identity
+
+.PHONY: tests/journal-keys/postgres
+tests/journal-keys/postgres: ## Verify composite journal keys and schema migration admission through PostgreSQL recovery
+	@$(call offline_runner,$$dependency_image)
+	$(compose) run --rm --no-deps -T offline journal-keys-compile
+	$(compose) up -d --no-build --pull never --wait --wait-timeout 90 postgres
+	$(compose) run --rm --no-deps -T postgres-tests journal-keys

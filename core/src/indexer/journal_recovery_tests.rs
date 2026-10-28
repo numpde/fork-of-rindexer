@@ -56,34 +56,42 @@ pub(super) fn at(
 async fn rollback(fixture: &Fixture, action: SetAction, cross_chain: bool) {
     let schema = generate_indexer_contract_schema_name(&fixture.params.indexer_name, "Contract");
     let cursor = generate_internal_event_table_name(&schema, "Value");
-    let mut coordinator =
-        ReorgCoordinator::new(
-            "ethereum".into(),
-            BlockChainWindow::try_new(8).unwrap(),
-            Arc::new(ReorgBlockHashPersistence::new(Some(fixture.client.clone()), None)),
-            Arc::new(MockChainProvider::new(1).with_blocks(vec![
-                crate::indexer::tables::view_call_cache_tests::header(B256::repeat_byte(101), 10),
-            ])),
-            vec![EventTableInfo::try_new(
-                schema,
-                "value".into(),
-                cursor,
-                fixture.params.indexer_name.clone(),
-                "Contract".into(),
-                "Value".into(),
-            )
-            .unwrap()],
-            vec![DerivedTableInfo::try_new(
-                fixture.params.tables[0].full_table_name.clone(),
-                cross_chain,
-                vec![],
-                vec![DerivedColumnJournal::try_new("amount".into(), action, vec!["id".into()])
-                    .unwrap()],
-            )
-            .unwrap()],
-            vec![],
+    let mut coordinator = ReorgCoordinator::new(
+        "ethereum".into(),
+        BlockChainWindow::try_new(8).unwrap(),
+        Arc::new(ReorgBlockHashPersistence::new(Some(fixture.client.clone()), None)),
+        Arc::new(MockChainProvider::new(1).with_blocks(vec![
+            crate::indexer::tables::view_call_cache_tests::header(B256::repeat_byte(101), 10),
+        ])),
+        vec![EventTableInfo::try_new(
+            schema,
+            "value".into(),
+            cursor,
+            fixture.params.indexer_name.clone(),
+            "Contract".into(),
+            "Value".into(),
         )
-        .unwrap();
+        .unwrap()],
+        vec![DerivedTableInfo::try_new(
+            fixture.params.tables[0].full_table_name.clone(),
+            cross_chain,
+            vec![],
+            vec![DerivedColumnJournal::try_new("amount".into(), action, {
+                let mut keys = fixture.params.tables[0]
+                    .table
+                    .primary_key_columns()
+                    .into_iter()
+                    .map(String::from)
+                    .collect::<Vec<_>>();
+                keys.sort();
+                keys
+            })
+            .unwrap()],
+        )
+        .unwrap()],
+        vec![],
+    )
+    .unwrap();
     let task = coordinator.try_create_reorg_task_for_block_range(100, 100).unwrap();
     coordinator
         .handle_reorg(
@@ -392,6 +400,63 @@ async fn postgres_cross_chain_recalculation_waits_for_another_networks_in_flight
     application.await.unwrap().unwrap();
     assert_eq!(amount(&fixture).await, "20");
     drop(connection);
+    drop(callback);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_composite_journal_keys_do_not_mix_rows_during_rollback() {
+    use alloy::dyn_abi::DynSolValue;
+    let definition = json!({"name":"Value","type":"event","anonymous":false,"inputs":[
+        {"name":"a","type":"string","indexed":false},
+        {"name":"b","type":"string","indexed":false},
+        {"name":"value","type":"uint64","indexed":false}
+    ]});
+    let fixture = Fixture::with_table(definition, "Contract", json!({"name":"totals",
+        "columns":[{"name":"a","type":"string"},{"name":"b","type":"string"},{"name":"amount","type":"uint64"}],
+        "events":[{"event":"Value","operations":[{"type":"upsert","where":{"a":"$a","b":"$b"},
+            "set":[{"column":"amount","action":"set","value":"$value"}]}]}]
+    })).await;
+    let make = |a: &str, b: &str, block: u64, index: u64, value: u64| {
+        let mut event = at(&fixture, "ethereum", block, B256::repeat_byte(block as u8), value);
+        event.log.inner.data = alloy::primitives::LogData::new_unchecked(
+            event.log.topics().to_vec(),
+            DynSolValue::Tuple(vec![
+                DynSolValue::String(a.into()),
+                DynSolValue::String(b.into()),
+                DynSolValue::Uint(U256::from(value), 64),
+            ])
+            .abi_encode_params()
+            .into(),
+        );
+        event.log.transaction_hash = Some(B256::repeat_byte(block as u8));
+        event.tx_information.transaction_hash = B256::repeat_byte(block as u8);
+        event.log.log_index = Some(index);
+        event.tx_information.log_index = U256::from(index);
+        event
+    };
+    let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+    callback(vec![make("x,b=y", "z", 99, 4, 10), make("x", "y,b=z", 99, 5, 20)]).await.unwrap();
+    let query = format!("SELECT to_jsonb(t) || jsonb_build_object('rindexer_sequence_id', t.rindexer_sequence_id::text) FROM {} t ORDER BY a, b", fixture.params.tables[0].full_table_name);
+    let before = fixture
+        .client
+        .query(&query, &[])
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.get::<_, serde_json::Value>(0))
+        .collect::<Vec<_>>();
+    callback(vec![make("x,b=y", "z", 100, 4, 30)]).await.unwrap();
+    rollback(&fixture, SetAction::Set, false).await;
+    let after = fixture
+        .client
+        .query(&query, &[])
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.get::<_, serde_json::Value>(0))
+        .collect::<Vec<_>>();
+    assert_eq!(after, before, "composite text keys must retain separate values and provenance");
     drop(callback);
     fixture.finish().await;
 }

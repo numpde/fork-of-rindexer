@@ -58,6 +58,13 @@ case "$1" in
     : "${RINDEXER_TEST_POSTGRES_URL:?missing explicit PostgreSQL fixture}"
     exec cargo nextest run --frozen -p rindexer --lib --test-threads 1 --no-fail-fast -E 'test(/postgres_historical_identity_/)'
     ;;
+  journal-keys-compile)
+    exec cargo nextest run --frozen -p rindexer --lib --no-run -E 'test(/postgres_composite_journal_keys/) | test(/postgres_journal_key_schema/)'
+    ;;
+  journal-keys)
+    : "${RINDEXER_TEST_POSTGRES_URL:?missing explicit PostgreSQL fixture}"
+    exec cargo nextest run --frozen -p rindexer --lib --test-threads 1 --no-fail-fast -E 'test(/postgres_composite_journal_keys/) | test(/postgres_journal_key_schema/)'
+    ;;
   runtime-image)
     cargo build --frozen --release -p rindexer_cli --no-default-features
     exec python3 -B containers/runtime/package.py >&3
