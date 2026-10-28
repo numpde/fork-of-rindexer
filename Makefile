@@ -589,3 +589,10 @@ tests/journal-keys/postgres: ## Verify composite journal keys and schema migrati
 	$(compose) run --rm --no-deps -T offline journal-keys-compile
 	$(compose) up -d --no-build --pull never --wait --wait-timeout 90 postgres
 	$(compose) run --rm --no-deps -T postgres-tests journal-keys
+
+.PHONY: tests/arithmetic-recovery/postgres
+tests/arithmetic-recovery/postgres: ## Verify arithmetic rollback values, ordering and provenance through PostgreSQL
+	@$(call offline_runner,$$dependency_image)
+	$(compose) run --rm --no-deps -T offline arithmetic-recovery-compile
+	$(compose) up -d --no-build --pull never --wait --wait-timeout 90 postgres
+	$(compose) run --rm --no-deps -T postgres-tests arithmetic-recovery

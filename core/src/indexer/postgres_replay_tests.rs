@@ -1675,3 +1675,6 @@ mod raw_column_collision_tests;
 
 #[path = "health_subscription_tests.rs"]
 mod health_subscription_tests;
+
+#[path = "arithmetic_recovery_tests.rs"]
+mod arithmetic_recovery_tests;
