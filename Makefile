@@ -604,3 +604,10 @@ tests/native-identity/native: ## Verify native queued block identity with native
 tests/native-identity/docker: ## Verify native queued block identity in the prepared offline container
 	@$(call offline_runner,$$dependency_image)
 	$(compose) run --rm --no-deps -T offline native-identity
+
+.PHONY: tests/required-delivery/postgres
+tests/required-delivery/postgres: ## Verify required immediate and finalized stream delivery across PostgreSQL restarts
+	@$(call offline_runner,$$dependency_image)
+	$(compose) run --rm --no-deps -T offline required-delivery-compile
+	$(compose) up -d --no-build --pull never --wait --wait-timeout 90 postgres
+	$(compose) run --rm --no-deps -T postgres-tests required-delivery

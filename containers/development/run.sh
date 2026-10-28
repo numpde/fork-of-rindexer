@@ -58,6 +58,13 @@ case "$1" in
     : "${RINDEXER_TEST_POSTGRES_URL:?missing explicit PostgreSQL fixture}"
     exec cargo nextest run --frozen -p rindexer --lib --test-threads 1 --no-fail-fast -E 'test(/postgres_historical_identity_/)'
     ;;
+  required-delivery-compile)
+    exec env CARGO_BUILD_JOBS=1 cargo nextest run --frozen -p rindexer --lib --no-run -E 'test(/postgres_required_stream_/)'
+    ;;
+  required-delivery)
+    : "${RINDEXER_TEST_POSTGRES_URL:?missing explicit PostgreSQL fixture}"
+    exec env CARGO_BUILD_JOBS=1 cargo nextest run --frozen -p rindexer --lib --test-threads 1 --no-fail-fast -E 'test(/postgres_required_stream_/)'
+    ;;
   native-identity)
     exec env CARGO_BUILD_JOBS=1 cargo nextest run --frozen -p rindexer --lib --test-threads 1 --no-fail-fast -E 'test(/native_queue_identity_/)'
     ;;
