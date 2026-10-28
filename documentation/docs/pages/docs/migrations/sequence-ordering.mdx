@@ -95,3 +95,26 @@ together, coordinating raw history, application receipts and cursors as describe
 above. Casting concatenated strings into JSON or splitting on delimiters cannot
 recover the original keys. Deploy the complete coordinated recovery upgrade before
 rebuilding, so the rebuild produces the final journal representation once.
+
+
+## Arithmetic row provenance after rollback
+
+PostgreSQL rollback now restores the ordering and provenance of arithmetic-only
+rows as well as mixed arithmetic and journaled rows. Reversing an amount alone
+leaves an orphaned sequence behind, which can reject a replacement `update` at
+the same event position. Recovery now selects the latest surviving canonical
+contribution and restores its sequence, block number and hash, transaction hash,
+contract address and optional timestamp in the rollback transaction. A row with
+no surviving contribution is deleted.
+
+This uses retained raw event history and existing typed journals. Keep canonical
+source events available for all derived rows that may require recovery. Recovery
+scans that history for affected rows; it does not introduce a second arithmetic
+value journal. When a required timestamp is absent from retained raw metadata,
+the provider must return a header whose hash matches the source event. Missing
+or inconsistent evidence aborts the rollback, leaving storage uncommitted for
+retry after the evidence is repaired.
+
+This change repairs future PostgreSQL rollbacks. It does not discover rows whose
+values or provenance were already corrupted by an earlier rollback; rebuild those
+rows from verified canonical events using the coordinated procedure above.

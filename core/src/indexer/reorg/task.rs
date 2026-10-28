@@ -1,3 +1,6 @@
+#[path = "arithmetic_metadata.rs"]
+mod arithmetic_metadata;
+
 use std::{collections::HashMap, sync::Arc};
 
 use alloy::primitives::{B256, U64};
@@ -1403,8 +1406,10 @@ impl ReorgTask {
                             jc.derived_column, dt.full_table_name
                         )
                     })?;
-                    self.restore_journal_metadata(pg, dt, jc, &network_filter, &network_join)
-                        .await?;
+                    if dt.rollback_ops.is_empty() {
+                        self.restore_journal_metadata(pg, dt, jc, &network_filter, &network_join)
+                            .await?;
+                    }
                     tracing::info!(
                         table = %dt.full_table_name,
                         column = %jc.derived_column,
@@ -1716,6 +1721,9 @@ impl ReorgTask {
             Self::apply_reversal_from_snapshots(&reversal_snapshots.entries, pg, clickhouse)
                 .await
                 .context("Accumulative reversal from snapshots failed")?;
+            if let Some(pg) = pg {
+                self.restore_arithmetic_metadata(pg, rollback_plan, provider).await?;
+            }
             self.recalculate_from_journal(pg, clickhouse)
                 .await
                 .context("Journal recalculation failed")?;

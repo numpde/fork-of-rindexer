@@ -3,8 +3,9 @@ use super::journal_recovery_tests::at;
 use super::*;
 use crate::{
     indexer::reorg::{
-        BlockChainWindow, DerivedColumnRollback, DerivedTableInfo, DerivedTableRollbackOp,
-        EventTableInfo, ReorgBlockHashPersistence, ReorgContext, ReorgCoordinator,
+        BlockChainWindow, DerivedColumnJournal, DerivedColumnRollback, DerivedTableInfo,
+        DerivedTableRollbackOp, EventTableInfo, ReorgBlockHashPersistence, ReorgContext,
+        ReorgCoordinator,
     },
     manifest::contract::{ColumnType, OperationType, SetAction},
     provider::mock::MockChainProvider,
@@ -12,17 +13,24 @@ use crate::{
 use alloy::primitives::{Address, U256};
 
 async fn fixture() -> Fixture {
-    Fixture::with_table(
-        serde_json::to_value(params().event).unwrap(),
-        "Contract",
-        json!({
-            "name":"totals","global":true,"timestamp":true,
-            "columns":[{"name":"amount","type":"uint256","default":"0"}],
-            "events":[{"event":"Value","operations":[{"type":"upsert","set":[
-                {"column":"amount","action":"add","value":"$value"}]}]}]
-        }),
-    )
-    .await
+    fixture_with_mixed_operations(false).await
+}
+
+async fn fixture_with_mixed_operations(mixed: bool) -> Fixture {
+    let mut table = json!({
+        "name":"totals","global":true,"timestamp":true,
+        "columns":[{"name":"amount","type":"uint256","default":"0"}],
+        "events":[{"event":"Value","operations":[{"type":"upsert","set":[
+            {"column":"amount","action":"add","value":"$value"}]}]}]
+    });
+    if mixed {
+        table["columns"].as_array_mut().unwrap().push(json!({"name":"latest","type":"uint256"}));
+        table["events"][0]["operations"][0]["set"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"column":"latest","action":"set","value":"$value"}));
+    }
+    Fixture::with_table(serde_json::to_value(params().event).unwrap(), "Contract", table).await
 }
 
 fn input(fixture: &Fixture, block: u64, branch: u8, value: u64) -> EventResult {
@@ -35,44 +43,63 @@ fn input(fixture: &Fixture, block: u64, branch: u8, value: u64) -> EventResult {
 }
 
 async fn rollback(fixture: &Fixture) {
+    rollback_with_ancestor(fixture, 99).await.unwrap();
+}
+
+async fn rollback_with_ancestor(fixture: &Fixture, branch: u8) -> anyhow::Result<()> {
+    let mut ancestor =
+        crate::indexer::tables::view_call_cache_tests::header(B256::repeat_byte(branch), 1099);
+    ancestor.header.inner.number = 99;
     let schema = generate_indexer_contract_schema_name(&fixture.params.indexer_name, "Contract");
-    let mut coordinator = ReorgCoordinator::new(
-        "ethereum".into(),
-        BlockChainWindow::try_new(8).unwrap(),
-        Arc::new(ReorgBlockHashPersistence::new(Some(fixture.client.clone()), None)),
-        Arc::new(MockChainProvider::new(1).with_blocks(vec![
-            crate::indexer::tables::view_call_cache_tests::header(B256::repeat_byte(101), 1101),
-        ])),
-        vec![EventTableInfo::try_new(
-            schema.clone(),
-            "value".into(),
-            generate_internal_event_table_name(&schema, "Value"),
-            fixture.params.indexer_name.clone(),
-            "Contract".into(),
-            "Value".into(),
-        )
-        .unwrap()],
-        vec![DerivedTableInfo::try_new(
-            fixture.params.tables[0].full_table_name.clone(),
-            false,
-            vec![DerivedTableRollbackOp::try_new(
-                format!("{schema}.value"),
-                vec![],
-                vec![DerivedColumnRollback::try_new(
-                    "amount".into(),
-                    "value".into(),
-                    SetAction::Add,
+    let mut coordinator =
+        ReorgCoordinator::new(
+            "ethereum".into(),
+            BlockChainWindow::try_new(8).unwrap(),
+            Arc::new(ReorgBlockHashPersistence::new(Some(fixture.client.clone()), None)),
+            Arc::new(MockChainProvider::new(1).with_blocks(vec![
+                ancestor,
+                crate::indexer::tables::view_call_cache_tests::header(B256::repeat_byte(101), 1101),
+            ])),
+            vec![EventTableInfo::try_new(
+                schema.clone(),
+                "value".into(),
+                generate_internal_event_table_name(&schema, "Value"),
+                fixture.params.indexer_name.clone(),
+                "Contract".into(),
+                "Value".into(),
+            )
+            .unwrap()],
+            vec![DerivedTableInfo::try_new(
+                fixture.params.tables[0].full_table_name.clone(),
+                false,
+                vec![DerivedTableRollbackOp::try_new(
+                    format!("{schema}.value"),
+                    vec![],
+                    vec![DerivedColumnRollback::try_new(
+                        "amount".into(),
+                        "value".into(),
+                        SetAction::Add,
+                    )
+                    .unwrap()],
+                    None,
                 )
                 .unwrap()],
-                None,
+                if fixture.params.tables[0]
+                    .table
+                    .columns
+                    .iter()
+                    .any(|column| column.name == "latest")
+                {
+                    vec![DerivedColumnJournal::try_new("latest".into(), SetAction::Set, vec![])
+                        .unwrap()]
+                } else {
+                    vec![]
+                },
             )
             .unwrap()],
             vec![],
         )
-        .unwrap()],
-        vec![],
-    )
-    .unwrap();
+        .unwrap();
     let mut plan = crate::indexer::reorg::task::DerivedTableRollbackPlan::default();
     plan.try_add_operation(
         fixture.params.tables[0].full_table_name.clone(),
@@ -95,7 +122,7 @@ async fn rollback(fixture: &Fixture) {
             },
         )
         .await
-        .unwrap();
+        .map(|_| ())
 }
 
 async fn state(fixture: &Fixture) -> (String, serde_json::Value) {
@@ -168,6 +195,83 @@ async fn postgres_arithmetic_recovery_removes_orphan_only_row() {
         .unwrap()
         .get(0);
     assert_eq!(count, 0, "no canonical contribution means no surviving derived row");
+    drop(callback);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_arithmetic_recovery_mixed_table_restores_values_and_metadata_together() {
+    let fixture = fixture_with_mixed_operations(true).await;
+    let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+    callback(vec![input(&fixture, 99, 99, 10)]).await.unwrap();
+    let canonical = state(&fixture).await;
+    callback(vec![input(&fixture, 100, 100, 20)]).await.unwrap();
+    rollback(&fixture).await;
+    assert_eq!(state(&fixture).await, canonical);
+    callback(vec![input(&fixture, 100, 101, 30)]).await.unwrap();
+    let (amount, metadata) = state(&fixture).await;
+    assert_eq!(amount, "40");
+    assert_eq!(metadata["latest"], json!(30));
+    assert_eq!(metadata["rindexer_block_hash"], json!(format!("{:#x}", B256::repeat_byte(101))));
+    drop(callback);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_arithmetic_recovery_resolves_missing_timestamp_by_matching_hash() {
+    let fixture = fixture().await;
+    let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+    callback(vec![input(&fixture, 99, 99, 10)]).await.unwrap();
+    let canonical = state(&fixture).await;
+    fixture
+        .client
+        .batch_execute(&format!(
+            "UPDATE {} SET block_timestamp = NULL",
+            fixture.params.sql_event_table_name
+        ))
+        .await
+        .unwrap();
+    callback(vec![input(&fixture, 100, 100, 20)]).await.unwrap();
+    let orphaned = state(&fixture).await;
+    assert!(
+        rollback_with_ancestor(&fixture, 98).await.is_err(),
+        "a different header cannot supply a canonical row's timestamp"
+    );
+    assert_eq!(
+        state(&fixture).await,
+        orphaned,
+        "failed recovery must roll back its arithmetic and metadata changes"
+    );
+    assert_eq!(fixture.position().await.0, 2, "failed recovery must retain both raw events");
+    rollback(&fixture).await;
+    assert_eq!(state(&fixture).await, canonical);
+    drop(callback);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_arithmetic_recovery_orders_sources_for_a_partial_metadata_target() {
+    let fixture = fixture().await;
+    let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+    callback(vec![
+        input(&fixture, 98, 98, 5),
+        input(&fixture, 99, 99, 10),
+        input(&fixture, 100, 100, 20),
+    ])
+    .await
+    .unwrap();
+    // Older/manual tables can expose just the block marker. Source ordering still
+    // needs the complete event position even when the target has no sequence column.
+    let table = &fixture.params.tables[0].full_table_name;
+    fixture.client.batch_execute(&format!("ALTER TABLE {table} DROP COLUMN rindexer_sequence_id, DROP COLUMN rindexer_block_timestamp, DROP COLUMN rindexer_block_hash, DROP COLUMN rindexer_tx_hash, DROP COLUMN rindexer_contract_address")).await.unwrap();
+    rollback(&fixture).await;
+    let row = fixture
+        .client
+        .query_one(&format!("SELECT amount::text, rindexer_block_number FROM {table}"), &[])
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, String>(0), "15");
+    assert_eq!(row.get::<_, i64>(1), 99);
     drop(callback);
     fixture.finish().await;
 }
