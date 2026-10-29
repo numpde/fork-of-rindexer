@@ -132,3 +132,76 @@ async fn postgres_timestamp_word_in_a_literal_does_not_require_timestamp_rpc() {
     assert_eq!(fixture.position().await, (1, "10".into(), "2".into()));
     fixture.finish().await;
 }
+
+async fn timestamp_recovery_case(hydrate: bool) {
+    let fixture = timestamp_fixture("$rindexer_block_timestamp > 100", false).await;
+    let blocks = [99u64, 100]
+        .into_iter()
+        .map(|number| {
+            let mut block = crate::indexer::tables::view_call_cache_tests::header(
+                B256::repeat_byte(number as u8),
+                1000 + number,
+            );
+            block.header.inner.number = number;
+            block
+        })
+        .collect();
+    let mut params = fixture.params.clone();
+    params.providers = Arc::new(std::collections::HashMap::from([(
+        "ethereum".into(),
+        Arc::new(MockChainProvider::new(1).with_blocks(blocks))
+            as Arc<dyn crate::provider::ChainProvider>,
+    )]));
+    let callback = no_code_callback(Arc::new(params)).event_callback;
+    for (number, value) in [(99u64, 10), (100, 20)] {
+        let mut event = super::journal_recovery_tests::at(
+            &fixture,
+            "ethereum",
+            number,
+            B256::repeat_byte(number as u8),
+            value,
+        );
+        let timestamp = (!hydrate).then_some(1000 + number);
+        event.log.block_timestamp = timestamp;
+        event.tx_information.block_timestamp = timestamp.map(alloy::primitives::U256::from);
+        callback(vec![event]).await.unwrap();
+    }
+    assert_eq!(fixture.position().await, (2, "30".into(), "100".into()));
+    let timestamps = fixture
+        .client
+        .query(
+            &format!(
+                "SELECT EXTRACT(EPOCH FROM block_timestamp)::bigint FROM {} ORDER BY block_number",
+                fixture.params.sql_event_table_name
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(timestamps.iter().map(|row|row.get::<_,Option<i64>>(0)).collect::<Vec<_>>(),vec![Some(1099),Some(1100)],"the source seconds used for admission must survive with the raw event, including RPC hydration");
+    super::recovery_boundary_tests::rollback(&fixture, 100, 100).await.unwrap();
+    assert_eq!(
+        fixture.position().await,
+        (1, "10".into(), "99".into()),
+        "recovery predicates must compare numeric Unix seconds just like forward admission"
+    );
+    let mut replacement =
+        super::journal_recovery_tests::at(&fixture, "ethereum", 100, B256::repeat_byte(101), 7);
+    replacement.log.block_timestamp = Some(1101);
+    replacement.tx_information.block_timestamp = Some(alloy::primitives::U256::from(1101));
+    callback(vec![replacement.clone()]).await.unwrap();
+    callback(vec![replacement]).await.unwrap();
+    assert_eq!(fixture.position().await, (2, "17".into(), "100".into()));
+    drop(callback);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_timestamp_recovery_predicate_uses_unix_seconds() {
+    timestamp_recovery_case(false).await;
+}
+
+#[tokio::test]
+async fn postgres_timestamp_recovery_persists_fetched_source_seconds() {
+    timestamp_recovery_case(true).await;
+}

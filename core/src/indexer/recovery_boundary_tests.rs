@@ -9,7 +9,7 @@ use crate::{
     provider::mock::MockChainProvider,
 };
 
-async fn rollback(fixture: &Fixture, fork: u64, detection: u64) -> anyhow::Result<()> {
+pub(super) async fn rollback(fixture: &Fixture, fork: u64, detection: u64) -> anyhow::Result<()> {
     let schema = generate_indexer_contract_schema_name(&fixture.params.indexer_name, "Contract");
     let mut derived = std::collections::HashMap::new();
     let mut plans = std::collections::HashMap::new();
