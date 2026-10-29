@@ -1681,3 +1681,6 @@ mod arithmetic_recovery_tests;
 
 #[path = "stream_outbox_tests.rs"]
 mod stream_outbox_tests;
+
+#[path = "event_operation_tests.rs"]
+mod event_operation_tests;
