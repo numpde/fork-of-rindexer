@@ -811,3 +811,248 @@ fn read_manifest_keeps_comparisons_non_reorg_arithmetic_and_insert_filters() {
             .expect("insert-only cleanup does not reevaluate arithmetic predicates");
     }
 }
+
+fn shared_recovery_target_manifest(
+    shape: &str,
+    enabled: bool,
+    native: bool,
+) -> (tempfile::TempDir, std::path::PathBuf, String) {
+    let mut first = partial_assignment_table("creators");
+    first["database"] = "shared_state".into();
+    let mut second = first.clone();
+    first["events"][0]["operations"] =
+        serde_json::json!([first["events"][0]["operations"][0].clone()]);
+    second["events"][0]["operations"] =
+        serde_json::json!([second["events"][0]["operations"][1].clone()]);
+    match shape {
+        "set-arithmetic" => {
+            second["events"][0]["operations"][0]["set"] = serde_json::json!([
+            {"column":"amount","action":"add","value":"$value"}])
+        }
+        "insert-mutable" => {
+            let columns = serde_json::json!([{"name":"id","type":"address"},{"name":"amount","type":"uint256","default":"0"}]);
+            first["global"] = false.into();
+            second["global"] = false.into();
+            first["columns"] = columns.clone();
+            second["columns"] = columns;
+            first["events"][0]["operations"][0] = serde_json::json!({"type":"insert","set":[
+                {"column":"id","action":"set","value":"$from"},{"column":"amount","action":"set","value":"$value"}]});
+            second["events"][0]["operations"][0] = serde_json::json!({"type":"upsert","where":{"id":"$from"},"set":[
+                {"column":"amount","action":"add","value":"$value"}]});
+        }
+        "extrema-baseline" => {
+            first["events"][0]["operations"][0]["set"][0]["action"] = "max".into();
+            second["events"][0]["operations"][0]["set"][0]["action"] = "add".into();
+        }
+        "name-alias" => second["name"] = "Totals".into(),
+        "truncated-alias" => {
+            first["name"] = format!("{}one", "t".repeat(63)).into();
+            second["name"] = format!("{}two", "t".repeat(63)).into();
+        }
+        _ => {}
+    }
+    let (_directory, path) = recovery_table_manifest(first, enabled, false);
+    let mut manifest: serde_json::Value =
+        serde_yaml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    let target = if shape == "default-alias" {
+        let schema = if native { "recovery_evm_traces" } else { "recovery_second" };
+        manifest["contracts"][0]["tables"][0]["database"] = schema.into();
+        second.as_object_mut().unwrap().remove("database");
+        format!("{schema}.totals")
+    } else if shape == "truncated-alias" {
+        format!("shared_state.{}", "t".repeat(63))
+    } else {
+        "shared_state.totals".into()
+    };
+    if native {
+        second["events"][0]["event"] = "NativeTransfer".into();
+        manifest["native_transfers"] = serde_json::json!({"enabled":true,"networks":[{"network":"mainnet"}],"tables":[second]});
+    } else {
+        let mut contract = manifest["contracts"][0].clone();
+        contract["name"] = "Second".into();
+        contract["tables"] = serde_json::json!([second]);
+        manifest["contracts"].as_array_mut().unwrap().push(contract);
+    }
+    fs::write(&path, serde_yaml::to_string(&manifest).unwrap()).unwrap();
+    (_directory, path, target)
+}
+
+#[test]
+fn read_manifest_rejects_shared_recovery_targets_across_all_write_models() {
+    for shape in [
+        "set",
+        "set-arithmetic",
+        "insert-mutable",
+        "extrema-baseline",
+        "name-alias",
+        "default-alias",
+        "truncated-alias",
+    ] {
+        for native in [false, true] {
+            let (_directory, path, target) = shared_recovery_target_manifest(shape, true, native);
+            let error = read_manifest(&path).expect_err("separate declarations cannot hide incompatible operations on one recovered target").to_string();
+            assert!(
+                error.contains(&target)
+                    && error.contains("recovery")
+                    && error.contains("Token")
+                    && error.contains(if native { "native_transfers" } else { "Second" }),
+                "{shape}: {error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn read_manifest_keeps_non_reorg_sharing_and_distinct_recovered_destinations() {
+    for native in [false, true] {
+        let (_directory, path, _) = shared_recovery_target_manifest("set", false, native);
+        read_manifest(&path).expect("non-reorg table sharing remains supported");
+        for distinct_schema in [false, true] {
+            let (_directory, path, _) = shared_recovery_target_manifest("set", true, native);
+            let mut manifest: serde_json::Value =
+                serde_yaml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            let second = if native {
+                &mut manifest["native_transfers"]["tables"][0]
+            } else {
+                &mut manifest["contracts"][1]["tables"][0]
+            };
+            if distinct_schema {
+                second["database"] = "other_state".into();
+            } else {
+                second["name"] = "other_totals".into();
+            }
+            fs::write(&path, serde_yaml::to_string(&manifest).unwrap()).unwrap();
+            read_manifest(&path).expect(
+                "sharing a schema or table basename alone does not share a physical target",
+            );
+        }
+    }
+}
+
+#[test]
+fn read_manifest_rejects_recovered_schema_case_mismatch() {
+    let (_directory, path) =
+        recovery_table_manifest(arithmetic_predicate_table("$value > 0"), true, false);
+    let mut manifest: serde_json::Value =
+        serde_yaml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    manifest["contracts"][0]["tables"][0]["database"] = "Shared_State".into();
+    fs::write(&path, serde_yaml::to_string(&manifest).unwrap()).unwrap();
+    let error = read_manifest(&path)
+        .expect_err("quoted forward names and bare recovery SQL must agree on case")
+        .to_string();
+    assert!(error.contains("lowercase") && error.contains("Shared_State"), "{error}");
+}
+
+#[test]
+fn read_manifest_rejects_shared_recovery_with_non_reorg_delete_writer() {
+    for native in [false, true] {
+        let (_directory, path, target) = shared_recovery_target_manifest("set", true, native);
+        let mut manifest: serde_json::Value =
+            serde_yaml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        manifest["networks"].as_array_mut().unwrap().push(serde_json::json!({"name":"other","chain_id":2,"rpc":"http://unused.invalid","reorg_handling":{"enabled":false}}));
+        // These writers share keys across networks. The second source's own
+        // recovery flag cannot exempt its DELETE from the physical write model.
+        let mut first = manifest["contracts"][0]["tables"][0].clone();
+        first["global"] = false.into();
+        first["cross_chain"] = true.into();
+        first["columns"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"name":"id","type":"address"}));
+        first["events"][0]["operations"][0]["where"] = serde_json::json!({"id":"$from"});
+        manifest["contracts"][0]["tables"][0] = first.clone();
+        let mut second = first;
+        second["events"][0]["operations"][0] =
+            serde_json::json!({"type":"delete","where":{"id":"$from"}});
+        if native {
+            second["events"][0]["event"] = "NativeTransfer".into();
+            manifest["native_transfers"]["tables"][0] = second;
+            manifest["native_transfers"]["networks"][0]["network"] = "other".into();
+        } else {
+            manifest["contracts"][1]["tables"][0] = second;
+            manifest["contracts"][1]["details"][0]["network"] = "other".into();
+        }
+        fs::write(&path, serde_yaml::to_string(&manifest).unwrap()).unwrap();
+        let error = read_manifest(&path)
+            .expect_err("all shared writers participate in the recovered physical model")
+            .to_string();
+        assert!(
+            error.contains(&target)
+                && error.contains("recovery")
+                && error.contains("Token")
+                && error.contains(if native { "native_transfers" } else { "Second" }),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn read_manifest_rejects_quoted_alias_from_non_reorg_writer() {
+    for native in [false, true] {
+        let (_directory, path, target) = shared_recovery_target_manifest("set", true, native);
+        let mut manifest: serde_json::Value =
+            serde_yaml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        manifest["storage"]["postgres"]["disable_create_tables"] = true.into();
+        manifest["networks"].as_array_mut().unwrap().push(serde_json::json!({"name":"other","chain_id":2,"rpc":"http://unused.invalid","reorg_handling":{"enabled":false}}));
+        let second = if native {
+            manifest["native_transfers"]["networks"][0]["network"] = "other".into();
+            &mut manifest["native_transfers"]["tables"][0]
+        } else {
+            manifest["contracts"][1]["details"][0]["network"] = "other".into();
+            &mut manifest["contracts"][1]["tables"][0]
+        };
+        second["database"] = "\"shared_state\"".into();
+        fs::write(&path, serde_yaml::to_string(&manifest).unwrap()).unwrap();
+        let error = read_manifest(&path)
+            .expect_err("quoted forward writes resolve to the same recovered destination")
+            .to_string();
+        assert!(error.contains(&target) && error.contains("recovery"), "{error}");
+        let second = if native {
+            &mut manifest["native_transfers"]["tables"][0]
+        } else {
+            &mut manifest["contracts"][1]["tables"][0]
+        };
+        second["database"] = "\"Shared_State\"".into();
+        fs::write(&path, serde_yaml::to_string(&manifest).unwrap()).unwrap();
+        read_manifest(&path).expect("quoted uppercase names identify a distinct non-reorg schema");
+    }
+}
+
+#[test]
+fn read_manifest_rejects_qualified_schema_from_non_reorg_writer() {
+    let (_directory, path, _) = shared_recovery_target_manifest("set", true, false);
+    let mut manifest: serde_json::Value =
+        serde_yaml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    manifest["storage"]["postgres"]["disable_create_tables"] = true.into();
+    manifest["networks"].as_array_mut().unwrap().push(serde_json::json!({"name":"other","chain_id":2,"rpc":"http://unused.invalid","reorg_handling":{"enabled":false}}));
+    manifest["contracts"][1]["details"][0]["network"] = "other".into();
+    manifest["contracts"][1]["tables"][0]["database"] = "current_database.shared_state".into();
+    fs::write(&path, serde_yaml::to_string(&manifest).unwrap()).unwrap();
+    let error = read_manifest(&path)
+        .expect_err("recovery cannot resolve a database-qualified schema alias offline")
+        .to_string();
+    assert!(error.contains("schema.table") && error.contains("Second"), "{error}");
+}
+
+#[test]
+fn read_manifest_keeps_one_recovered_owner_with_multiple_sources() {
+    for native in [false, true] {
+        let (_directory, path) =
+            recovery_table_manifest(arithmetic_predicate_table("$value > 0"), true, native);
+        let mut manifest: serde_json::Value =
+            serde_yaml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        if native {
+            manifest["networks"].as_array_mut().unwrap().push(serde_json::json!({"name":"other","chain_id":2,"rpc":"http://unused.invalid","reorg_handling":{"enabled":true}}));
+            manifest["native_transfers"]["networks"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({"network":"other"}));
+        } else {
+            let mut detail = manifest["contracts"][0]["details"][0].clone();
+            detail["address"] = "0x0000000000000000000000000000000000000002".into();
+            manifest["contracts"][0]["details"].as_array_mut().unwrap().push(detail);
+        }
+        fs::write(&path, serde_yaml::to_string(&manifest).unwrap()).unwrap();
+        read_manifest(&path).expect("source count does not duplicate a logical Table declaration");
+    }
+}
