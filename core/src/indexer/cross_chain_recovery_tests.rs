@@ -158,3 +158,68 @@ mod known_risks {
         }
     }
 }
+
+async fn shared_state(fixture: &Fixture) -> (String, serde_json::Value) {
+    let row = fixture
+        .client
+        .query_one(
+            &format!(
+                "SELECT amount::text, to_jsonb(t) - 'amount' FROM {} t",
+                fixture.params.tables[0].full_table_name
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    (row.get(0), row.get(1))
+}
+
+async fn equal_position_case(other_first: bool) {
+    let fixture = fixture("upsert", "set", false).await;
+    fixture.params.tables[0].table.validate_reorg_operations().unwrap();
+    let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+    let mut updates = [("ethereum", 10), ("other", 20)];
+    if other_first {
+        updates.reverse();
+    }
+    for (network, value) in updates {
+        callback(vec![at(&fixture, network, 99, B256::repeat_byte(value as u8), value)])
+            .await
+            .unwrap();
+    }
+    let before = shared_state(&fixture).await;
+    rollback(&fixture).await.unwrap();
+    assert_eq!(
+        shared_state(&fixture).await,
+        before,
+        "an unrelated later reorg must not change the equal-position winner or its provenance"
+    );
+    assert_eq!(
+        before.0, "20",
+        "equal positions use the bytewise greatest configured network name in either arrival order"
+    );
+    assert_eq!(before.1["network"], "other");
+    callback(vec![
+        at(&fixture, "ethereum", 99, B256::repeat_byte(10), 10),
+        at(&fixture, "other", 99, B256::repeat_byte(20), 20),
+    ])
+    .await
+    .unwrap();
+    assert_eq!(
+        shared_state(&fixture).await,
+        before,
+        "receipt replay must preserve the deterministic winner"
+    );
+    drop(callback);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_cross_chain_equal_position_winner_survives_recovery() {
+    equal_position_case(false).await;
+}
+
+#[tokio::test]
+async fn postgres_cross_chain_equal_position_winner_is_independent_of_arrival_order() {
+    equal_position_case(true).await;
+}
