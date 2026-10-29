@@ -643,14 +643,11 @@ pub(super) fn build_derived_tables_for_event(
                 let columns: Vec<DerivedColumnRollback> = operation
                     .set
                     .iter()
-                    .filter(|set_col| {
-                        set_col.action.reverse().is_some()
-                            && (set_col.action.is_counter_action()
-                                || set_col.event_field_name().is_some())
-                    })
+                    .filter(|set_col| set_col.action.reverse().is_some())
                     .map(|set_col| {
                         let event_field = set_col
-                            .event_field_name()
+                            .reorg_event_field()
+                            .map_err(anyhow::Error::msg)?
                             .unwrap_or("rindexer_block_number")
                             .to_string();
                         DerivedColumnRollback::try_new(
@@ -871,6 +868,9 @@ pub(super) async fn start_indexing_contract_events(
         // once per source event/network, while rewinding every subscription cursor.
         let mut registered_networks = std::collections::HashSet::new();
         for network_contract in event.contract.details.iter() {
+            if !reorg_configs.contains_key(&network_contract.network) {
+                continue;
+            }
             if !registered_networks.insert(&network_contract.network) {
                 continue;
             }
@@ -907,6 +907,9 @@ pub(super) async fn start_indexing_contract_events(
     if manifest.native_transfers.enabled {
         if let Some(networks) = &manifest.native_transfers.networks {
             for nt_detail in networks {
+                if !reorg_configs.contains_key(&nt_detail.network) {
+                    continue;
+                }
                 let schema = generate_indexer_contract_schema_name(
                     &manifest.name,
                     NATIVE_TRANSFER_CONTRACT_NAME,
@@ -941,6 +944,9 @@ pub(super) async fn start_indexing_contract_events(
                 )?
             };
             for network_detail in trace_event.trace_information.details.iter() {
+                if !reorg_configs.contains_key(&network_detail.network) {
+                    continue;
+                }
                 build_derived_tables_for_event(
                     &trace_event.event_name,
                     &trace_event.indexer_name,

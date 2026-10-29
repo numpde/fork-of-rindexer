@@ -96,6 +96,12 @@ with default 42, a later `max(20)` retains 42, but journaling only 20 loses that
 baseline. Conversely, a first `max(20)` can create a row at 20 despite default 42;
 always folding the default into recovery would also be wrong.
 
+For a fixed baseline of 42, each creator can explicitly journal
+`{ column: extreme, action: max, value: "42" }` (use `min` for a minimum).
+That records the baseline as a source contribution at creation. Literal extrema
+operands are supported because they are journaled; the arithmetic restriction
+below applies to reversible actions.
+
 Keep monotonic extrema in a table whose creators journal their initial operand,
 or split unsupported operations into separate tables. Adding an extrema action
 to a creator can change its initial value: review that behavior before migrating.
@@ -118,3 +124,22 @@ Deletes on networks without reorg handling retain their existing behavior.
 This restriction prevents new accepted delete histories; it does not restore rows
 lost during an earlier rollback. Verify affected canonical ranges and coordinate
 any repair with derived state, journals, application receipts and cursors.
+
+## Reversible arithmetic operands
+
+On reorg-enabled mutable tables, `add` and `subtract` require a single event-field
+operand such as `$value`. Literal and computed operands now fail startup; they
+were not reliably represented in the rollback plan. The planner also rejects an
+unsupported operand rather than silently omitting the operation.
+
+For unit counts, use `increment` or `decrement` with `value` omitted or set to
+`"1"`. Other explicit counter operands now fail startup because their recovery
+counts events rather than summing arbitrary amounts. For non-unit constants, use
+a supported event-field value or move the aggregation outside the recovered table.
+Review semantics before replacing an arbitrary amount with a unit counter.
+
+These checks cover contract and native-transfer tables. Recovery plans are built
+only for reorg-enabled networks, preserving literal arithmetic on other networks.
+Insert-only tables retain their existing behavior. Editing YAML does not repair
+state previously lost through an incomplete rollback plan: coordinate any verified
+canonical rebuild with derived state, journals, receipts and cursors.

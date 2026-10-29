@@ -372,6 +372,13 @@ impl Table {
         if self.is_insert_only() {
             return Ok(());
         }
+        for operation in self.all_operations() {
+            for column in operation.set.iter().filter(|column| column.action.reverse().is_some()) {
+                column
+                    .reorg_event_field()
+                    .map_err(|reason| format!("Table '{}': {reason}", self.name))?;
+            }
+        }
         for extrema in self
             .all_operations()
             .flat_map(|operation| &operation.set)
@@ -1255,6 +1262,28 @@ impl SetColumn {
             Some(v) => v.as_str(),
             None if self.action.is_counter_action() => "1",
             None => "",
+        }
+    }
+
+    /// Reversal counts unit counters; other arithmetic must read one source field.
+    pub(crate) fn reorg_event_field(&self) -> Result<Option<&str>, String> {
+        if self.action.is_counter_action() {
+            if self.effective_value() != "1" {
+                return Err(format!(
+                    "Column '{}' has a non-unit counter operand on a reorg-enabled network. Count-based recovery requires increment/decrement by exactly 1; omit value or use `value: '1'`.",
+                    self.column
+                ));
+            }
+            return Ok(None);
+        }
+        match self.event_field_name() {
+            Some(field) if matches!(crate::event::parse_arithmetic_expression(field),
+                Ok(crate::event::ArithmeticExpr::Variable(variable)) if variable.source() == crate::event::VariableSource::Event
+            ) => Ok(Some(field)),
+            _ => Err(format!(
+                "Column '{}' needs a single event-field operand for arithmetic on a reorg-enabled network. Literal and computed operands cannot be reconstructed; use increment/decrement for unit counters or a supported event-field value.",
+                self.column
+            )),
         }
     }
 

@@ -291,3 +291,54 @@ async fn postgres_arithmetic_recovery_separate_column_set_restores_null() {
     separate_column_recovery("set", json!({"name":"latest","type":"uint256","nullable":true}))
         .await;
 }
+
+async fn journaled_creation_baseline(action: &str, canonical_operand: u64, orphan_operand: u64) {
+    let fixture = Fixture::with_table(serde_json::to_value(params().event).unwrap(), "Contract", json!({
+        "name":"totals", "global":true, "timestamp":true,
+        "columns":[{"name":"amount", "type":"uint256", "default":"0"}, {"name":"latest", "type":"uint256", "default":"42"}],
+        "events":[{"event":"Value", "operations":[
+            {"type":"upsert", "if":"value == 10", "set":[
+                {"column":"amount", "action":"add", "value":"$value"},
+                {"column":"latest", "action":action, "value":"42"}
+            ]},
+            {"type":"update", "if":"value != 10", "set":[{"column":"latest", "action":action, "value":"$value"}]}
+        ]}]
+    })).await;
+    fixture.params.tables[0]
+        .table
+        .validate_reorg_operations()
+        .expect("the explicit creation baseline must pass admission");
+    let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+    callback(vec![input(&fixture, 98, 98, 10)]).await.unwrap();
+    callback(vec![input(&fixture, 99, 99, canonical_operand)]).await.unwrap();
+    let canonical = state(&fixture).await;
+    let baseline: String = fixture
+        .client
+        .query_one(
+            &format!("SELECT latest::text FROM {}", fixture.params.tables[0].full_table_name),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        baseline, "42",
+        "the canonical extrema operand must leave the creation baseline unchanged"
+    );
+    callback(vec![input(&fixture, 100, 100, orphan_operand)]).await.unwrap();
+    assert_ne!(state(&fixture).await, canonical);
+    rollback(&fixture).await;
+    assert_eq!(state(&fixture).await, canonical, "a surviving non-changing operand must not replace the actual creation baseline or provenance");
+    drop(callback);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_arithmetic_recovery_journaled_creation_baseline_max() {
+    journaled_creation_baseline("max", 20, 60).await;
+}
+
+#[tokio::test]
+async fn postgres_arithmetic_recovery_journaled_creation_baseline_min() {
+    journaled_creation_baseline("min", 60, 20).await;
+}

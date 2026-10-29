@@ -555,6 +555,8 @@ fn read_manifest_keeps_tracked_arithmetic_and_non_reorg_literals() {
         ("increment", Some("1"), true),
         ("decrement", Some("1"), true),
         ("increment", Some("2"), false),
+        ("max", Some("42"), true),
+        ("min", Some("42"), true),
         ("add", Some("1"), false),
         ("subtract", Some("1"), false),
     ] {
