@@ -34,6 +34,35 @@ apply to its storage and configuration:
 These notes retain their existing URLs. Their place in this section identifies
 them as maintained fork documentation.
 
+## Arithmetic predicates and recovered tables
+
+Mutable tables on a reorg-enabled network now reject arithmetic expressions in
+`if` and its legacy `filter` alias. This includes division, addition, subtraction,
+multiplication and exponentiation, for contract and native-transfer tables.
+Forward filters evaluate checked unsigned integers; SQL division returns a
+fraction, and SQL overflow/error behavior also differs. Recovery cannot safely
+use that SQL predicate to decide which source effects actually occurred.
+
+Use verified equivalent comparisons. For example:
+
+```yaml
+if: "$rindexer_block_timestamp >= 1000 && $rindexer_block_timestamp < 2000"
+```
+
+This expresses the integer predicate `$rindexer_block_timestamp / 1000 == 1`.
+Logical combinations of comparisons remain supported. Arithmetic characters
+inside string literals are not interpreted as arithmetic. Non-reorg predicate
+arithmetic, insert-only filters and existing value expressions retain their
+behavior; insert-only recovery deletes rows by provenance without reevaluating
+the filter.
+
+Legacy recovery plans containing arithmetic now return an explicit error before
+permanent raw data, receipts, effects or cursors change. Verify the rewrite and
+source metadata before retrying recovery; changing a predicate to a different
+meaning does not repair previously indexed effects. General SQL emulation of the
+forward integer evaluator is deferred rather than approximated operator by
+operator.
+
 ## Complete assignment groups for recovered rows
 
 On a reorg-enabled table, every mutable operation must supply every non-key column

@@ -688,6 +688,12 @@ fn render_reorg_condition(condition: &str, source: &ReversalSource<'_>) -> anyho
             return Ok(condition.to_string());
         }
     };
+    // Old stored history and public task callers can bypass current manifest
+    // admission. Stop before event deletion instead of guessing integer semantics.
+    anyhow::ensure!(
+        !expression.has_arithmetic(),
+        "Cannot reconstruct recovery predicate {condition:?}: arithmetic predicates use checked unsigned-integer semantics during forward execution and are unsupported by recovery SQL; use verified equivalent comparisons before retrying recovery"
+    );
     expression
         .to_sql_event_condition(|variable| {
             let expression = source.variable_expression(variable);

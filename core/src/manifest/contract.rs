@@ -373,6 +373,15 @@ impl Table {
             return Ok(());
         }
         for operation in self.all_operations() {
+            if operation.condition().is_some_and(|condition| {
+                crate::event::parse_filter_expression(condition)
+                    .is_ok_and(|expression| expression.has_arithmetic())
+            }) {
+                return Err(format!(
+                    "Table '{}' uses an arithmetic predicate on a reorg-enabled mutable table. Forward filters use checked unsigned-integer arithmetic, but recovery SQL cannot reproduce those semantics. Rewrite the predicate as equivalent comparisons, such as timestamp >= 1000 && timestamp < 2000 instead of timestamp / 1000 == 1. Non-reorg and insert-only filters remain supported.",
+                    self.name
+                ));
+            }
             if operation.operation_type == OperationType::Update
                 && operation.set.iter().any(|column| column.action.reverse().is_some())
             {

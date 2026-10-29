@@ -201,6 +201,19 @@ impl<'a> Expression<'a> {
         }
     }
 
+    /// Whether a predicate computes a value, rather than only comparing inputs.
+    /// Inspect syntax so operator characters inside string literals stay literals.
+    pub(crate) fn has_arithmetic(&self) -> bool {
+        match self {
+            Self::Condition(condition) => {
+                matches!(&condition.left, ArithmeticExpr::Binary { .. })
+                    || matches!(&condition.right, ArithmeticExpr::Binary { .. })
+            }
+            Self::Logical { left, right, .. } => left.has_arithmetic() || right.has_arithmetic(),
+            Self::Not(inner) => inner.has_arithmetic(),
+        }
+    }
+
     pub(crate) fn visit_variables(&self, visitor: &mut impl FnMut(&ConditionLeft<'a>)) {
         match self {
             Self::Condition(condition) => {
