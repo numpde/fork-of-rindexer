@@ -859,4 +859,55 @@ WHERE am.holder = tp.holder
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|row| row.len() == 4));
     }
+
+    #[tokio::test]
+    async fn postgres_event_owner_matches_only_the_active_transaction() {
+        use crate::manifest::contract::injected_columns::*;
+        let (url, _container) =
+            crate::database::unsigned_integer_tests::postgres_fixture_url().await;
+        let (mut client, connection) =
+            tokio_postgres::connect(&url, tokio_postgres::NoTls).await.unwrap();
+        let connection = tokio::spawn(connection);
+        let version: String = client.query_one("SHOW server_version", &[]).await.unwrap().get(0);
+        eprintln!("Testing transaction ownership on PostgreSQL {version}");
+        let columns = [RINDEXER_SEQUENCE_ID, BLOCK_HASH, TX_HASH, CONTRACT_ADDRESS]
+            .iter()
+            .map(|name| {
+                DynamicColumnDefinition::new(
+                    (*name).into(),
+                    if *name == RINDEXER_SEQUENCE_ID {
+                        EthereumSqlTypeWrapper::U128(1)
+                    } else {
+                        EthereumSqlTypeWrapper::String("identity".into())
+                    },
+                    if *name == RINDEXER_SEQUENCE_ID {
+                        BatchOperationSqlType::Numeric
+                    } else {
+                        BatchOperationSqlType::Text
+                    },
+                    if *name == RINDEXER_SEQUENCE_ID {
+                        BatchOperationColumnBehavior::Sequence
+                    } else {
+                        BatchOperationColumnBehavior::Normal
+                    },
+                    BatchOperationAction::Set,
+                )
+            })
+            .collect::<Vec<_>>();
+        let condition = event_continuation(&columns, "input", "target").unwrap();
+        let query =
+            format!("SELECT {condition} FROM event_owner target CROSS JOIN event_owner input");
+        let tx = client.transaction().await.unwrap();
+        tx.batch_execute("CREATE TEMP TABLE event_owner (rindexer_sequence_id NUMERIC, rindexer_block_hash TEXT, rindexer_tx_hash TEXT, rindexer_contract_address TEXT); INSERT INTO event_owner VALUES (1, 'block', 'transaction', 'address')").await.unwrap();
+        let owns: bool =
+            tx.query_one(&query, &[]).await.expect("current transaction ownership query").get(0);
+        assert!(owns, "the active transaction must recognize its row version");
+        tx.commit().await.unwrap();
+        let tx = client.transaction().await.unwrap();
+        let owns: bool = tx.query_one(&query, &[]).await.unwrap().get(0);
+        assert!(!owns, "a committed row cannot authorize continuation in a later transaction");
+        tx.rollback().await.unwrap();
+        drop(client);
+        connection.await.unwrap().unwrap();
+    }
 }
