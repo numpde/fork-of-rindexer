@@ -49,7 +49,8 @@ class MakeTimeoutTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             checkout = Path(directory) / 'checkout with spaces'
             for relative in ['Makefile', 'cli/Makefile', 'e2e-tests/Makefile',
-                             'tools/make-timeout.mk', 'tools/make-recipe.sh', 'tools/make-recipe.py']:
+                             'tools/make-timeout.mk', 'tools/make-recipe.sh', 'tools/make-recipe.py',
+                             'containers/development/docs.mk']:
                 destination = checkout / relative
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(ROOT / relative, destination)
