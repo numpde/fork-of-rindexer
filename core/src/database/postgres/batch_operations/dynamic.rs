@@ -76,9 +76,9 @@ pub async fn execute_dynamic_batch_operation(
     rows: Vec<Vec<DynamicColumnDefinition>>,
     event_name: &str,
     custom_where: Option<&str>,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     if rows.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
 
     // PostgreSQL wire protocol limits parameters to i16::MAX (32767) per statement.
@@ -86,25 +86,26 @@ pub async fn execute_dynamic_batch_operation(
     let num_columns = rows.first().map_or(1, |r| r.len().max(1));
     let max_rows_per_batch = (32767 / num_columns).max(1);
 
+    let mut affected = 0;
     for batch in rows.chunks(max_rows_per_batch) {
         let Some(statement) = build_batch_statement(table_name, op_type, batch, custom_where)
         else {
             continue;
         };
-        execute_batch_statement(mode, statement).await.map_err(|e| {
+        affected += execute_batch_statement(mode, statement).await.map_err(|e| {
             tracing::error!("{} - Batch operation failed: {}", event_name, e);
             e
         })?;
     }
 
-    Ok(())
+    Ok(affected)
 }
 
 /// Sends one built statement to Postgres in the given write mode.
 pub async fn execute_batch_statement(
     mode: PgWriteMode<'_>,
     statement: DynamicBatchStatement,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     match statement {
         DynamicBatchStatement::Query { sql, params } => {
             let param_refs: Vec<&(dyn ToSql + Sync)> =
@@ -114,13 +115,12 @@ pub async fn execute_batch_statement(
 
             match mode {
                 PgWriteMode::Eager(database) => database
-                    .with_transaction(&sql, &param_refs, |_| async move { Ok(()) })
+                    .with_transaction(&sql, &param_refs, |count| async move { Ok(count) })
                     .await
                     .map_err(|e| query_failure(&e, e.to_string(), &sql)),
                 PgWriteMode::Tx(transaction) => transaction
                     .execute(sql.as_str(), &param_refs)
                     .await
-                    .map(|_| ())
                     .map_err(|e| query_failure(&e, pg_error_to_string(&e), &sql)),
             }
         }
@@ -149,7 +149,7 @@ pub async fn execute_batch_statement(
                 }
             };
 
-            result.map_err(|e| {
+            result.map(|_| rows.len() as u64).map_err(|e| {
                 tracing::error!("PostgreSQL COPY error: {:?}", e);
                 e.to_string()
             })

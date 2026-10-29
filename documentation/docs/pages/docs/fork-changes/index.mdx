@@ -154,10 +154,29 @@ address match. Committed equal-position rows and different events retain the
 strict ordering protection. Application receipts still suppress event replay.
 
 Multi-operation mutable batches execute per input to preserve this order, which
-can issue more SQL statements than the former operation-first batching. Single
-operations and insert-only batches retain their batching in this repair. The
+can issue more SQL statements than the former operation-first batching. Insert-only batches and single operations that need no recovery journal retain
+batching. Journaled operations follow the per-input rules below. The
 sequence encoding and schema do not change.
 
 An event whose second effect was previously skipped may already have a receipt.
 Upgrading does not replay it automatically. Verify affected ranges and coordinate
 canonical derived-state repair with journals, application receipts and cursors.
+
+## Journals record applied inputs
+
+PostgreSQL journals now follow each journaled input's affected-row result. An
+`update` against a missing row, or an input rejected by sequence or table-state
+conditions, contributes no recovery entry. Its valid raw event and application
+receipt can still commit: an UPDATE that matches no row is a configured no-op.
+
+Journaled inputs execute individually in event order. This also prevents a
+rejected older operand from being aggregated into an admitted newer UPDATE.
+When several applied `set` writes share one event position, the journal ID
+breaks ties so recovery selects the last applied write.
+The same rule applies to eager per-operation PostgreSQL writes; their existing
+commit boundary is unchanged. Journaled batches may issue more SQL statements,
+and PostgreSQL table logs report affected rows.
+
+Old phantom journal entries are not removed automatically. Verify affected ranges
+and rebuild derived state and journals together with receipts and cursors before
+relying on recovery. No journal schema migration is introduced by this change.

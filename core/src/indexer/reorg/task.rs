@@ -1405,7 +1405,7 @@ impl ReorgTask {
                                  SELECT DISTINCT ON (where_key) where_key, value \
                                  FROM rindexer_internal.derived_op_log \
                                  WHERE derived_table = '{}' AND column_name = '{}'{} \
-                                 ORDER BY where_key, block_number DESC, tx_index DESC, log_index DESC \
+                                 ORDER BY where_key, block_number DESC, tx_index DESC, log_index DESC, id DESC \
                              ) sub \
                              WHERE {} {}",
                             dt.full_table_name, jc.derived_column, jc.derived_column, jc.derived_column,

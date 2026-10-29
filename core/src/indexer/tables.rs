@@ -3943,19 +3943,19 @@ pub(crate) async fn apply_table_operations(
             let mut connection =
                 postgres.raw_connection().await.map_err(|error| error.to_string())?;
             let tx = connection.transaction().await.map_err(|error| pg_error_to_string(&error))?;
-            execute_postgres_operation(
-                PgWriteMode::Tx(&tx),
-                &op.table.full_table_name,
-                &op.table.table,
-                op.operation,
-                &op.rows,
-                op.sql_condition.as_deref(),
-            )
-            .await?;
-
-            // Journal non-reversible operations (Set/Max/Min) for reorg recalculation
-            journal_non_reversible_ops(&tx, &op.table.full_table_name, op.operation, &op.rows)
-                .await?;
+            if requires_recovery_journal(op.operation) {
+                let mut inputs = op
+                    .rows
+                    .iter()
+                    .map(|row| Ok((postgres_event_order(row)?, row)))
+                    .collect::<Result<Vec<_>, String>>()?;
+                inputs.sort_by_key(|(order, _)| *order);
+                for (_, row) in inputs {
+                    apply_postgres_rows(&tx, op, std::slice::from_ref(row)).await?;
+                }
+            } else {
+                apply_postgres_rows(&tx, op, &op.rows).await?;
+            }
             tx.commit().await.map_err(|error| pg_error_to_string(&error))?;
         }
 
@@ -3994,28 +3994,59 @@ pub(crate) async fn apply_table_operations(
     Ok(())
 }
 
+fn requires_recovery_journal(operation: &TableOperation) -> bool {
+    matches!(operation.operation_type, OperationType::Upsert | OperationType::Update)
+        && operation.set.iter().any(|column| column.action.reverse().is_none())
+}
+
+fn postgres_event_order(row: &TableRowData) -> Result<(&str, u128), String> {
+    match row.columns.get(injected_columns::RINDEXER_SEQUENCE_ID) {
+        Some(EthereumSqlTypeWrapper::U128(sequence)) => Ok((row.network.as_str(), *sequence)),
+        _ => {
+            Err("Cannot apply derived event operations: prepared row has no event sequence".into())
+        }
+    }
+}
+
+// Journaled writes arrive one input at a time so PostgreSQL's command result
+// identifies that input's outcome. Non-journaled operations can retain batching.
+async fn apply_postgres_rows(
+    tx: &PgTransaction<'_>,
+    op: &PreparedOperation<'_>,
+    rows: &[TableRowData],
+) -> Result<(), String> {
+    let affected = execute_postgres_operation(
+        PgWriteMode::Tx(tx),
+        &op.table.full_table_name,
+        &op.table.table,
+        op.operation,
+        rows,
+        op.sql_condition.as_deref(),
+    )
+    .await?;
+    if affected > 0 {
+        journal_non_reversible_ops(tx, &op.table.full_table_name, op.operation, rows).await?;
+    }
+    Ok(())
+}
+
 /// Stages every prepared operation and its journal row in `tx`; nothing commits here.
 async fn apply_table_operations_in_tx(
     prepared: &PreparedTableOps<'_>,
     tx: &PgTransaction<'_>,
 ) -> Result<(), String> {
-    let ordered = prepared.ops.len() > 1
-        && prepared.ops.iter().any(|op| op.operation.operation_type != OperationType::Insert);
+    let ordered = (prepared.ops.len() > 1
+        && prepared.ops.iter().any(|op| op.operation.operation_type != OperationType::Insert))
+        || prepared.ops.iter().any(|op| requires_recovery_journal(op.operation));
     let mut inputs = Vec::new();
     if ordered {
         // Event order precedes operation order: a later event must not advance
         // row metadata before an earlier event has finished all of its writes.
         for (operation_index, op) in prepared.ops.iter().enumerate() {
             for (row_index, row) in op.rows.iter().enumerate() {
-                let sequence = match row.columns.get(injected_columns::RINDEXER_SEQUENCE_ID) {
-                    Some(EthereumSqlTypeWrapper::U128(sequence)) => *sequence,
-                    _ => return Err(
-                        "Cannot apply derived event operations: prepared row has no event sequence"
-                            .into(),
-                    ),
-                };
+                let (network, sequence) = postgres_event_order(row)?;
                 inputs.push((
-                    (row.network.as_str(), sequence, operation_index, row_index),
+                    (network, sequence, operation_index, row_index),
                     op,
                     std::slice::from_ref(row),
                 ));
@@ -4028,16 +4059,7 @@ async fn apply_table_operations_in_tx(
         }
     }
     for (_, op, rows) in inputs {
-        execute_postgres_operation(
-            PgWriteMode::Tx(tx),
-            &op.table.full_table_name,
-            &op.table.table,
-            op.operation,
-            rows,
-            op.sql_condition.as_deref(),
-        )
-        .await?;
-        journal_non_reversible_ops(tx, &op.table.full_table_name, op.operation, rows).await?;
+        apply_postgres_rows(tx, op, rows).await?;
     }
 
     Ok(())
@@ -4188,9 +4210,9 @@ async fn execute_postgres_operation(
     operation: &TableOperation,
     rows: &[TableRowData],
     sql_where: Option<&str>,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     if rows.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
 
     // Build rows of DynamicColumnDefinition for the batch operation
@@ -4373,8 +4395,15 @@ async fn execute_postgres_operation(
     let short_table_name = table_name.split('.').next_back().unwrap_or(table_name);
     let event_name = format!("Tables::{}", short_table_name);
 
-    execute_dynamic_batch_operation(mode, table_name, op_type, batch_rows, &event_name, sql_where)
-        .await?;
+    let affected = execute_dynamic_batch_operation(
+        mode,
+        table_name,
+        op_type,
+        batch_rows,
+        &event_name,
+        sql_where,
+    )
+    .await?;
 
     let op_label = match operation.operation_type {
         OperationType::Upsert => "UPSERT",
@@ -4383,9 +4412,9 @@ async fn execute_postgres_operation(
         OperationType::Delete => "DELETE",
     };
 
-    info!("Tables::{} - {} - {} rows", short_table_name, op_label, rows.len());
+    info!("Tables::{} - {} - {} rows", short_table_name, op_label, affected);
 
-    Ok(())
+    Ok(affected)
 }
 
 /// Executes a ClickHouse operation for tables using the batch operations infrastructure.
@@ -4585,6 +4614,7 @@ pub async fn execute_postgres_operation_internal(
         sql_where,
     )
     .await
+    .map(|_| ())
 }
 
 /// Internal ClickHouse operation execution - used by cron scheduler.
