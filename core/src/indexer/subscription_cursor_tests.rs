@@ -220,6 +220,7 @@ async fn postgres_overlapping_subscriptions_share_receipts_but_advance_separate_
 async fn run_tip_subscription(fixture: &Fixture, head: u64) -> String {
     let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
     let mut registry = super::super::permanent_failure_tests::registry(&fixture.params, callback);
+    registry.events[0].tables = fixture.params.tables.clone();
     let logs = (100..=head)
         .map(|number| {
             let mut log = fixture.events(&[number]).remove(0).log;
@@ -258,7 +259,7 @@ async fn run_tip_subscription(fixture: &Fixture, head: u64) -> String {
     let registry = registry.complete();
     let progress = IndexingEventsProgressState::monitor(&registry.events, &[], None).await;
     let manifest = serde_json::from_value(json!({"name":"Replay","project_type":"no-code",
-        "contracts":[],"networks":[{"name":"ethereum","chain_id":1,"rpc":"http://unused.invalid"}]})).unwrap();
+        "contracts":[{"name":fixture.params.contract_name,"abi":"abi.json","details":[]}],"networks":[{"name":"ethereum","chain_id":1,"rpc":"http://unused.invalid"}]})).unwrap();
     // Complete the production historical phase at the current tip on each run;
     // both range fields remain omitted in the subscription being restarted.
     let (handles, _, _, _, _) = crate::indexer::start::start_indexing_contract_events(
@@ -322,5 +323,23 @@ async fn postgres_restart_without_start_block_recovers_downtime_exactly_once() {
         .unwrap()
         .get(0);
     assert_eq!(receipts, 6, "one application receipt per canonical event");
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_non_reorg_literal_arithmetic_survives_startup_and_restart() {
+    let mut fixture = Fixture::new().await;
+    Arc::make_mut(&mut fixture.params.tables)[0].table.events[0].operations[0].set[0].value =
+        Some("1".into());
+    run_tip_subscription(&fixture, 100).await;
+    assert_eq!(fixture.position().await, (1, "1".into(), "100".into()));
+    run_tip_subscription(&fixture, 102).await;
+    assert_eq!(fixture.position().await, (3, "3".into(), "102".into()));
+    run_tip_subscription(&fixture, 102).await;
+    assert_eq!(
+        fixture.position().await,
+        (3, "3".into(), "102".into()),
+        "non-reorg literal arithmetic remains valid and exactly-once on restart"
+    );
     fixture.finish().await;
 }

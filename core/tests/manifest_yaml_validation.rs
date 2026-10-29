@@ -514,3 +514,74 @@ fn read_manifest_keeps_non_reorg_deletes_and_recoverable_state_replacements() {
         read_manifest(&path).expect("journaled set operations remain valid without deletes");
     }
 }
+
+fn arithmetic_operand_table(action: &str, value: Option<&str>) -> serde_json::Value {
+    let mut table = deletion_recovery_table();
+    table["events"][0]["operations"].as_array_mut().unwrap().pop();
+    let column = &mut table["events"][0]["operations"][0]["set"][0];
+    column["action"] = action.into();
+    if let Some(value) = value {
+        column["value"] = value.into();
+    } else {
+        column.as_object_mut().unwrap().remove("value");
+    }
+    table
+}
+
+#[test]
+fn read_manifest_rejects_untracked_literal_arithmetic() {
+    for action in ["add", "subtract"] {
+        for native in [false, true] {
+            let (_directory, path) =
+                recovery_table_manifest(arithmetic_operand_table(action, Some("1")), true, native);
+            let error = read_manifest(&path)
+                .expect_err("a literal arithmetic effect must not disappear from the recovery plan")
+                .to_string();
+            assert!(
+                error.contains("amount") && error.contains("operand") && error.contains("reorg"),
+                "{action}: {error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn read_manifest_keeps_tracked_arithmetic_and_non_reorg_literals() {
+    for (action, value, enabled) in [
+        ("add", Some("$value"), true),
+        ("subtract", Some("$value"), true),
+        ("increment", None, true),
+        ("decrement", None, true),
+        ("increment", Some("1"), true),
+        ("decrement", Some("1"), true),
+        ("increment", Some("2"), false),
+        ("add", Some("1"), false),
+        ("subtract", Some("1"), false),
+    ] {
+        for native in [false, true] {
+            let (_directory, path) =
+                recovery_table_manifest(arithmetic_operand_table(action, value), enabled, native);
+            read_manifest(&path)
+                .expect("tracked arithmetic and non-reorg literal operands remain supported");
+        }
+    }
+}
+
+#[test]
+fn read_manifest_rejects_non_unit_counter_operands() {
+    for action in ["increment", "decrement"] {
+        for value in ["0", "2", "$value"] {
+            for native in [false, true] {
+                let (_directory, path) = recovery_table_manifest(
+                    arithmetic_operand_table(action, Some(value)),
+                    true,
+                    native,
+                );
+                let error = read_manifest(&path)
+                    .expect_err("count-based reversal requires a unit counter operand")
+                    .to_string();
+                assert!(error.contains("amount") && error.contains("operand"), "{action}: {error}");
+            }
+        }
+    }
+}

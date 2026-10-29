@@ -2513,4 +2513,30 @@ events:
         assert_eq!(rollback.columns.len(), 1);
         assert_eq!(rollback.columns[0].action, crate::manifest::contract::SetAction::Increment);
     }
+    #[test]
+    fn reorg_planner_rejects_literal_arithmetic_instead_of_dropping_it() {
+        for action in ["add", "subtract", "increment", "decrement"] {
+            let table: crate::manifest::contract::Table = serde_json::from_value(serde_json::json!({
+                "name":"totals", "global":true,
+                "columns":[{"name":"amount", "type":"uint256", "default":"0"}],
+                "events":[{"event":"Value", "operations":[{"type":"upsert", "set":[
+                    {"column":"amount", "action":action, "value":if action == "add" || action == "subtract" {"1"} else {"2"}}
+                ]}]}]
+            })).unwrap();
+            let result = build_derived_tables_for_event(
+                "Value",
+                "test_indexer",
+                "Token",
+                "ethereum",
+                &HashMap::new(),
+                &[crate::indexer::tables::TableRuntime::new(table, "test_indexer", "Token")],
+                &mut HashMap::new(),
+                &mut HashMap::new(),
+            );
+            assert!(
+                result.is_err(),
+                "{action}: a reversible effect needs a complete plan or an explicit startup error"
+            );
+        }
+    }
 }
