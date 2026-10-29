@@ -34,6 +34,42 @@ apply to its storage and configuration:
 These notes retain their existing URLs. Their place in this section identifies
 them as maintained fork documentation.
 
+## Runtime lifecycle integration check
+
+After building an image separately with `make runtime/image/build`, run:
+
+```sh
+make MAKE_TIMEOUT=8m runtime/lifecycle/checks RINDEXER_IMAGE=sha256:...
+```
+
+Use the immutable local image ID printed by the build. The check requires the
+pinned PostgreSQL and Anvil images to be present; it never builds or pulls images.
+It uses the local rootless Docker context named `rootless` by default. Set
+`RINDEXER_DOCKER_CONTEXT` to select another local rootless context. The selected
+Unix socket is resolved once and used for rendering, execution and cleanup;
+ambient Docker and Compose overrides are discarded.
+
+The self-contained `Funded` ABI and event emitter live in this repository. The
+check starts the actual indexer image, backfills an event, catches up after
+indexer downtime, replaces a block on local Anvil, and restarts again. Every
+phase requires the expected raw rows, funding total, provenance, application
+receipt count, orphan removal and durable health cursor with zero lag. Large
+amounts exceed 64-bit range. This tests indexing, not PayToPlay payment logic,
+and reads no sibling checkout. A historical image can be supplied to reproduce a
+regression; the result records its image ID and revision label when present,
+rather than assuming it was built from the current checkout.
+
+The host runs only the Python standard-library orchestrator and Docker client.
+The disposable services run as non-root users with read-only root filesystems,
+dropped capabilities, and a combined one-CPU budget. PostgreSQL and Anvil have
+no published ports; health uses a temporary loopback port. A unique Compose
+project owns its database volume, which is deleted on success, failure or handled
+cancellation. Teardown failure fails the check and prints the recovery command.
+The runtime profile retains its routable RPC bridge; configured endpoints are
+local fixtures, but this check does not restrict internet egress. No engine socket
+or checkout is mounted into the containers. `MAKE_TIMEOUT` bounds the full check
+and reserves the existing cleanup grace period.
+
 ## Historical-to-live cursor identity
 
 A subscription keeps its configured `start_block` as part of its durable cursor

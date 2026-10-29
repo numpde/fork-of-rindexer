@@ -546,6 +546,10 @@ runtime/image/build: tests/posture ## Build the minimal PostgreSQL CLI image off
 	docker build --network none --tag rindexer-postgres:local - < "$$scratch_dir/runtime.tar"
 	docker image inspect rindexer-postgres:local --format '{{.Id}}'
 
+.PHONY: runtime/lifecycle/checks
+runtime/lifecycle/checks: ## Check an explicit runtime image through backfill, restart, reorg and health on disposable rootless fixtures
+	@python3 -B containers/runtime/lifecycle.py
+
 .PHONY: runtime/checks
 runtime/checks: runtime/launcher/checks ## Check the rendered single-host PostgreSQL deployment without starting services
 	@python3 -B containers/runtime/test.py

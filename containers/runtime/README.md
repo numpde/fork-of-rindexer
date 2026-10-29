@@ -33,6 +33,29 @@ It sends only the generated runtime context to Docker, never a project directory
 The same `images.env` pins the PostgreSQL image. Acquire that image explicitly if
 it is not already present; service startup uses `--pull never` and never builds.
 
+For backfill, downtime catch-up, reorg recovery and restart against the actual
+runtime image, use the self-contained lifecycle check:
+
+```bash
+make MAKE_TIMEOUT=8m runtime/lifecycle/checks RINDEXER_IMAGE=sha256:...
+```
+
+It requires a local rootless Docker context (`rootless` by default; override with
+`RINDEXER_DOCKER_CONTEXT`) and the pinned PostgreSQL/Anvil images already present.
+It never builds or pulls, reads no sibling checkout, and uses the minimal `Funded`
+ABI under `fixtures/lifecycle/`, not a payment contract implementation. The host
+runs the Python standard-library orchestrator; the three non-root services have a
+combined one-CPU limit and no Docker socket. The private database volume and
+unique Compose project are removed on success, failure or handled cancellation.
+Health uses a temporary loopback port; the runtime profile's RPC bridge remains
+routable. Each phase prints JSON evidence; the final success record includes the
+input image ID and optional revision label. Historical images are accepted for
+red/green reproduction. A teardown failure fails the check and retains private
+fixture inputs with a recovery command. `MAKE_TIMEOUT` covers the whole recipe
+with the existing cleanup grace period. See the maintained
+[fork guide](../../documentation/docs/pages/docs/fork-changes/index.mdx#runtime-lifecycle-integration-check)
+for assertions and scope.
+
 Copy `containers/runtime/project/` to a dedicated operator-owned directory. Copy
 `environment.example` outside the checkout to an absolute file, set mode 0600,
 and replace every placeholder. Use the immutable local image ID, a random

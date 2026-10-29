@@ -1,0 +1,24 @@
+[
+  {
+    "type": "event",
+    "name": "Funded",
+    "anonymous": false,
+    "inputs": [
+      {
+        "name": "customer",
+        "type": "address",
+        "indexed": true
+      },
+      {
+        "name": "channelId",
+        "type": "uint256",
+        "indexed": true
+      },
+      {
+        "name": "amount",
+        "type": "uint256",
+        "indexed": false
+      }
+    ]
+  }
+]

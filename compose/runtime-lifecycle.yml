@@ -1,0 +1,37 @@
+# Disposable peers for runtime/lifecycle/checks; the deployment profile owns the base services.
+services:
+  indexer:
+    container_name: ${LIFECYCLE_INDEXER}
+    cpus: 0.6
+    mem_limit: 1g
+    stop_grace_period: 10s
+    ports: !override
+      - '127.0.0.1::8080'
+    labels: {io.rindexer.lifecycle: '${LIFECYCLE_OWNER}'}
+  postgres:
+    cpus: 0.2
+    mem_limit: 512m
+    stop_grace_period: 10s
+    labels: {io.rindexer.lifecycle: '${LIFECYCLE_OWNER}'}
+  anvil:
+    image: ${ANVIL_IMAGE}
+    pull_policy: never
+    user: '65532:65532'
+    read_only: true
+    cpus: 0.2
+    mem_limit: 256m
+    pids_limit: 128
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    entrypoint: [/usr/local/bin/anvil]
+    command: [--host, 0.0.0.0, --chain-id, '31337', --silent]
+    networks: [rpc]
+    labels: {io.rindexer.lifecycle: '${LIFECYCLE_OWNER}'}
+    healthcheck:
+      test: [CMD, /usr/local/bin/cast, rpc, --rpc-url, 'http://127.0.0.1:8545', eth_chainId]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+volumes:
+  database:
+    labels: {io.rindexer.lifecycle: '${LIFECYCLE_OWNER}'}

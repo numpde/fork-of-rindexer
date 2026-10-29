@@ -1,0 +1,39 @@
+name: Lifecycle
+project_type: no-code
+networks:
+  - name: selected
+    chain_id: ${CHAIN_ID}
+    rpc: ${RPC_HTTP_URL}
+    reorg_handling:
+      enabled: true
+    shared_tip_logs:
+      enabled: false
+storage:
+  postgres:
+    enabled: true
+    drop_each_run: false
+contracts:
+  - name: Funding
+    abi: ./abis/funded.json
+    include_events: [Funded]
+    details:
+      - network: selected
+        address: ${CONTRACT_ADDRESS}
+        start_block: '${START_BLOCK}'
+    tables:
+      - name: funding_totals
+        columns:
+          - {name: customer, type: address}
+          - {name: channel_id, type: uint256}
+          - {name: funded_wei, type: uint256, default: '0'}
+        events:
+          - event: Funded
+            operations:
+              - type: upsert
+                where:
+                  customer: $customer
+                  channel_id: $channelId
+                set:
+                  - {column: funded_wei, action: add, value: '$amount'}
+global:
+  health_port: 8080
