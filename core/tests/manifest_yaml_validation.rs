@@ -478,3 +478,39 @@ fn read_manifest_rejects_incomplete_extrema_histories() {
         );
     }
 }
+
+fn deletion_recovery_table() -> serde_json::Value {
+    serde_json::json!({"name":"balances", "columns":[
+        {"name":"id", "type":"address"}, {"name":"amount", "type":"uint256", "default":"0"}
+    ], "events":[{"event":"Transfer", "operations":[
+        {"type":"upsert", "where":{"id":"$from"}, "set":[{"column":"amount", "action":"add", "value":"$value"}]},
+        {"type":"delete", "where":{"id":"$from"}}
+    ]}]})
+}
+
+#[test]
+fn read_manifest_rejects_deletes_without_row_reconstruction() {
+    for native in [false, true] {
+        let (_directory, path) = recovery_table_manifest(deletion_recovery_table(), true, native);
+        let error = read_manifest(&path)
+            .expect_err("an orphan delete must not permanently erase canonical upserts")
+            .to_string();
+        assert!(
+            error.contains("balances") && error.contains("delete") && error.contains("reorg"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn read_manifest_keeps_non_reorg_deletes_and_recoverable_state_replacements() {
+    for native in [false, true] {
+        let (_directory, path) = recovery_table_manifest(deletion_recovery_table(), false, native);
+        read_manifest(&path).expect("non-reorg deletes retain their existing behavior");
+        let mut table = deletion_recovery_table();
+        table["events"][0]["operations"][0]["set"][0]["action"] = "set".into();
+        table["events"][0]["operations"][1] = serde_json::json!({"type":"update", "where":{"id":"$from"}, "set":[{"column":"amount", "action":"set", "value":"$value"}]});
+        let (_directory, path) = recovery_table_manifest(table, true, native);
+        read_manifest(&path).expect("journaled set operations remain valid without deletes");
+    }
+}
