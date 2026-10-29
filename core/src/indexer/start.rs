@@ -803,9 +803,18 @@ pub(super) async fn start_indexing_contract_events(
                     cursor_key: &network_contract.cursor_key(),
                 };
 
+                // PostgreSQL coverage, including a rewind to zero, owns the resume point.
+                // Without PostgreSQL, the handoff hint supplies the fallback resume bound.
+                let requested_start = if postgres.is_some() {
+                    network_contract.start_block
+                } else {
+                    registry
+                        .historical_resume_block(&network_contract.id)
+                        .or(network_contract.start_block)
+                };
                 let result = get_start_end_block(
                     &*network_contract.cached_provider,
-                    network_contract.start_block,
+                    requested_start,
                     network_contract.end_block,
                     config,
                     &event.info_log_name(),

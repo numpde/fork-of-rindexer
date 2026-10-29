@@ -281,6 +281,7 @@ pub struct EventCallbackRegistry {
     pub events: Vec<EventCallbackRegistryInformation>,
     pub on_reorg: Vec<OnReorgCallback>,
     failures: Arc<CallbackFailures>,
+    historical_resume_blocks: HashMap<String, U64>,
 }
 
 impl Default for EventCallbackRegistry {
@@ -299,6 +300,7 @@ impl EventCallbackRegistry {
             events: Vec::new(),
             on_reorg: Vec::new(),
             failures: Arc::new(CallbackFailures::default()),
+            historical_resume_blocks: HashMap::new(),
         }
     }
 
@@ -361,17 +363,25 @@ impl EventCallbackRegistry {
         Arc::new(self.clone())
     }
 
+    pub(crate) fn historical_resume_block(&self, id: &str) -> Option<U64> {
+        self.historical_resume_blocks.get(id).copied()
+    }
+
     pub fn reapply_after_historic(
         &mut self,
         processed_network_contracts: Vec<ProcessedNetworkContract>,
     ) -> Arc<EventCallbackRegistry> {
-        self.events.iter_mut().for_each(|e| {
-            e.contract.details.iter_mut().for_each(|d| {
+        self.historical_resume_blocks.clear();
+        self.events.iter().for_each(|e| {
+            e.contract.details.iter().for_each(|d| {
                 if d.end_block.is_none() {
                     if let Some(processed_block) =
                         processed_network_contracts.iter().find(|c| c.id == d.id)
                     {
-                        d.start_block = Some(processed_block.processed_up_to);
+                        // The configured start belongs to the durable query identity.
+                        // Keep the in-process resume hint separate from that identity.
+                        self.historical_resume_blocks
+                            .insert(d.id.clone(), processed_block.processed_up_to);
                     }
                 }
             });

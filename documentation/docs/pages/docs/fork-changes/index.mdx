@@ -34,6 +34,21 @@ apply to its storage and configuration:
 These notes retain their existing URLs. Their place in this section identifies
 them as maintained fork documentation.
 
+## Historical-to-live cursor identity
+
+A subscription keeps its configured `start_block` as part of its durable cursor
+identity when it switches from historical to live indexing. Its runtime resume
+position does not create a second cursor. PostgreSQL live writes, restart catch-up
+and health therefore read the same checkpoint. When saved progress is zero,
+PostgreSQL startup uses the configured start rather than a later historical hint.
+Handlers without PostgreSQL retain the in-process historical resume hint.
+
+Existing shadow cursors created by earlier handoffs are not merged into the
+configured cursor: their maximum does not prove contiguous canonical coverage.
+An upgrade may replay an already indexed range under the configured identity;
+PostgreSQL application receipts suppress previously applied effects. This change
+does not repair skipped or noncanonical history behind a durable checkpoint.
+
 ## Derived recovery with separate column operations
 
 PostgreSQL recovery now restores a column's database default (or NULL for a
