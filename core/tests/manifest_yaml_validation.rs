@@ -751,3 +751,63 @@ fn read_manifest_keeps_complete_assignment_versions_and_non_reorg_partials() {
         }
     }
 }
+
+fn arithmetic_predicate_table(condition: &str) -> serde_json::Value {
+    serde_json::json!({"name":"totals","global":true,
+        "columns":[{"name":"amount","type":"uint256","default":"0"}],
+        "events":[{"event":"Transfer","operations":[{"type":"upsert","if":condition,
+            "set":[{"column":"amount","action":"add","value":"$value"}]}]}]})
+}
+
+#[test]
+fn read_manifest_rejects_arithmetic_predicates_without_integer_recovery_semantics() {
+    for condition in [
+        "$rindexer_block_timestamp / 1000 == 1",
+        "$value + 1 > 1",
+        "$value - 1 > 0",
+        "$value * 2 > 0",
+        "$value ^ 2 > 0",
+    ] {
+        for native in [false, true] {
+            let (_directory, path) =
+                recovery_table_manifest(arithmetic_predicate_table(condition), true, native);
+            let error = read_manifest(&path)
+                .expect_err(
+                    "SQL arithmetic cannot certify the same integer predicate as forward admission",
+                )
+                .to_string();
+            assert!(
+                error.contains("arithmetic")
+                    && error.contains("predicate")
+                    && error.contains("totals"),
+                "{condition}: {error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn read_manifest_keeps_comparisons_non_reorg_arithmetic_and_insert_filters() {
+    for native in [false, true] {
+        for condition in [
+            "$rindexer_block_timestamp >= 1000 && $rindexer_block_timestamp < 2000",
+            "$value > 0 && $value < 100",
+            "'a/b+c' == 'a/b+c'",
+        ] {
+            let (_directory, path) =
+                recovery_table_manifest(arithmetic_predicate_table(condition), true, native);
+            read_manifest(&path)
+                .expect("comparisons and arithmetic characters inside literals remain supported");
+        }
+        let table = arithmetic_predicate_table("$rindexer_block_timestamp / 1000 == 1");
+        let (_directory, path) = recovery_table_manifest(table.clone(), false, native);
+        read_manifest(&path).expect("non-reorg arithmetic filters retain forward evaluation");
+        let mut insert = table;
+        insert["global"] = false.into();
+        insert["events"][0]["operations"][0]["type"] = "insert".into();
+        insert["events"][0]["operations"][0]["set"][0]["action"] = "set".into();
+        let (_directory, path) = recovery_table_manifest(insert, true, native);
+        read_manifest(&path)
+            .expect("insert-only cleanup does not reevaluate arithmetic predicates");
+    }
+}

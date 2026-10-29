@@ -212,3 +212,40 @@ async fn postgres_timestamp_recovery_persists_fetched_source_seconds() {
 async fn postgres_timestamp_recovery_retains_filtered_source_seconds() {
     timestamp_recovery_case(true, 1099).await;
 }
+
+#[tokio::test]
+async fn postgres_timestamp_division_recovery_fails_before_mutating_legacy_history() {
+    let fixture = timestamp_fixture("$rindexer_block_timestamp / 1000 == 1", false).await;
+    // Model history committed before startup rejected arithmetic predicates.
+    // Both timestamps pass the real forward U256 integer-division evaluator.
+    let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+    for (block, value) in [(99u64, 10), (100, 20)] {
+        let mut event = super::journal_recovery_tests::at(
+            &fixture,
+            "ethereum",
+            block,
+            B256::repeat_byte(block as u8),
+            value,
+        );
+        event.tx_information.block_timestamp = Some(alloy::primitives::U256::from(1000 + block));
+        event.log.block_timestamp = Some(1000 + block);
+        callback(vec![event]).await.unwrap();
+    }
+    let before = fixture.position().await;
+    assert_eq!(before, (2, "30".into(), "100".into()));
+    let result = super::recovery_boundary_tests::rollback(&fixture, 100, 100).await;
+    let after = fixture.position().await;
+    assert!(result.is_err(),"unsupported legacy arithmetic must fail before changing source/effects; state after recovery: {after:?}");
+    let error = format!("{:#}", result.unwrap_err());
+    assert!(error.contains("arithmetic") && error.contains("predicate"), "{error}");
+    assert_eq!(after, before, "failed recovery must retain raw rows, amount and cursors");
+    let receipts: i64 = fixture
+        .client
+        .query_one("SELECT count(*) FROM rindexer_internal.event_applications", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(receipts, 2);
+    drop(callback);
+    fixture.finish().await;
+}
