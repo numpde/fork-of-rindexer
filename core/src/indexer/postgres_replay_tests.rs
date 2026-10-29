@@ -1684,3 +1684,6 @@ mod stream_outbox_tests;
 
 #[path = "event_operation_tests.rs"]
 mod event_operation_tests;
+
+#[path = "cross_chain_recovery_tests.rs"]
+mod cross_chain_recovery_tests;
