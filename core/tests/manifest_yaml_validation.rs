@@ -587,3 +587,75 @@ fn read_manifest_rejects_non_unit_counter_operands() {
         }
     }
 }
+
+fn set_arithmetic_table(action: &str, separate_columns: bool) -> serde_json::Value {
+    let mut table = deletion_recovery_table();
+    let mut arithmetic = serde_json::json!({"column":"amount", "action":action});
+    if action == "add" || action == "subtract" {
+        arithmetic["value"] = "$value".into();
+    }
+    table["events"][0]["operations"][0]["set"] = serde_json::json!([arithmetic]);
+    let replacement_column = if separate_columns {
+        table["columns"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"name":"status", "type":"uint256", "default":"0"}));
+        "status"
+    } else {
+        "amount"
+    };
+    table["events"][0]["operations"][1] = serde_json::json!({"type":"update", "where":{"id":"$from"}, "set":[
+        {"column":replacement_column, "action":"set", "value":"$value"}
+    ]});
+    table
+}
+
+#[test]
+fn read_manifest_rejects_set_and_arithmetic_on_one_recovered_column() {
+    for action in ["add", "subtract", "increment", "decrement"] {
+        for native in [false, true] {
+            let (_directory, path) =
+                recovery_table_manifest(set_arithmetic_table(action, false), true, native);
+            let error = read_manifest(&path)
+                .expect_err(
+                    "journal baseline replacement cannot reconstruct arithmetic on the same column",
+                )
+                .to_string();
+            assert!(
+                error.contains("amount") && error.contains("set") && error.contains("arithmetic"),
+                "{action}: {error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn read_manifest_keeps_separate_column_actions_and_non_reorg_mixtures() {
+    for action in ["add", "subtract", "increment", "decrement"] {
+        for (enabled, separate) in [(true, true), (false, false)] {
+            for native in [false, true] {
+                let (_directory, path) = recovery_table_manifest(
+                    set_arithmetic_table(action, separate),
+                    enabled,
+                    native,
+                );
+                read_manifest(&path)
+                    .expect("independent columns and non-reorg ordered mixtures retain support");
+            }
+        }
+    }
+}
+
+#[test]
+fn read_manifest_keeps_one_arithmetic_model_on_a_recovered_column() {
+    for action in ["add", "subtract", "increment", "decrement"] {
+        for native in [false, true] {
+            let mut table = set_arithmetic_table(action, false);
+            table["events"][0]["operations"][1]["set"] =
+                table["events"][0]["operations"][0]["set"].clone();
+            let (_directory, path) = recovery_table_manifest(table, true, native);
+            read_manifest(&path)
+                .expect("multiple arithmetic operations without state replacement remain accepted");
+        }
+    }
+}
