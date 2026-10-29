@@ -380,3 +380,71 @@ fn read_manifest_rejects_native_insert_with_mutable_reorg_operations() {
         "{error}"
     );
 }
+
+fn recovery_table_manifest(
+    table: serde_json::Value,
+    enabled: bool,
+    native: bool,
+) -> (tempfile::TempDir, std::path::PathBuf) {
+    let directory = tempfile::tempdir().unwrap();
+    write_abi(directory.path());
+    let mut manifest: serde_json::Value =
+        serde_yaml::from_str(&mixed_insert_manifest("", enabled, false)).unwrap();
+    if native {
+        let mut table = table;
+        table["events"][0]["event"] = "NativeTransfer".into();
+        manifest["contracts"] = serde_json::json!([]);
+        manifest["native_transfers"] = serde_json::json!({"enabled":true, "networks":[{"network":"mainnet"}], "tables":[table]});
+    } else {
+        manifest["contracts"][0]["tables"] = serde_json::json!([table]);
+    }
+    let path = manifest_path(directory.path());
+    fs::write(&path, serde_yaml::to_string(&manifest).unwrap()).unwrap();
+    (directory, path)
+}
+
+fn extrema_recovery_table(action: &str, tracked_creator: bool) -> serde_json::Value {
+    let mut creator =
+        vec![serde_json::json!({"column":"amount", "action":"add", "value":"$value"})];
+    if tracked_creator {
+        creator.push(serde_json::json!({"column":"extreme", "action":action, "value":"$value"}));
+    }
+    serde_json::json!({"name":"balances", "columns":[
+        {"name":"id", "type":"address"}, {"name":"amount", "type":"uint256", "default":"0"},
+        {"name":"extreme", "type":"uint256", "default":"42"}
+    ], "events":[{"event":"Transfer", "operations":[
+        {"type":"upsert", "where":{"id":"$from"}, "set":creator},
+        {"type":"update", "where":{"id":"$from"}, "set":[{"column":"extreme", "action":action, "value":"$value"}]}
+    ]}]})
+}
+
+#[test]
+fn read_manifest_rejects_extrema_without_a_journaled_creation_baseline() {
+    for action in ["max", "min"] {
+        for native in [false, true] {
+            let (_directory, path) =
+                recovery_table_manifest(extrema_recovery_table(action, false), true, native);
+            let error = read_manifest(&path)
+                .expect_err("surviving operands cannot reconstruct an unjournaled creation default")
+                .to_string();
+            assert!(error.contains("extreme") && error.contains("baseline"), "{action}: {error}");
+        }
+    }
+}
+
+#[test]
+fn read_manifest_keeps_tracked_extrema_and_non_reorg_baselines() {
+    for action in ["max", "min"] {
+        for (enabled, tracked) in [(true, true), (false, false)] {
+            for native in [false, true] {
+                let (_directory, path) = recovery_table_manifest(
+                    extrema_recovery_table(action, tracked),
+                    enabled,
+                    native,
+                );
+                read_manifest(&path)
+                    .expect("tracked monotonic extrema and non-reorg defaults remain supported");
+            }
+        }
+    }
+}
