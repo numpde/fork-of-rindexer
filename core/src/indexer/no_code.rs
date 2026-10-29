@@ -422,13 +422,14 @@ struct DecodedCallbackEvent {
     application: EventApplication,
 }
 
-/// Apply only newly claimed PostgreSQL events. Independent sinks borrow the
-/// original batch, and the caller supplies a cursor only when PG can own it.
+/// Apply only newly claimed PostgreSQL events and retain resolved timestamps in raw rows.
+/// Independent sinks keep the original batch membership; the caller supplies a
+/// cursor only when PostgreSQL can own it.
 async fn apply_postgres_events(
     postgres: &PostgresClient,
     params: &NoCodeCallbackParams,
     applications: &[EventApplication],
-    raw_rows: &[Vec<EthereumSqlTypeWrapper>],
+    raw_rows: &mut [Vec<EthereumSqlTypeWrapper>],
     table_events: &[(Vec<LogParam>, String, TxMetadata)],
     cursor: Option<&BulkCursorUpdate>,
     messages: &[(u64, Value)],
@@ -447,10 +448,10 @@ async fn apply_postgres_events(
         applications,
     )
     .await?;
-    let rows: Vec<_> = raw_rows
-        .iter()
+    let mut rows: Vec<_> = raw_rows
+        .iter_mut()
         .zip(&new_events)
-        .filter_map(|(row, is_new)| is_new.then_some(row.as_slice()))
+        .filter_map(|(row, is_new)| is_new.then_some(row))
         .collect();
     // A duplicate event can still complete a different subscription's range.
     // Keep its cursor commit even when shared receipts suppress every effect.
@@ -460,7 +461,7 @@ async fn apply_postgres_events(
         .filter_map(|(event, is_new)| is_new.then_some(event.clone()))
         .collect();
     let prepared = if params.tables.is_empty() || rows.is_empty() {
-        PreparedTableOps { ops: vec![] }
+        PreparedTableOps { ops: vec![], event_timestamps: vec![] }
     } else {
         prepare_table_operations(
             &params.tables,
@@ -473,6 +474,28 @@ async fn apply_postgres_events(
         .await
         .inspect_err(|error| log_table_failure(params, error))?
     };
+    // Timestamp hydration belongs to the source event as well as its derived
+    // effects. Persist it even when the filter produced no rows, so recovery can
+    // evaluate that same predicate without guessing or fetching another header.
+    if !prepared.event_timestamps.is_empty() {
+        let column = params
+            .sql_column_names
+            .iter()
+            .position(|name| name == "block_timestamp")
+            .ok_or_else(|| {
+                "Cannot persist resolved source timestamps: raw event columns omit block_timestamp"
+                    .to_string()
+            })?;
+        for (row, timestamp) in rows.iter_mut().zip(&prepared.event_timestamps) {
+            if let Some(timestamp) = timestamp {
+                let seconds: i64 = (*timestamp).try_into().map_err(|_| "Cannot persist resolved source timestamp: Unix seconds exceed the signed storage range".to_string())?;
+                let datetime = chrono::DateTime::from_timestamp(seconds, 0)
+                    .ok_or_else(|| format!("Cannot persist resolved source timestamp {seconds}: outside the supported date range"))?;
+                row[column] = EthereumSqlTypeWrapper::DateTimeNullable(Some(datetime));
+            }
+        }
+    }
+    let rows: Vec<_> = rows.iter().map(|row| row.as_slice()).collect();
     // Constants and RPC results can introduce text that was absent from the raw
     // event. Validate resolved PG inputs before staging any derived or raw writes.
     for operation in &prepared.ops {
@@ -834,7 +857,7 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
                             network: network.clone(), to_block: to_block.to(),
                         }
                     });
-                    Some(apply_postgres_events(postgres, &params, &applications, &sql_bulk_data,
+                    Some(apply_postgres_events(postgres, &params, &applications, &mut sql_bulk_data,
                         &table_events_data, cursor.as_ref(), &event_message_data).await?)
                 }
                 _ => None,

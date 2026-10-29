@@ -34,6 +34,21 @@ apply to its storage and configuration:
 These notes retain their existing URLs. Their place in this section identifies
 them as maintained fork documentation.
 
+## Timestamp predicates during recovery
+
+`$rindexer_block_timestamp` in a table condition means numeric Unix seconds in
+both forward indexing and recovery. PostgreSQL raw timestamps retain their
+`TIMESTAMPTZ` representation; recovery extracts epoch seconds for the predicate,
+without changing timestamp-typed keys or the database schema.
+
+When required table inputs fetch a missing timestamp from a hash-matching header,
+the callback now persists it with the raw PostgreSQL row in the same transaction
+as receipts and derived effects. This also covers events whose condition is false:
+reconstruction needs the timestamp to make the same admission decision later.
+Older raw rows with missing required timestamps are not backfilled by this change;
+verify and repair their source metadata before relying on timestamp-filtered
+recovery. Restart alone cannot hydrate an event already suppressed by a receipt.
+
 ## Network-wide rollback coverage
 
 A detecting subscription can lag behind other subscriptions on the same network.

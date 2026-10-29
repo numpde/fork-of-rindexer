@@ -63,6 +63,7 @@
 
 ### Bug fixes
 -------------------------------------------------
+- fix: recovery predicates now evaluate `$rindexer_block_timestamp` as numeric Unix seconds, matching forward table conditions. Timestamps fetched for required table inputs are persisted in the raw PostgreSQL event transaction, including events filtered out of derived operations, so later recovery uses the original admission inputs.
 - fix: network reorg recovery now resolves the rollback endpoint after draining admitted writers, including event rows committed ahead of the detecting subscription. Raw rows, application receipts, journals, arithmetic and insert-only effects use the same closed interval so faster subscriptions cannot retain receipts for erased effects.
 - fix: keep configured subscription cursor identities stable across historical-to-live handoff. PostgreSQL live processing and health now use the same checkpoint after recovery; durable coverage, including a rewind to zero, takes precedence over in-process resume hints. Stateless handlers retain their historical resume position.
 - fix: PostgreSQL cross-chain arithmetic recovery resolves missing canonical timestamps through each contribution’s source-network provider, including contract and native-transfer registries. Missing providers and inconsistent source hashes report the network and block and leave rollback uncommitted. Hash diagnostics now begin `Cannot restore row timestamp on network` instead of `Cannot restore row timestamp at block`; update log-grep alerts.

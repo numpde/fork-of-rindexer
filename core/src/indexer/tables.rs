@@ -3475,6 +3475,9 @@ pub(crate) struct PreparedOperation<'t> {
 /// Every operation of a batch that produced rows, in manifest order.
 pub(crate) struct PreparedTableOps<'t> {
     pub(crate) ops: Vec<PreparedOperation<'t>>,
+    /// Resolved source seconds in input-event order, including filtered-out events.
+    /// Raw persistence needs the same inputs that admitted the prepared effects.
+    pub(crate) event_timestamps: Vec<Option<U256>>,
 }
 
 fn condition_needs_block_timestamp(condition: &str) -> bool {
@@ -3875,7 +3878,13 @@ pub(crate) async fn prepare_table_operations<'t>(
         }
     }
 
-    Ok(PreparedTableOps { ops })
+    Ok(PreparedTableOps {
+        ops,
+        event_timestamps: events_data
+            .iter()
+            .map(|(_, _, metadata)| metadata.block_timestamp)
+            .collect(),
+    })
 }
 
 /// Writes prepared operations to the configured databases.

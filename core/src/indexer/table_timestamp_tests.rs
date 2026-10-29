@@ -133,8 +133,10 @@ async fn postgres_timestamp_word_in_a_literal_does_not_require_timestamp_rpc() {
     fixture.finish().await;
 }
 
-async fn timestamp_recovery_case(hydrate: bool) {
-    let fixture = timestamp_fixture("$rindexer_block_timestamp > 100", false).await;
+async fn timestamp_recovery_case(hydrate: bool, threshold: u64) {
+    let fixture =
+        timestamp_fixture(&format!("$rindexer_block_timestamp > {threshold}"), false).await;
+    let surviving_amount = if threshold < 1099 { 10 } else { 0 };
     let blocks = [99u64, 100]
         .into_iter()
         .map(|number| {
@@ -166,7 +168,7 @@ async fn timestamp_recovery_case(hydrate: bool) {
         event.tx_information.block_timestamp = timestamp.map(alloy::primitives::U256::from);
         callback(vec![event]).await.unwrap();
     }
-    assert_eq!(fixture.position().await, (2, "30".into(), "100".into()));
+    assert_eq!(fixture.position().await, (2, (surviving_amount + 20).to_string(), "100".into()));
     let timestamps = fixture
         .client
         .query(
@@ -182,7 +184,7 @@ async fn timestamp_recovery_case(hydrate: bool) {
     super::recovery_boundary_tests::rollback(&fixture, 100, 100).await.unwrap();
     assert_eq!(
         fixture.position().await,
-        (1, "10".into(), "99".into()),
+        (1, surviving_amount.to_string(), "99".into()),
         "recovery predicates must compare numeric Unix seconds just like forward admission"
     );
     let mut replacement =
@@ -191,17 +193,22 @@ async fn timestamp_recovery_case(hydrate: bool) {
     replacement.tx_information.block_timestamp = Some(alloy::primitives::U256::from(1101));
     callback(vec![replacement.clone()]).await.unwrap();
     callback(vec![replacement]).await.unwrap();
-    assert_eq!(fixture.position().await, (2, "17".into(), "100".into()));
+    assert_eq!(fixture.position().await, (2, (surviving_amount + 7).to_string(), "100".into()));
     drop(callback);
     fixture.finish().await;
 }
 
 #[tokio::test]
 async fn postgres_timestamp_recovery_predicate_uses_unix_seconds() {
-    timestamp_recovery_case(false).await;
+    timestamp_recovery_case(false, 100).await;
 }
 
 #[tokio::test]
 async fn postgres_timestamp_recovery_persists_fetched_source_seconds() {
-    timestamp_recovery_case(true).await;
+    timestamp_recovery_case(true, 100).await;
+}
+
+#[tokio::test]
+async fn postgres_timestamp_recovery_retains_filtered_source_seconds() {
+    timestamp_recovery_case(true, 1099).await;
 }

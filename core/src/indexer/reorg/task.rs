@@ -689,7 +689,19 @@ fn render_reorg_condition(condition: &str, source: &ReversalSource<'_>) -> anyho
         }
     };
     expression
-        .to_sql_event_condition(|variable| source.variable_expression(variable))
+        .to_sql_event_condition(|variable| {
+            let expression = source.variable_expression(variable);
+            // Forward filters expose Unix seconds. Stored timestamp keys still
+            // need their native SQL type, so convert only in predicate context.
+            if variable.base_name() == "rindexer_block_timestamp" && variable.accessors().is_empty() {
+                match source.dialect {
+                    SqlDialect::Postgres => format!("EXTRACT(EPOCH FROM {expression})"),
+                    SqlDialect::Clickhouse => format!("toUnixTimestamp({expression})"),
+                }
+            } else {
+                expression
+            }
+        })
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "rollback condition '{condition}' references table state, which cannot be reconstructed from raw events"
