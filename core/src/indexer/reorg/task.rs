@@ -1810,7 +1810,9 @@ impl ReorgTask {
                 if !dt.rollback_ops.is_empty() || !dt.journal_columns.is_empty() {
                     continue;
                 }
-                let network_filter = self.network_filter(dt.cross_chain);
+                // Append-only source rows belong to one network even when the
+                // table shares keys across networks. Heights are not a shared fork boundary.
+                let network_filter = self.network_filter(false);
 
                 if let Some(pg) = pg {
                     let query = format!(

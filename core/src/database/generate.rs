@@ -236,8 +236,8 @@ fn generate_tables_sql(
             // Build column definitions
             let mut columns: Vec<String> = vec![];
 
-            // Add network column (part of primary key unless cross_chain is true)
-            if !table.cross_chain {
+            // Append-only rows retain their source network even when keys are shared.
+            if !table.cross_chain || table.is_insert_only() {
                 columns.push("network VARCHAR(50) NOT NULL".to_string());
             }
 
@@ -324,7 +324,17 @@ fn generate_tables_sql(
             } else {
                 String::new()
             };
-            Ok(format!("{create_schema_sql}{create_table_sql}\n{table_comment}"))
+            // Existing rows cannot acquire trustworthy source identities from a
+            // default. Keep this upgrade manual and reject missing/nullable provenance.
+            let source_network_check = if table.cross_chain && table.is_insert_only() {
+                let literal = table_name.replace("'", "''");
+                format!(
+                    "DO $rindexer$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = '{literal}'::regclass AND attname = 'network' AND attnum > 0 AND NOT attisdropped AND attnotnull) THEN RAISE EXCEPTION 'Cannot start cross-chain table %: required network source column is missing or nullable; rebuild the table from canonical events with source-network identities before restarting', '{literal}'; END IF; END $rindexer$;"
+                )
+            } else {
+                String::new()
+            };
+            Ok(format!("{create_schema_sql}{create_table_sql}\n{source_network_check}\n{table_comment}"))
         })
         .collect::<Result<Vec<_>, GenerateTablesForIndexerSqlError>>()?
         .join("\n"))

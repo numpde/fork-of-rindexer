@@ -245,3 +245,25 @@ retaining its canonical version. If block 100 is then orphaned, recovery restore
 This differs from a missing-row UPDATE, which neither creates a row nor defines
 an unconditional replacement version. Recovery candidate selection follows that
 operation distinction rather than treating every zero-row SQL result alike.
+
+## Cross-chain append-only recovery and manual upgrades
+
+Insert-only tables with `cross_chain: true` now store the source `network` on each
+row in PostgreSQL and ClickHouse. It remains outside the shared primary key.
+Rolling back chain A removes only A's rows at or beyond its fork; chain B's
+independent heights do not define A's recovery boundary.
+
+Existing PostgreSQL tables missing this required, non-null source column stop
+startup with a clear error. Automatic migration is deferred: neither a default
+network nor a block number can recover the chain that produced an old row.
+An existing deployment must reconstruct the rows from canonical events with
+source-network identities, coordinating receipts and cursors so replay is not
+suppressed. Manually managed ClickHouse tables also need their source column
+before writing with this version; ClickHouse reorg recovery remains unsupported.
+
+The passing `known_risks::known_risk_cross_chain_insert_legacy_schema_requires_manual_rebuild`
+test records this operational limitation. It asserts the explicit startup error
+for missing or nullable provenance and preservation of existing raw history.
+When an automatic migration can establish source identities, replace this test
+with migration-success coverage. It is not an ignored test or a claim that the
+legacy table is safe to recover.

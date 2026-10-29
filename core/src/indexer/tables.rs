@@ -4250,7 +4250,7 @@ async fn execute_postgres_operation(
     for row in rows {
         let mut columns: Vec<DynamicColumnDefinition> = Vec::new();
 
-        if !table_def.cross_chain {
+        if !table_def.cross_chain || table_def.is_insert_only() {
             // For Insert, network is just a normal column (no dedup)
             let network_behavior = if is_insert {
                 BatchOperationColumnBehavior::Normal
@@ -4463,7 +4463,7 @@ async fn execute_clickhouse_operation(
     for row in rows {
         let mut columns: Vec<DynamicColumnDefinition> = Vec::new();
 
-        if !table_def.cross_chain {
+        if !table_def.cross_chain || table_def.is_insert_only() {
             // For Insert, network is just a normal column (no dedup)
             let network_behavior = if is_insert {
                 BatchOperationColumnBehavior::Normal

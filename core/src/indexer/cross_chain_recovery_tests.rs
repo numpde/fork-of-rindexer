@@ -109,44 +109,52 @@ async fn postgres_cross_chain_insert_rollback_preserves_other_network_rows() {
     fixture.finish().await;
 }
 
-#[tokio::test]
-async fn postgres_cross_chain_insert_legacy_schema_reports_required_rebuild() {
-    for nullable in [false, true] {
-        let fixture = fixture("insert", "set", false).await;
-        let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
-        callback(vec![at(&fixture, "ethereum", 99, B256::repeat_byte(99), 10)]).await.unwrap();
-        let table = &fixture.params.tables[0].full_table_name;
-        fixture
-            .client
-            .batch_execute(&format!("ALTER TABLE {table} DROP COLUMN IF EXISTS network"))
-            .await
-            .unwrap();
-        if nullable {
+// Deferred migration: these passing assertions pin the manual rebuild requirement.
+// Replace this group with migration-success coverage when source identities can be recovered.
+mod known_risks {
+    use super::*;
+
+    #[tokio::test]
+    async fn known_risk_cross_chain_insert_legacy_schema_requires_manual_rebuild() {
+        for nullable in [false, true] {
+            let fixture = fixture("insert", "set", false).await;
+            let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+            callback(vec![at(&fixture, "ethereum", 99, B256::repeat_byte(99), 10)]).await.unwrap();
+            let table = &fixture.params.tables[0].full_table_name;
             fixture
                 .client
-                .batch_execute(&format!("ALTER TABLE {table} ADD COLUMN network VARCHAR(50)"))
+                .batch_execute(&format!("ALTER TABLE {table} DROP COLUMN IF EXISTS network"))
                 .await
                 .unwrap();
+            if nullable {
+                fixture
+                    .client
+                    .batch_execute(&format!("ALTER TABLE {table} ADD COLUMN network VARCHAR(50)"))
+                    .await
+                    .unwrap();
+            }
+            let ddl =
+                generate_tables_for_indexer_sql(fixture._directory.path(), &fixture.indexer, false)
+                    .unwrap();
+            let error = fixture
+                .client
+                .batch_execute(ddl.as_str())
+                .await
+                .expect_err("legacy rows without source identity must stop startup")
+                .to_string();
+            assert!(
+                error.contains("cross-chain")
+                    && error.contains("network")
+                    && error.contains("rebuild"),
+                "{error}"
+            );
+            assert_eq!(
+                fixture.position().await.0,
+                1,
+                "schema rejection must preserve existing history"
+            );
+            drop(callback);
+            fixture.finish().await;
         }
-        let ddl =
-            generate_tables_for_indexer_sql(fixture._directory.path(), &fixture.indexer, false)
-                .unwrap();
-        let error = fixture
-            .client
-            .batch_execute(ddl.as_str())
-            .await
-            .expect_err("legacy rows without source identity must stop startup")
-            .to_string();
-        assert!(
-            error.contains("cross-chain") && error.contains("network") && error.contains("rebuild"),
-            "{error}"
-        );
-        assert_eq!(
-            fixture.position().await.0,
-            1,
-            "schema rejection must preserve existing history"
-        );
-        drop(callback);
-        fixture.finish().await;
     }
 }

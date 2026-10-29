@@ -154,8 +154,8 @@ fn generate_tables_clickhouse(tables: &[Table], schema_name: &str) -> String {
             // Build column definitions
             let mut columns: Vec<String> = vec![];
 
-            // Add network column (part of ORDER BY unless cross_chain is true)
-            if !table.cross_chain {
+            // Append-only rows retain their source network even when keys are shared.
+            if !table.cross_chain || table.is_insert_only() {
                 columns.push("`network` String".to_string());
             }
 
