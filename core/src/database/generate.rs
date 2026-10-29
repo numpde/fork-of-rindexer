@@ -325,7 +325,7 @@ fn generate_tables_sql(
             // Existing rows cannot acquire trustworthy source identities from a
             // default. Keep this upgrade manual and reject missing/nullable provenance.
             let source_network_check = if table.cross_chain {
-                let literal = table_name.replace("'", "''");
+                let literal = table_name.replace('\'', "''");
                 format!(
                     "DO $rindexer$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = '{literal}'::regclass AND attname = 'network' AND attnum > 0 AND NOT attisdropped AND attnotnull) THEN RAISE EXCEPTION 'Cannot start cross-chain table %: required network source column is missing or nullable; rebuild the table from canonical events with source-network identities before restarting', '{literal}'; END IF; END $rindexer$;"
                 )

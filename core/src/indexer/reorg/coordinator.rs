@@ -480,12 +480,16 @@ impl ReorgCoordinator {
                     Some(event_writer_barrier(&self.network).write_owned().await);
             }
             let reorg_task = self.pending_recovery.tasks.front().expect("pending recovery");
+            let mut providers = ctx.recovery_providers();
+            if let Some(provider) = &self.provider {
+                providers.insert(self.network.clone(), provider.clone());
+            }
             let result = reorg_task
                 .execute_with_deliveries(
                     &mut self.window,
                     ctx.postgres,
                     ctx.clickhouse,
-                    self.provider.as_ref(),
+                    &providers,
                     &self.rollback_plan,
                     &self.streams_clients,
                 )

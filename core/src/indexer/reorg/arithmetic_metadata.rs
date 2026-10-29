@@ -6,7 +6,7 @@ impl ReorgTask {
         &self,
         pg: &PgTransaction<'_>,
         plan: &DerivedTableRollbackPlan,
-        provider: Option<&Arc<dyn ChainProvider>>,
+        providers: &HashMap<String, Arc<dyn ChainProvider>>,
     ) -> anyhow::Result<()> {
         use crate::manifest::contract::injected_columns::*;
         let empty_types = HashMap::new();
@@ -123,18 +123,19 @@ impl ReorgTask {
                 format!("Cannot reconstruct canonical row identity for {}", table.full_table_name)
             })?;
             if columns.iter().any(|name| name == BLOCK_TIMESTAMP) {
-                let missing = pg.query(&format!("SELECT DISTINCT row_metadata->>'{BLOCK_NUMBER}', row_metadata->>'{BLOCK_HASH}' FROM {temporary} WHERE row_metadata->>'{BLOCK_TIMESTAMP}' IS NULL"), &[]).await?;
+                let missing = pg.query(&format!("SELECT DISTINCT row_metadata->>'{BLOCK_NUMBER}', row_metadata->>'{BLOCK_HASH}', row_metadata->>'network' FROM {temporary} WHERE row_metadata->>'{BLOCK_TIMESTAMP}' IS NULL"), &[]).await?;
                 for row in missing {
                     let number = row.get::<_, String>(0).parse::<u64>()?;
                     let expected = row.get::<_, String>(1).parse::<B256>()?;
-                    let provider = provider.context("Cannot restore required row timestamp: canonical source timestamp is absent and no provider is available")?;
+                    let source_network = row.get::<_, String>(2);
+                    let provider = providers.get(&source_network).with_context(|| format!("Cannot restore row timestamp for {} on network {source_network} at block {number}: canonical source timestamp is absent and no provider is registered", table.full_table_name))?;
                     let headers = super::super::fetch_canonical_headers(
                         provider.as_ref(),
                         &[U64::from(number)],
                     )
-                    .await?;
+                    .await.with_context(|| format!("Cannot fetch row timestamp for {} on network {source_network} at block {number}", table.full_table_name))?;
                     let header = &headers[0].header;
-                    anyhow::ensure!(header.hash == expected, "Cannot restore row timestamp at block {number}: source hash {expected} differs from canonical hash {}", header.hash);
+                    anyhow::ensure!(header.hash == expected, "Cannot restore row timestamp on network {source_network} at block {number}: source hash {expected} differs from canonical hash {}", header.hash);
                     let timestamp = chrono::DateTime::from_timestamp(
                         i64::try_from(header.timestamp).context(
                             "Cannot restore row timestamp beyond the signed seconds range",
@@ -143,7 +144,7 @@ impl ReorgTask {
                     )
                     .context("Cannot restore row timestamp outside the supported date range")?
                     .to_rfc3339();
-                    pg.execute(&format!("UPDATE {temporary} SET row_metadata = jsonb_set(row_metadata, '{{{BLOCK_TIMESTAMP}}}', to_jsonb($1::text)) WHERE row_metadata->>'{BLOCK_NUMBER}' = $2 AND row_metadata->>'{BLOCK_HASH}' = $3"), &[&timestamp, &number.to_string(), &expected.to_string()]).await?;
+                    pg.execute(&format!("UPDATE {temporary} SET row_metadata = jsonb_set(row_metadata, '{{{BLOCK_TIMESTAMP}}}', to_jsonb($1::text)) WHERE row_metadata->>'{BLOCK_NUMBER}' = $2 AND row_metadata->>'{BLOCK_HASH}' = $3 AND row_metadata->>'network' = $4"), &[&timestamp, &number.to_string(), &expected.to_string(), &source_network]).await?;
                 }
             }
             let key_match = "to_jsonb(dt) @> sub.where_key";

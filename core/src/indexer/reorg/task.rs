@@ -1629,7 +1629,10 @@ impl ReorgTask {
         provider: Option<&Arc<dyn ChainProvider>>,
         rollback_plan: &DerivedTableRollbackPlan,
     ) -> anyhow::Result<ReorgTaskResult> {
-        self.execute_with_deliveries(window, postgres, clickhouse, provider, rollback_plan, &[])
+        let providers = provider
+            .map(|provider| HashMap::from([(self.network.clone(), provider.clone())]))
+            .unwrap_or_default();
+        self.execute_with_deliveries(window, postgres, clickhouse, &providers, rollback_plan, &[])
             .await
     }
 
@@ -1638,7 +1641,7 @@ impl ReorgTask {
         window: &mut BlockChainWindow,
         postgres: Option<&PostgresClient>,
         clickhouse: Option<&Arc<ClickhouseClient>>,
-        provider: Option<&Arc<dyn ChainProvider>>,
+        providers: &HashMap<String, Arc<dyn ChainProvider>>,
         rollback_plan: &DerivedTableRollbackPlan,
         deliveries: &[Arc<Option<crate::streams::StreamsClients>>],
     ) -> anyhow::Result<ReorgTaskResult> {
@@ -1678,7 +1681,7 @@ impl ReorgTask {
                 .all(|pair| pair[0].0.checked_add(1) == Some(pair[1].0) && pair[1].2 == pair[0].1);
         let canonical: Vec<(u64, B256, B256)> = if complete {
             cached
-        } else if let Some(provider) = provider {
+        } else if let Some(provider) = providers.get(&self.network) {
             let block_numbers: Vec<U64> =
                 (self.fork_point..=self.detection_point).map(|n| U64::from(n)).collect();
             super::fetch_canonical_headers(provider.as_ref(), &block_numbers)
@@ -1803,7 +1806,7 @@ impl ReorgTask {
                 .await
                 .context("Accumulative reversal from snapshots failed")?;
             if let Some(pg) = pg {
-                self.restore_arithmetic_metadata(pg, rollback_plan, provider).await?;
+                self.restore_arithmetic_metadata(pg, rollback_plan, providers).await?;
             }
             self.recalculate_from_journal(pg, clickhouse)
                 .await

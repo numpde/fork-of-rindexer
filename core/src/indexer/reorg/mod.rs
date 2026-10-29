@@ -254,6 +254,39 @@ pub struct ReorgContext<'a> {
     pub trace_registry: Option<&'a TraceCallbackRegistry>,
 }
 
+impl ReorgContext<'_> {
+    // Resolve source networks from the running generation's provider registry.
+    // A reorg on one network may restore shared rows contributed by another.
+    fn recovery_providers(&self) -> HashMap<String, Arc<dyn ChainProvider>> {
+        let mut providers = HashMap::new();
+        if let Some(registry) = self.registry {
+            for event in &registry.events {
+                providers.extend(
+                    event
+                        .providers
+                        .iter()
+                        .map(|(network, provider)| (network.clone(), provider.clone())),
+                );
+                for detail in &event.contract.details {
+                    providers
+                        .entry(detail.network.clone())
+                        .or_insert_with(|| detail.cached_provider.clone());
+                }
+            }
+        }
+        if let Some(registry) = self.trace_registry {
+            for event in &registry.events {
+                for detail in &event.trace_information.details {
+                    providers
+                        .entry(detail.network.clone())
+                        .or_insert_with(|| detail.cached_provider.clone());
+                }
+            }
+        }
+        providers
+    }
+}
+
 async fn quarantine_exhausted_history(
     coordinator: &mut ReorgCoordinator,
     error: &anyhow::Error,

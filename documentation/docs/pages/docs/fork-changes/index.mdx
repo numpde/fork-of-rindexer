@@ -253,13 +253,15 @@ row in PostgreSQL and ClickHouse. It remains outside the shared primary key.
 Rolling back chain A removes only A's rows at or beyond its fork; chain B's
 independent heights do not define A's recovery boundary.
 
-Existing PostgreSQL tables missing this required, non-null source column stop
-startup with a clear error. Automatic migration is deferred: neither a default
+With table creation enabled, existing PostgreSQL tables missing this required,
+non-null source column stop startup with a clear error. Automatic migration is deferred: neither a default
 network nor a block number can recover the chain that produced an old row.
 An existing deployment must reconstruct the rows from canonical events with
 source-network identities, coordinating receipts and cursors so replay is not
 suppressed. Manually managed ClickHouse tables also need their source column
 before writing with this version; ClickHouse reorg recovery remains unsupported.
+`disable_create_tables: true` also bypasses setup-time schema checks: manually
+managed tables must already provide the required source column before use.
 
 The passing `known_risks::known_risk_cross_chain_legacy_schema_requires_manual_rebuild`
 test records this operational limitation. It asserts the explicit startup error
@@ -287,3 +289,18 @@ Existing cross-chain state must be rebuilt with canonical source identities and
 this ordering rule. A newly added column cannot by itself correct values selected
 under the old first-arrival rule. Automatic migration remains the known limitation
 above; coordinate any rebuild with journals, receipts and cursors.
+
+## Source-network timestamp recovery
+
+A shared arithmetic row can retain contributions from another network after a
+rollback. When a surviving raw event lacks its timestamp, recovery now looks up
+that event's network in the running generation's provider registries. It checks
+the returned header against that contribution's block hash before using its time.
+Contract-event provider maps and native-transfer providers both participate.
+
+A missing provider or mismatched hash stops rollback with an error identifying
+the source network and block. The transaction leaves derived values, provenance,
+raw events, receipts and cursors unchanged; it does not substitute the reorging
+network's header at the same height. Keep a provider capable of serving retained
+source history when shared rows may require this enrichment. No additional
+migration or journal schema is introduced by this timestamp fix.
