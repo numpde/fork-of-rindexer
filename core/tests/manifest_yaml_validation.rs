@@ -659,3 +659,26 @@ fn read_manifest_keeps_one_arithmetic_model_on_a_recovered_column() {
         }
     }
 }
+
+#[test]
+fn read_manifest_rejects_arithmetic_updates_without_applied_effect_tracking() {
+    for action in ["add", "subtract", "increment", "decrement"] {
+        for native in [false, true] {
+            let mut table = arithmetic_operand_table(
+                action,
+                if action == "add" || action == "subtract" { Some("$value") } else { None },
+            );
+            let mut update = table["events"][0]["operations"][0].clone();
+            update["type"] = "update".into();
+            table["events"][0]["operations"].as_array_mut().unwrap().push(update);
+            let (_directory, path) = recovery_table_manifest(table, true, native);
+            let error = read_manifest(&path)
+                .expect_err("skipped arithmetic updates cannot be reconstructed from raw inputs")
+                .to_string();
+            assert!(
+                error.contains("arithmetic update") && error.contains("reorg"),
+                "{action}: {error}"
+            );
+        }
+    }
+}

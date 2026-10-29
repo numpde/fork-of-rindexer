@@ -1,4 +1,6 @@
 //! One admitted event must apply all configured writes before its receipt commits.
+use alloy::primitives::U64;
+
 use super::journal_recovery_tests::at;
 use super::*;
 
@@ -366,6 +368,104 @@ async fn postgres_superseded_upsert_policy_does_not_journal_a_false_table_guard(
         .unwrap()
         .get(0);
     assert_eq!(journal, 1, "a failed table-state guard is not a superseded canonical assignment");
+    drop(callback);
+    fixture.finish().await;
+}
+
+fn arithmetic_update_table() -> serde_json::Value {
+    json!({"name":"totals", "global":true,
+        "columns":[{"name":"amount", "type":"uint256", "default":"0"}],
+        "events":[{"event":"Value", "operations":[
+            {"type":"update", "if":"value != 10", "set":[{"column":"amount", "action":"add", "value":"$value"}]},
+            {"type":"upsert", "if":"value == 10", "set":[{"column":"amount", "action":"add", "value":"$value"}]}
+        ]}]
+    })
+}
+
+async fn arithmetic_update_batch_case(batched: bool) {
+    let fixture = Fixture::with_table(
+        serde_json::to_value(params().event).unwrap(),
+        "Contract",
+        arithmetic_update_table(),
+    )
+    .await;
+    let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+    callback(vec![event(&fixture, 100, 100, 10)]).await.unwrap();
+    let mut updates = vec![event(&fixture, 99, 99, 100), event(&fixture, 101, 101, 1)];
+    for update in &mut updates {
+        update.found_in_request.from_block = U64::from(99);
+        update.found_in_request.to_block = U64::from(101);
+    }
+    if batched {
+        callback(updates.clone()).await.unwrap();
+    } else {
+        callback(vec![event(&fixture, 99, 99, 100)]).await.unwrap();
+        callback(vec![event(&fixture, 101, 101, 1)]).await.unwrap();
+    }
+    assert_eq!(
+        fixture.position().await,
+        (3, "11".into(), "101".into()),
+        "batching must not admit an older rejected arithmetic input"
+    );
+    callback(updates).await.unwrap();
+    assert_eq!(fixture.position().await.1, "11");
+    drop(callback);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_arithmetic_update_batch_matches_individual_admission() {
+    arithmetic_update_batch_case(true).await;
+}
+
+#[tokio::test]
+async fn postgres_arithmetic_update_separate_callbacks_are_an_admission_control() {
+    arithmetic_update_batch_case(false).await;
+}
+
+#[tokio::test]
+async fn postgres_arithmetic_update_recovery_requires_support_or_startup_rejection() {
+    let fixture = Fixture::with_table(
+        serde_json::to_value(params().event).unwrap(),
+        "Contract",
+        arithmetic_update_table(),
+    )
+    .await;
+    match fixture.params.tables[0].table.validate_reorg_operations() {
+        Err(reason) => {
+            assert!(reason.contains("arithmetic update") && reason.contains("reorg"), "{reason}");
+            let untouched = fixture.client.query_one(&format!("SELECT (SELECT count(*) FROM {}), (SELECT count(*) FROM {}), (SELECT count(*) FROM rindexer_internal.event_applications)", fixture.params.sql_event_table_name, fixture.params.tables[0].full_table_name), &[]).await.unwrap();
+            assert_eq!(
+                (
+                    untouched.get::<_, i64>(0),
+                    untouched.get::<_, i64>(1),
+                    untouched.get::<_, i64>(2)
+                ),
+                (0, 0, 0),
+                "unsupported recovery must be rejected before event effects"
+            );
+            fixture.finish().await;
+            return;
+        }
+        Ok(()) => {}
+    }
+    let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+    callback(vec![event(&fixture, 99, 99, 1)]).await.unwrap();
+    callback(vec![event(&fixture, 100, 100, 10)]).await.unwrap();
+    super::arithmetic_recovery_tests::rollback(&fixture).await;
+    let rows: i64 = fixture
+        .client
+        .query_one(
+            &format!("SELECT count(*) FROM {}", fixture.params.tables[0].full_table_name),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        rows, 0,
+        "a skipped canonical update cannot keep a row that only the orphan created"
+    );
     drop(callback);
     fixture.finish().await;
 }
