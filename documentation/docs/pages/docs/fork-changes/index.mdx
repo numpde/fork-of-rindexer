@@ -180,3 +180,20 @@ and PostgreSQL table logs report affected rows.
 Old phantom journal entries are not removed automatically. Verify affected ranges
 and rebuild derived state and journals together with receipts and cursors before
 relying on recovery. No journal schema migration is introduced by this change.
+
+## State replacement and arithmetic on one column
+
+Reorg-enabled tables now reject `set` combined with `add`, `subtract`, `increment`
+or `decrement` on the same column. This applies across operations and event
+mappings, including native-transfer tables. Recovery cannot reconstruct the
+ordered replacement/accumulation history from the current journal model.
+
+For example, a canonical add can establish 10 and an orphan set can replace it
+with 20. Removing the set journal must not reset the surviving arithmetic value
+to its configured default. Startup now prevents that unsupported history.
+
+Use separate columns/tables for replacement state and accumulated amounts, or one
+update model for the column. Different columns may still use different actions;
+networks without reorg handling retain their existing behavior. Editing YAML does
+not repair earlier incorrect rollbacks: coordinate verified canonical repair of
+derived state and journals with application receipts and cursors.

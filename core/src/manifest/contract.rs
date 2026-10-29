@@ -379,6 +379,20 @@ impl Table {
                     .map_err(|reason| format!("Table '{}': {reason}", self.name))?;
             }
         }
+        for replacement in self
+            .all_operations()
+            .flat_map(|operation| &operation.set)
+            .filter(|column| column.action == SetAction::Set)
+        {
+            if self.all_operations().flat_map(|operation| &operation.set).any(|column| {
+                column.column == replacement.column && column.action.reverse().is_some()
+            }) {
+                return Err(format!(
+                    "Table '{}' column '{}' mixes set and arithmetic on a reorg-enabled network. Recovery cannot reconstruct their ordered combination; separate the columns/tables or use one update model for this column.",
+                    self.name, replacement.column
+                ));
+            }
+        }
         for extrema in self
             .all_operations()
             .flat_map(|operation| &operation.set)
