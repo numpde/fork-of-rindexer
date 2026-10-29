@@ -3943,7 +3943,7 @@ pub(crate) async fn apply_table_operations(
             let mut connection =
                 postgres.raw_connection().await.map_err(|error| error.to_string())?;
             let tx = connection.transaction().await.map_err(|error| pg_error_to_string(&error))?;
-            if requires_recovery_journal(op.operation) {
+            if requires_individual_admission(op.operation) {
                 let mut inputs = op
                     .rows
                     .iter()
@@ -3999,6 +3999,12 @@ fn requires_recovery_journal(operation: &TableOperation) -> bool {
         && operation.set.iter().any(|column| column.action.reverse().is_none())
 }
 
+// UPDATE's target/sequence guard applies to each event's delta before any
+// aggregation. Combining accepted and rejected inputs first changes the amount.
+fn requires_individual_admission(operation: &TableOperation) -> bool {
+    operation.operation_type == OperationType::Update || requires_recovery_journal(operation)
+}
+
 fn postgres_event_order(row: &TableRowData) -> Result<(&str, u128), String> {
     match row.columns.get(injected_columns::RINDEXER_SEQUENCE_ID) {
         Some(EthereumSqlTypeWrapper::U128(sequence)) => Ok((row.network.as_str(), *sequence)),
@@ -4015,7 +4021,8 @@ enum PostgresInputOutcome {
 }
 
 // Journaled writes arrive one input at a time so PostgreSQL's command result
-// identifies that input's outcome. Non-journaled operations can retain batching.
+// identifies that input's outcome. UPDATE also checks each delta individually;
+// non-journaled inserts, upserts and deletes can retain batching.
 async fn apply_postgres_rows(
     tx: &PgTransaction<'_>,
     op: &PreparedOperation<'_>,
@@ -4056,7 +4063,7 @@ async fn apply_table_operations_in_tx(
 ) -> Result<(), String> {
     let ordered = (prepared.ops.len() > 1
         && prepared.ops.iter().any(|op| op.operation.operation_type != OperationType::Insert))
-        || prepared.ops.iter().any(|op| requires_recovery_journal(op.operation));
+        || prepared.ops.iter().any(|op| requires_individual_admission(op.operation));
     let mut inputs = Vec::new();
     if ordered {
         // Event order precedes operation order: a later event must not advance

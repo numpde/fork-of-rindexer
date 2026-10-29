@@ -431,23 +431,16 @@ async fn postgres_arithmetic_update_recovery_requires_support_or_startup_rejecti
         arithmetic_update_table(),
     )
     .await;
-    match fixture.params.tables[0].table.validate_reorg_operations() {
-        Err(reason) => {
-            assert!(reason.contains("arithmetic update") && reason.contains("reorg"), "{reason}");
-            let untouched = fixture.client.query_one(&format!("SELECT (SELECT count(*) FROM {}), (SELECT count(*) FROM {}), (SELECT count(*) FROM rindexer_internal.event_applications)", fixture.params.sql_event_table_name, fixture.params.tables[0].full_table_name), &[]).await.unwrap();
-            assert_eq!(
-                (
-                    untouched.get::<_, i64>(0),
-                    untouched.get::<_, i64>(1),
-                    untouched.get::<_, i64>(2)
-                ),
-                (0, 0, 0),
-                "unsupported recovery must be rejected before event effects"
-            );
-            fixture.finish().await;
-            return;
-        }
-        Ok(()) => {}
+    if let Err(reason) = fixture.params.tables[0].table.validate_reorg_operations() {
+        assert!(reason.contains("arithmetic update") && reason.contains("reorg"), "{reason}");
+        let untouched = fixture.client.query_one(&format!("SELECT (SELECT count(*) FROM {}), (SELECT count(*) FROM {}), (SELECT count(*) FROM rindexer_internal.event_applications)", fixture.params.sql_event_table_name, fixture.params.tables[0].full_table_name), &[]).await.unwrap();
+        assert_eq!(
+            (untouched.get::<_, i64>(0), untouched.get::<_, i64>(1), untouched.get::<_, i64>(2)),
+            (0, 0, 0),
+            "unsupported recovery must be rejected before event effects"
+        );
+        fixture.finish().await;
+        return;
     }
     let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
     callback(vec![event(&fixture, 99, 99, 1)]).await.unwrap();

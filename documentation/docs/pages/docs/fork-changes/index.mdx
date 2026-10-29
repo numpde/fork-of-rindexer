@@ -154,9 +154,10 @@ address match. Committed equal-position rows and different events retain the
 strict ordering protection. Application receipts still suppress event replay.
 
 Multi-operation mutable batches execute per input to preserve this order, which
-can issue more SQL statements than the former operation-first batching. Insert-only batches and single operations that need no recovery journal retain
-batching. Journaled operations follow the per-input rules below. The
-sequence encoding and schema do not change.
+can issue more SQL statements than the former operation-first batching.
+Insert-only batches and single arithmetic upserts that need no recovery journal
+retain batching. Updates always check each input individually; journaled
+operations follow the rules below. The sequence encoding and schema do not change.
 
 An event whose second effect was previously skipped may already have a receipt.
 Upgrading does not replay it automatically. Verify affected ranges and coordinate
@@ -185,6 +186,28 @@ and PostgreSQL table logs report affected rows.
 Old phantom journal entries are not removed automatically. Verify affected ranges
 and rebuild derived state and journals together with receipts and cursors before
 relying on recovery. No journal schema migration is introduced by this change.
+
+## Arithmetic updates require applied-effect history
+
+Reorg-enabled derived tables now reject `update` operations containing `add`,
+`subtract`, `increment` or `decrement`. Contract and native-transfer tables use
+this same startup check. Recovery currently derives arithmetic contributors from
+raw events, which cannot distinguish an update that found no row from an applied
+delta. For example, a skipped canonical update must not keep a row alive after
+rollback removes the orphaned upsert that actually created it.
+
+Use arithmetic `upsert` only when creating a missing row is intended. This changes
+creation semantics and is not an automatic replacement for `update`. Otherwise,
+keep that aggregation outside the recovered table until durable applied-effect
+tracking is supported. Non-arithmetic updates retain their existing admission
+rules; this restriction does not change arithmetic upserts.
+
+On networks without reorg handling, arithmetic updates remain supported. Every
+PostgreSQL update input now checks its target and sequence individually, even
+when it is the only prepared operation. A batch containing an older rejected
+`add(100)` and a newer accepted `add(1)` therefore changes 10 to 11, matching
+separate callback execution. Receipts continue to suppress replay. This can issue
+more SQL statements than aggregating deltas before admission.
 
 ## State replacement and arithmetic on one column
 

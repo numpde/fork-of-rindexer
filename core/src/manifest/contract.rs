@@ -373,6 +373,14 @@ impl Table {
             return Ok(());
         }
         for operation in self.all_operations() {
+            if operation.operation_type == OperationType::Update
+                && operation.set.iter().any(|column| column.action.reverse().is_some())
+            {
+                return Err(format!(
+                    "Table '{}' uses an arithmetic update on a reorg-enabled network. Recovery cannot distinguish skipped inputs from applied deltas; use arithmetic upsert only if row creation is intended, or move aggregation outside this recovered table until applied-effect tracking is supported.",
+                    self.name
+                ));
+            }
             for column in operation.set.iter().filter(|column| column.action.reverse().is_some()) {
                 column
                     .reorg_event_field()

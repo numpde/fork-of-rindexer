@@ -349,7 +349,7 @@ fn read_manifest_rejects_insert_with_mutable_operations_during_reorg_recovery() 
 #[test]
 fn read_manifest_keeps_supported_insert_and_mutable_recovery_shapes() {
     for (operation, enabled, insert) in
-        [("", true, true), ("update", true, false), ("update", false, true)]
+        [("", true, true), ("upsert", true, false), ("update", false, true)]
     {
         let directory = tempfile::tempdir().unwrap();
         write_abi(directory.path());
@@ -647,15 +647,15 @@ fn read_manifest_keeps_separate_column_actions_and_non_reorg_mixtures() {
 }
 
 #[test]
-fn read_manifest_keeps_one_arithmetic_model_on_a_recovered_column() {
+fn read_manifest_keeps_arithmetic_upserts_on_a_recovered_column() {
     for action in ["add", "subtract", "increment", "decrement"] {
         for native in [false, true] {
             let mut table = set_arithmetic_table(action, false);
             table["events"][0]["operations"][1]["set"] =
                 table["events"][0]["operations"][0]["set"].clone();
+            table["events"][0]["operations"][1]["type"] = "upsert".into();
             let (_directory, path) = recovery_table_manifest(table, true, native);
-            read_manifest(&path)
-                .expect("multiple arithmetic operations without state replacement remain accepted");
+            read_manifest(&path).expect("multiple arithmetic upserts retain supported recovery");
         }
     }
 }
@@ -671,6 +671,9 @@ fn read_manifest_rejects_arithmetic_updates_without_applied_effect_tracking() {
             let mut update = table["events"][0]["operations"][0].clone();
             update["type"] = "update".into();
             table["events"][0]["operations"].as_array_mut().unwrap().push(update);
+            let (_directory, path) = recovery_table_manifest(table.clone(), false, native);
+            read_manifest(&path)
+                .expect("arithmetic updates without reorg handling remain supported");
             let (_directory, path) = recovery_table_manifest(table, true, native);
             let error = read_manifest(&path)
                 .expect_err("skipped arithmetic updates cannot be reconstructed from raw inputs")
