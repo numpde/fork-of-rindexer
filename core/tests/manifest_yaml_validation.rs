@@ -634,13 +634,18 @@ fn read_manifest_keeps_separate_column_actions_and_non_reorg_mixtures() {
     for action in ["add", "subtract", "increment", "decrement"] {
         for (enabled, separate) in [(true, true), (false, false)] {
             for native in [false, true] {
-                let (_directory, path) = recovery_table_manifest(
-                    set_arithmetic_table(action, separate),
-                    enabled,
-                    native,
+                let mut table = set_arithmetic_table(action, separate);
+                if enabled {
+                    // Independent actions remain supported when each writer also
+                    // supplies the complete assignment version for the row.
+                    table["events"][0]["operations"][0]["set"].as_array_mut().unwrap().push(
+                        serde_json::json!({"column":"status","action":"set","value":"$value"}),
+                    );
+                }
+                let (_directory, path) = recovery_table_manifest(table, enabled, native);
+                read_manifest(&path).expect(
+                    "complete mixed-column versions and non-reorg ordered mixtures retain support",
                 );
-                read_manifest(&path)
-                    .expect("independent columns and non-reorg ordered mixtures retain support");
             }
         }
     }

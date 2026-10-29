@@ -34,6 +34,38 @@ apply to its storage and configuration:
 These notes retain their existing URLs. Their place in this section identifies
 them as maintained fork documentation.
 
+## Complete assignment groups for recovered rows
+
+On a reorg-enabled table, every mutable operation must supply every non-key column
+that any operation writes with `action: set`. A table with assignment columns
+`x` and `y` therefore cannot accept one upsert/update setting only `x` and another
+setting only `y`. The same check applies to native-transfer tables and to an
+arithmetic operation that omits a table's assignment columns. Arithmetic-only
+and insert-only tables are unchanged; non-reorg partial assignments remain valid.
+
+Forward admission orders the entire row. An older partial upsert can be correctly
+superseded while its canonical candidate remains journaled. Independent column
+reconstruction can then install its rejected assignment during an unrelated
+rollback. Discarding superseded candidates would instead lose the state needed
+when the newer version is orphaned. The current journal does not retain complete
+row versions or independent per-column admission, so startup now rejects this
+unsupported history with the table and omitted assignment columns in the error.
+
+Combine assignments only when the source provides a complete version of the
+assignment group, or split independent state into separate keyed tables and adapt
+queries. Adding missing assignments with default values changes forward behavior
+and is not a migration preserving the old partial-write semantics. Complete
+assignment groups retain superseded candidates for rollback; this restriction
+does not change non-reorg ordering.
+
+There is no journal schema migration in this change. Editing YAML does not make
+old partial-write history complete. Before reusing such history under a new
+model, reconstruct derived state and journals from verified canonical sources,
+coordinating receipts and cursors so replay is not suppressed. This is required
+even if no incorrect rollback has been observed. Automatic support for partial
+recovered assignments is deferred until whole-row versions or consistent
+per-column versioning can preserve their admission semantics.
+
 ## Timestamp predicates during recovery
 
 `$rindexer_block_timestamp` in a table condition means numeric Unix seconds in
@@ -119,10 +151,12 @@ does not repair skipped or noncanonical history behind a durable checkpoint.
 
 PostgreSQL recovery now restores a column's database default (or NULL for a
 nullable column without a default) when all of that column's journal entries are
-orphaned but the row has a surviving canonical contribution. This covers separate
-operations that create a row through arithmetic and later set a different column.
+orphaned but the row has a surviving canonical contribution. This defensive
+fallback handles stored histories where a creator left another column at its
+default; it does not establish that partial assignment histories are safe.
+New manifests must satisfy the complete assignment groups described above.
 The internal fallback also handles empty `max`/`min` journals. New manifests must
-meet the extrema admission requirements below; that fallback alone cannot recover
+meet the extrema admission requirements below; the fallback alone cannot recover
 an omitted creation baseline when journal operands survive.
 
 The fix preserves the canonical row's sequence and provenance. It does not repair
@@ -302,8 +336,9 @@ with 20. Removing the set journal must not reset the surviving arithmetic value
 to its configured default. Startup now prevents that unsupported history.
 
 Use separate columns/tables for replacement state and accumulated amounts, or one
-update model for the column. Different columns may still use different actions;
-networks without reorg handling retain their existing behavior. Editing YAML does
+update model for the column. Different columns may still use different actions
+when every mutable operation supplies the complete assignment group described
+above. Networks without reorg handling retain their existing behavior. Editing YAML does
 not repair earlier incorrect rollbacks: coordinate verified canonical repair of
 derived state and journals with application receipts and cursors.
 

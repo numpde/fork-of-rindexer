@@ -435,6 +435,40 @@ impl Table {
                 ));
             }
         }
+        // Admission versions the whole row, while the journal selects each set
+        // column independently. Every mutable input must therefore carry the
+        // complete assignment group; defaults cannot stand in for omitted history.
+        let keys = self.primary_key_columns();
+        let assignment_columns = self
+            .columns
+            .iter()
+            .filter(|column| {
+                !keys.contains(&column.name.as_str())
+                    && self.all_operations().any(|operation| {
+                        operation.set.iter().any(|assignment| {
+                            assignment.column == column.name && assignment.action == SetAction::Set
+                        })
+                    })
+            })
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>();
+        for operation in self.all_operations() {
+            let missing = assignment_columns
+                .iter()
+                .copied()
+                .filter(|column| {
+                    !operation.set.iter().any(|assignment| {
+                        assignment.column.as_str() == *column && assignment.action == SetAction::Set
+                    })
+                })
+                .collect::<Vec<_>>();
+            if !missing.is_empty() {
+                return Err(format!(
+                    "Table '{}' has partial set history on a reorg-enabled network: a mutable operation omits assignment columns [{}]. Forward admission orders whole rows, but recovery retains individual column candidates. Every upsert/update must assign all non-key set columns; combine assignments into complete versions or split independent state into separate tables. Adding defaults does not recover the omitted history.",
+                    self.name, missing.join(", ")
+                ));
+            }
+        }
         Ok(())
     }
 
