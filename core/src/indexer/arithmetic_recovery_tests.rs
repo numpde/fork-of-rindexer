@@ -40,7 +40,7 @@ fn input(fixture: &Fixture, block: u64, branch: u8, value: u64) -> EventResult {
     event
 }
 
-async fn rollback(fixture: &Fixture) {
+pub(super) async fn rollback(fixture: &Fixture) {
     rollback_with_ancestor(fixture, 99).await.unwrap();
 }
 

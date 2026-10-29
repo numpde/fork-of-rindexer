@@ -139,3 +139,135 @@ async fn postgres_same_event_arithmetic_upsert_keeps_its_state_setting_fields() 
     drop(callback);
     fixture.finish().await;
 }
+
+async fn extrema_fixture(action: &str) -> Fixture {
+    let fixture = Fixture::with_table(serde_json::to_value(params().event).unwrap(), "Contract", json!({
+        "name":"totals", "global":true,
+        "columns":[{"name":"amount", "type":"uint256", "default":"0"}],
+        "events":[{"event":"Value", "operations":[
+            {"type":"update", "if":"value != 20", "set":[{"column":"amount", "action":action, "value":"$value"}]},
+            {"type":"upsert", "if":"value == 20", "set":[{"column":"amount", "action":action, "value":"$value"}]}
+        ]}]
+    })).await;
+    fixture.params.tables[0].table.validate_reorg_operations().unwrap();
+    fixture
+}
+
+async fn ignored_update_recovery(action: &str, ignored: u64, orphan: u64) {
+    let fixture = extrema_fixture(action).await;
+    let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+    callback(vec![event(&fixture, 98, 98, ignored)]).await.unwrap();
+    let rows: i64 = fixture
+        .client
+        .query_one(
+            &format!("SELECT count(*) FROM {}", fixture.params.tables[0].full_table_name),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(rows, 0, "UPDATE must not create a row");
+    let ignored_journals: i64 = fixture
+        .client
+        .query_one(
+            "SELECT count(*) FROM rindexer_internal.derived_op_log WHERE block_number=98",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    callback(vec![event(&fixture, 99, 99, 20)]).await.unwrap();
+    callback(vec![event(&fixture, 100, 100, orphan)]).await.unwrap();
+    super::arithmetic_recovery_tests::rollback(&fixture).await;
+    let amount: String = fixture
+        .client
+        .query_one(
+            &format!("SELECT amount::text FROM {}", fixture.params.tables[0].full_table_name),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(amount, "20", "a skipped update must never become a canonical extrema contribution");
+    assert_eq!(ignored_journals, 0, "only actual effects belong in recovery history");
+    assert_eq!(
+        fixture.position().await.0,
+        2,
+        "both surviving canonical raw events remain, including the no-op update"
+    );
+    let receipts: i64 = fixture
+        .client
+        .query_one("SELECT count(*) FROM rindexer_internal.event_applications", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(receipts, 2);
+    drop(callback);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_skipped_update_cannot_fabricate_max_during_recovery() {
+    ignored_update_recovery("max", 100, 30).await;
+}
+
+#[tokio::test]
+async fn postgres_skipped_update_cannot_fabricate_min_during_recovery() {
+    ignored_update_recovery("min", 1, 10).await;
+}
+
+#[tokio::test]
+async fn postgres_skipped_and_applied_updates_in_one_batch_keep_distinct_outcomes() {
+    let fixture = extrema_fixture("max").await;
+    let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+    callback(vec![event(&fixture, 99, 99, 20)]).await.unwrap();
+    callback(vec![event(&fixture, 98, 98, 100), event(&fixture, 100, 100, 30)]).await.unwrap();
+    let amount: String = fixture
+        .client
+        .query_one(
+            &format!("SELECT amount::text FROM {}", fixture.params.tables[0].full_table_name),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        amount, "30",
+        "an older rejected input must not be aggregated into the admitted update"
+    );
+    let blocks: Vec<String> = fixture
+        .client
+        .query(
+            "SELECT journal.block_number::text FROM rindexer_internal.derived_op_log journal ORDER BY journal.block_number",
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(blocks, ["99", "100"], "the batch's affected-row count cannot certify every input");
+    drop(callback);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_applied_same_event_set_order_survives_recovery() {
+    let mut fixture = fixture().await;
+    Arc::make_mut(&mut fixture.params.tables)[0].table.events[0].operations[2].set[0].column =
+        "amount".into();
+    let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+    callback(vec![event(&fixture, 98, 98, 0)]).await.unwrap();
+    callback(vec![event(&fixture, 99, 99, 1)]).await.unwrap();
+    let canonical = values(&fixture).await;
+    assert_eq!(canonical.0, "2");
+    callback(vec![event(&fixture, 100, 100, 3)]).await.unwrap();
+    super::arithmetic_recovery_tests::rollback(&fixture).await;
+    assert_eq!(
+        values(&fixture).await,
+        canonical,
+        "the last applied write at an event position must win during recovery too"
+    );
+    drop(callback);
+    fixture.finish().await;
+}
