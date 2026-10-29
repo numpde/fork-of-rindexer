@@ -40,7 +40,9 @@ PostgreSQL recovery now restores a column's database default (or NULL for a
 nullable column without a default) when all of that column's journal entries are
 orphaned but the row has a surviving canonical contribution. This covers separate
 operations that create a row through arithmetic and later set a different column.
-It also applies to `max` and `min` columns with no surviving journal entries.
+The internal fallback also handles empty `max`/`min` journals. New manifests must
+meet the extrema admission requirements below; that fallback alone cannot recover
+an omitted creation baseline when journal operands survive.
 
 The fix preserves the canonical row's sequence and provenance. It does not repair
 state left wrong by an earlier completed rollback; review affected ranges and
@@ -81,3 +83,23 @@ record. A timeout cannot establish whether the destination accepted a message;
 retries retain the same message ID, so consumers should deduplicate it. If the
 database cannot commit the retry delay, durable database state determines the
 next attempt. This changes no best-effort delivery configuration.
+
+## Extrema need a journaled creation baseline
+
+On reorg-enabled tables, every `upsert` that can create a row must initialize each
+`max`/`min` column using that same extrema action. All writes to that column must
+use the same action. Update-only extrema and a mix of `set`, arithmetic, `max`
+or `min` on one column now fail startup. These checks cover contract and native-transfer tables.
+
+A default is not a substitute for creation history. If arithmetic creates a row
+with default 42, a later `max(20)` retains 42, but journaling only 20 loses that
+baseline. Conversely, a first `max(20)` can create a row at 20 despite default 42;
+always folding the default into recovery would also be wrong.
+
+Keep monotonic extrema in a table whose creators journal their initial operand,
+or split unsupported operations into separate tables. Adding an extrema action
+to a creator can change its initial value: review that behavior before migrating.
+Changing YAML does not repair old journal history or earlier incorrect rollbacks.
+Rebuild affected derived state and recovery journals from verified canonical
+history, coordinating application receipts and cursors as described in the
+[sequence-ordering migration](/docs/migrations/sequence-ordering).

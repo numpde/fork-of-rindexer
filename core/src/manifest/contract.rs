@@ -351,7 +351,7 @@ impl Table {
         !ops.is_empty() && ops.iter().all(|op| op.operation_type == OperationType::Insert)
     }
 
-    pub(crate) fn validate_reorg_operation_mix(&self) -> Result<(), String> {
+    pub(crate) fn validate_reorg_operations(&self) -> Result<(), String> {
         if self.all_operations().any(|op| op.operation_type == OperationType::Insert)
             && !self.is_insert_only()
         {
@@ -361,6 +361,43 @@ impl Table {
                  instead of inserts, or move append-only inserts to a separate table.",
                 self.name
             ));
+        }
+        if self.is_insert_only() {
+            return Ok(());
+        }
+        for extrema in self
+            .all_operations()
+            .flat_map(|operation| &operation.set)
+            .filter(|column| matches!(column.action, SetAction::Max | SetAction::Min))
+        {
+            let mut has_creator = false;
+            for operation in self.all_operations() {
+                if operation.operation_type == OperationType::Upsert {
+                    has_creator = true;
+                    if !operation.set.iter().any(|column| {
+                        column.column == extrema.column && column.action == extrema.action
+                    }) {
+                        return Err(format!(
+                            "Table '{}' column '{}' has an unjournaled creation baseline on a reorg-enabled network. Every upsert must initialize this column with the same max/min action; otherwise recovery cannot reconstruct its initial value. Split the table or make every creator journal that extrema column.",
+                            self.name, extrema.column
+                        ));
+                    }
+                }
+                if operation.set.iter().any(|column| {
+                    column.column == extrema.column && column.action != extrema.action
+                }) {
+                    return Err(format!(
+                        "Table '{}' column '{}' mixes max/min with another action on a reorg-enabled network. Recovery requires a monotonic extrema history; use the same max or min action for every write to this column.",
+                        self.name, extrema.column
+                    ));
+                }
+            }
+            if !has_creator {
+                return Err(format!(
+                    "Table '{}' column '{}' has no journaled creation baseline on a reorg-enabled network. Use an upsert that initializes this column with the same max/min action; update-only extrema cannot recover an external initial value.",
+                    self.name, extrema.column
+                ));
+            }
         }
         Ok(())
     }

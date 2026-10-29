@@ -251,7 +251,7 @@ fn validate_manifest(
         })
     {
         for table in manifest.native_transfers.tables.iter().flatten() {
-            table.validate_reorg_operation_mix().map_err(|error| {
+            table.validate_reorg_operations().map_err(|error| {
                 ValidateManifestError::CustomIndexingValidationError(
                     error,
                     "native_transfers".to_string(),
@@ -367,7 +367,7 @@ fn validate_manifest(
                             && network.reorg_handling.as_ref().is_some_and(|config| config.enabled)
                     })
                 }) {
-                    table.validate_reorg_operation_mix().map_err(|error| {
+                    table.validate_reorg_operations().map_err(|error| {
                         ValidateManifestError::CustomIndexingValidationError(
                             error,
                             contract.name.clone(),

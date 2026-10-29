@@ -448,3 +448,33 @@ fn read_manifest_keeps_tracked_extrema_and_non_reorg_baselines() {
         }
     }
 }
+
+#[test]
+fn read_manifest_rejects_incomplete_extrema_histories() {
+    for variant in ["external baseline", "mixed actions", "another untracked creator"] {
+        let mut table = extrema_recovery_table("max", true);
+        let operations = table["events"][0]["operations"].as_array_mut().unwrap();
+        match variant {
+            "external baseline" => {
+                operations.remove(0);
+            }
+            "mixed actions" => {
+                operations[1]["set"][0]["action"] = "set".into();
+            }
+            _ => {
+                let mut creator = operations[0].clone();
+                creator["set"].as_array_mut().unwrap().pop();
+                operations.push(creator);
+            }
+        }
+        let (_directory, path) = recovery_table_manifest(table, true, false);
+        let error = read_manifest(&path)
+            .expect_err("accepted extrema must retain a complete monotonic history")
+            .to_string();
+        assert!(
+            error.contains("extreme")
+                && (error.contains("baseline") || error.contains("monotonic")),
+            "{variant}: {error}"
+        );
+    }
+}
