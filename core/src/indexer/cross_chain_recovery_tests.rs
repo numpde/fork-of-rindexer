@@ -115,9 +115,11 @@ mod known_risks {
     use super::*;
 
     #[tokio::test]
-    async fn known_risk_cross_chain_insert_legacy_schema_requires_manual_rebuild() {
-        for nullable in [false, true] {
-            let fixture = fixture("insert", "set", false).await;
+    async fn known_risk_cross_chain_legacy_schema_requires_manual_rebuild() {
+        for (operation, nullable) in
+            [("insert", false), ("insert", true), ("upsert", false), ("upsert", true)]
+        {
+            let fixture = fixture(operation, "set", false).await;
             let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
             callback(vec![at(&fixture, "ethereum", 99, B256::repeat_byte(99), 10)]).await.unwrap();
             let table = &fixture.params.tables[0].full_table_name;
@@ -164,7 +166,7 @@ async fn shared_state(fixture: &Fixture) -> (String, serde_json::Value) {
         .client
         .query_one(
             &format!(
-                "SELECT amount::text, to_jsonb(t) - 'amount' FROM {} t",
+                "SELECT amount::text, (to_jsonb(t) - 'amount') || jsonb_build_object('rindexer_sequence_id',rindexer_sequence_id::text) FROM {} t",
                 fixture.params.tables[0].full_table_name
             ),
             &[],

@@ -154,10 +154,8 @@ fn generate_tables_clickhouse(tables: &[Table], schema_name: &str) -> String {
             // Build column definitions
             let mut columns: Vec<String> = vec![];
 
-            // Append-only rows retain their source network even when keys are shared.
-            if !table.cross_chain || table.is_insert_only() {
-                columns.push("`network` String".to_string());
-            }
+            // Shared keys still retain the source network as row provenance.
+            columns.push("`network` String".to_string());
 
             // Add user-defined columns
             for column in &table.columns {

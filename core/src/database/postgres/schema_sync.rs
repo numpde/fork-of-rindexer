@@ -197,10 +197,8 @@ async fn table_exists(
 fn get_expected_columns(table: &Table) -> HashMap<String, String> {
     let mut columns: HashMap<String, String> = HashMap::new();
 
-    // Append-only shared rows need source identity for network-scoped recovery.
-    if !table.cross_chain || table.is_insert_only() {
-        columns.insert("network".to_string(), "character varying".to_string());
-    }
+    // Sharing keys does not remove the source-network provenance column.
+    columns.insert("network".to_string(), "character varying".to_string());
 
     // For insert-only tables, add auto-incrementing ID column
     if table.is_insert_only() {

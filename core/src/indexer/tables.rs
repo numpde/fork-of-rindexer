@@ -3943,7 +3943,7 @@ pub(crate) async fn apply_table_operations(
             let mut connection =
                 postgres.raw_connection().await.map_err(|error| error.to_string())?;
             let tx = connection.transaction().await.map_err(|error| pg_error_to_string(&error))?;
-            if requires_individual_admission(op.operation) {
+            if requires_individual_admission(op.operation, op.table.table.cross_chain) {
                 let mut inputs = op
                     .rows
                     .iter()
@@ -4001,8 +4001,10 @@ fn requires_recovery_journal(operation: &TableOperation) -> bool {
 
 // UPDATE's target/sequence guard applies to each event's delta before any
 // aggregation. Combining accepted and rejected inputs first changes the amount.
-fn requires_individual_admission(operation: &TableOperation) -> bool {
-    operation.operation_type == OperationType::Update || requires_recovery_journal(operation)
+fn requires_individual_admission(operation: &TableOperation, cross_chain: bool) -> bool {
+    cross_chain
+        || operation.operation_type == OperationType::Update
+        || requires_recovery_journal(operation)
 }
 
 fn postgres_event_order(row: &TableRowData) -> Result<(&str, u128), String> {
@@ -4063,7 +4065,10 @@ async fn apply_table_operations_in_tx(
 ) -> Result<(), String> {
     let ordered = (prepared.ops.len() > 1
         && prepared.ops.iter().any(|op| op.operation.operation_type != OperationType::Insert))
-        || prepared.ops.iter().any(|op| requires_individual_admission(op.operation));
+        || prepared
+            .ops
+            .iter()
+            .any(|op| requires_individual_admission(op.operation, op.table.table.cross_chain));
     let mut inputs = Vec::new();
     if ordered {
         // Event order precedes operation order: a later event must not advance
@@ -4250,9 +4255,9 @@ async fn execute_postgres_operation(
     for row in rows {
         let mut columns: Vec<DynamicColumnDefinition> = Vec::new();
 
-        if !table_def.cross_chain || table_def.is_insert_only() {
+        {
             // For Insert, network is just a normal column (no dedup)
-            let network_behavior = if is_insert {
+            let network_behavior = if is_insert || table_def.cross_chain {
                 BatchOperationColumnBehavior::Normal
             } else {
                 BatchOperationColumnBehavior::Distinct
@@ -4262,7 +4267,11 @@ async fn execute_postgres_operation(
                 EthereumSqlTypeWrapper::String(row.network.clone()),
                 BatchOperationSqlType::Varchar,
                 network_behavior,
-                BatchOperationAction::Where,
+                if table_def.cross_chain {
+                    BatchOperationAction::Set
+                } else {
+                    BatchOperationAction::Where
+                },
             ));
         }
 
@@ -4463,9 +4472,9 @@ async fn execute_clickhouse_operation(
     for row in rows {
         let mut columns: Vec<DynamicColumnDefinition> = Vec::new();
 
-        if !table_def.cross_chain || table_def.is_insert_only() {
+        {
             // For Insert, network is just a normal column (no dedup)
-            let network_behavior = if is_insert {
+            let network_behavior = if is_insert || table_def.cross_chain {
                 BatchOperationColumnBehavior::Normal
             } else {
                 BatchOperationColumnBehavior::Distinct
@@ -4475,7 +4484,11 @@ async fn execute_clickhouse_operation(
                 EthereumSqlTypeWrapper::String(row.network.clone()),
                 BatchOperationSqlType::Varchar,
                 network_behavior,
-                BatchOperationAction::Where,
+                if table_def.cross_chain {
+                    BatchOperationAction::Set
+                } else {
+                    BatchOperationAction::Where
+                },
             ));
         }
 

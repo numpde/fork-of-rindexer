@@ -246,9 +246,9 @@ This differs from a missing-row UPDATE, which neither creates a row nor defines
 an unconditional replacement version. Recovery candidate selection follows that
 operation distinction rather than treating every zero-row SQL result alike.
 
-## Cross-chain append-only recovery and manual upgrades
+## Cross-chain source identity and manual upgrades
 
-Insert-only tables with `cross_chain: true` now store the source `network` on each
+Tables with `cross_chain: true` now store the source `network` on each
 row in PostgreSQL and ClickHouse. It remains outside the shared primary key.
 Rolling back chain A removes only A's rows at or beyond its fork; chain B's
 independent heights do not define A's recovery boundary.
@@ -261,9 +261,29 @@ source-network identities, coordinating receipts and cursors so replay is not
 suppressed. Manually managed ClickHouse tables also need their source column
 before writing with this version; ClickHouse reorg recovery remains unsupported.
 
-The passing `known_risks::known_risk_cross_chain_insert_legacy_schema_requires_manual_rebuild`
+The passing `known_risks::known_risk_cross_chain_legacy_schema_requires_manual_rebuild`
 test records this operational limitation. It asserts the explicit startup error
 for missing or nullable provenance and preservation of existing raw history.
 When an automatic migration can establish source identities, replace this test
 with migration-success coverage. It is not an ignored test or a claim that the
 legacy table is safe to recover.
+
+## Equal positions in shared PostgreSQL rows
+
+Shared rows compare `(block number, transaction index, log index)` first. When
+positions are equal across chains, the bytewise greatest configured network name
+wins (`COLLATE "C"` in PostgreSQL). This is an explicit tie-breaking policy, not a
+claim that block heights measure time across chains. Both forward admission and
+journal/metadata recovery use the same policy, independent of arrival order.
+Multiple writes from the same event still follow manifest operation order.
+
+The source `network` is stored as row provenance, outside the shared key. Inputs
+for shared tables execute individually, including arithmetic upserts, to preserve
+ordering of state fields and metadata. Arithmetic amounts still combine admitted
+contributions; this tie-breaker selects state-setting fields and provenance.
+Non-shared tables retain their existing event-position order.
+
+Existing cross-chain state must be rebuilt with canonical source identities and
+this ordering rule. A newly added column cannot by itself correct values selected
+under the old first-arrival rule. Automatic migration remains the known limitation
+above; coordinate any rebuild with journals, receipts and cursors.

@@ -1405,7 +1405,7 @@ impl ReorgTask {
                                  SELECT DISTINCT ON (where_key) where_key, value \
                                  FROM rindexer_internal.derived_op_log \
                                  WHERE derived_table = '{}' AND column_name = '{}'{} \
-                                 ORDER BY where_key, block_number DESC, tx_index DESC, log_index DESC, id DESC \
+                                 ORDER BY where_key, block_number DESC, tx_index DESC, log_index DESC, network COLLATE \"C\" DESC, id DESC \
                              ) sub \
                              WHERE {} {}",
                             dt.full_table_name, jc.derived_column, jc.derived_column, jc.derived_column,
@@ -1526,7 +1526,7 @@ impl ReorgTask {
         network_join: &str,
     ) -> anyhow::Result<()> {
         use crate::manifest::contract::injected_columns::*;
-        let metadata_columns = vec![
+        let mut metadata_columns = vec![
             RINDEXER_SEQUENCE_ID.to_string(),
             BLOCK_NUMBER.to_string(),
             BLOCK_TIMESTAMP.to_string(),
@@ -1534,6 +1534,9 @@ impl ReorgTask {
             BLOCK_HASH.to_string(),
             CONTRACT_ADDRESS.to_string(),
         ];
+        if table.cross_chain {
+            metadata_columns.push("network".into());
+        }
         // Timestamp is optional, and older tables can expose fewer metadata columns.
         // PostgreSQL's row type is the authority for converting the recorded values.
         let columns = pg
@@ -1555,9 +1558,9 @@ impl ReorgTask {
         let sql = format!(
             "UPDATE {table} AS dt SET ({targets}) = \
              (SELECT {restored} FROM jsonb_populate_record(dt, sub.row_metadata) AS restored) \
-             FROM (SELECT DISTINCT ON (where_key) where_key, row_metadata \
+             FROM (SELECT DISTINCT ON (where_key) where_key, row_metadata || jsonb_build_object('network', network) AS row_metadata \
                  FROM rindexer_internal.derived_op_log WHERE derived_table = '{table}'{network_filter} \
-                 ORDER BY where_key, block_number DESC, tx_index DESC, log_index DESC, id DESC) sub \
+                 ORDER BY where_key, block_number DESC, tx_index DESC, log_index DESC, network COLLATE \"C\" DESC, id DESC) sub \
              WHERE {key_join}{network_join}",
             table = table.full_table_name,
             key_join = Self::journal_where_key_join(&column.where_columns, "dt", "sub"),

@@ -11,7 +11,7 @@ impl ReorgTask {
         use crate::manifest::contract::injected_columns::*;
         let empty_types = HashMap::new();
         for table in self.derived_tables.iter().filter(|table| !table.rollback_ops.is_empty()) {
-            let names = vec![
+            let mut names = vec![
                 RINDEXER_SEQUENCE_ID,
                 BLOCK_NUMBER,
                 BLOCK_TIMESTAMP,
@@ -19,6 +19,9 @@ impl ReorgTask {
                 BLOCK_HASH,
                 CONTRACT_ADDRESS,
             ];
+            if table.cross_chain {
+                names.push("network");
+            }
             let columns = pg.query(
                 "SELECT attname::text FROM pg_attribute WHERE attrelid = $1::text::regclass AND attnum > 0 AND NOT attisdropped AND attname::text = ANY($2)",
                 &[&table.full_table_name, &names],
@@ -83,11 +86,13 @@ impl ReorgTask {
                 // Keep all 128 position bits in PostgreSQL NUMERIC, and use a
                 // string in JSON so no floating-point decoder can round it.
                 // Ordering is needed even when an older target exposes fewer fields.
-                let mut fields = vec![format!("'{RINDEXER_SEQUENCE_ID}', (_rindexer_event.block_number::numeric * 18446744073709551616 + _rindexer_event.tx_index::numeric * 4294967296 + _rindexer_event.log_index::numeric)::text")];
+                let mut fields = vec!["'network', _rindexer_event.network".into(), format!("'{RINDEXER_SEQUENCE_ID}', (_rindexer_event.block_number::numeric * 18446744073709551616 + _rindexer_event.tx_index::numeric * 4294967296 + _rindexer_event.log_index::numeric)::text")];
                 fields.extend(
                     columns
                         .iter()
-                        .filter(|name| name.as_str() != RINDEXER_SEQUENCE_ID)
+                        .filter(|name| {
+                            name.as_str() != RINDEXER_SEQUENCE_ID && name.as_str() != "network"
+                        })
                         .map(|name| format!("'{name}', {}", source.column(name))),
                 );
                 let fields = fields.join(", ");
@@ -105,7 +110,7 @@ impl ReorgTask {
                 } else {
                     format!("network = '{}' AND block_number < {}", self.network, self.fork_point)
                 };
-                candidates.push(format!("SELECT where_key, row_metadata FROM rindexer_internal.derived_op_log WHERE derived_table = '{}' AND {canonical}", table.full_table_name));
+                candidates.push(format!("SELECT where_key, row_metadata || jsonb_build_object('network', network) AS row_metadata FROM rindexer_internal.derived_op_log WHERE derived_table = '{}' AND {canonical}", table.full_table_name));
             }
             let temporary =
                 format!("_rindexer_canonical_{}", generate_random_id(20).to_ascii_lowercase());
@@ -149,7 +154,7 @@ impl ReorgTask {
                 .collect::<Vec<_>>()
                 .join(", ");
             pg.batch_execute(&format!(
-                "UPDATE {} dt SET ({}) = (SELECT {restored} FROM (SELECT row_metadata FROM {temporary} sub WHERE {key_match} ORDER BY (row_metadata->>'{RINDEXER_SEQUENCE_ID}')::numeric DESC LIMIT 1) latest CROSS JOIN LATERAL jsonb_populate_record(dt, latest.row_metadata) restored) WHERE {affected}",
+                "UPDATE {} dt SET ({}) = (SELECT {restored} FROM (SELECT row_metadata FROM {temporary} sub WHERE {key_match} ORDER BY (row_metadata->>'{RINDEXER_SEQUENCE_ID}')::numeric DESC, (row_metadata->>'network') COLLATE \"C\" DESC LIMIT 1) latest CROSS JOIN LATERAL jsonb_populate_record(dt, latest.row_metadata) restored) WHERE {affected}",
                 table.full_table_name, columns.join(", "),
             )).await.with_context(|| format!("Cannot restore arithmetic sequence and provenance for {}", table.full_table_name))?;
         }

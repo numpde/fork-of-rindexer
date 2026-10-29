@@ -46,7 +46,10 @@ fn event_continuation(
     }) {
         return None;
     }
-    let identity = [RINDEXER_SEQUENCE_ID, BLOCK_HASH, TX_HASH, CONTRACT_ADDRESS];
+    let mut identity = vec![RINDEXER_SEQUENCE_ID, BLOCK_HASH, TX_HASH, CONTRACT_ADDRESS];
+    if columns.iter().any(|column| column.name == "network") {
+        identity.push("network");
+    }
     if !identity.iter().all(|name| columns.iter().any(|column| column.name == *name)) {
         return None;
     }
@@ -59,6 +62,33 @@ fn event_continuation(
     // epoch-extended ID must be reduced to the 32 bits stored in tuple xmin.
     Some(format!(
         "({target}.xmin::text::bigint = (txid_current() % 4294967296::bigint) AND {same_event})"
+    ))
+}
+
+// Shared rows compare event position first, then source network in byte order.
+// The journal uses the same order; transaction ownership only permits another
+// operation from the exact same event to continue at its position.
+fn event_admission(
+    columns: &[DynamicColumnDefinition],
+    input: &str,
+    target: &str,
+) -> Option<String> {
+    let continuation = event_continuation(columns, input, target)?;
+    let sequence = super::query_builder::quote_identifier(
+        crate::manifest::contract::injected_columns::RINDEXER_SEQUENCE_ID,
+    );
+    let shared = columns.iter().any(|column| {
+        column.name == "network"
+            && matches!(column.behavior, BatchOperationColumnBehavior::Normal)
+            && matches!(column.action, BatchOperationAction::Set)
+    });
+    let network_tie = if shared {
+        format!(" OR ({input}.{sequence} = {target}.{sequence} AND {input}.network COLLATE \"C\" > {target}.network COLLATE \"C\")")
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "({input}.{sequence} > COALESCE({target}.{sequence}, 0){network_tie} OR {continuation})"
     ))
 }
 
@@ -410,13 +440,9 @@ pub fn build_batch_statement(
                                 UpsertClauseType::Max,
                             ));
                         } else {
-                            if let Some(continuation) =
-                                event_continuation(columns, "EXCLUDED", &formatted_table_name)
+                            if let Some(condition) =
+                                event_admission(columns, "EXCLUDED", &formatted_table_name)
                             {
-                                let sequence = super::query_builder::quote_identifier(
-                                    sequence_col.expect("sequence column exists"),
-                                );
-                                let condition = format!("(EXCLUDED.{sequence} > COALESCE({formatted_table_name}.{sequence}, 0) OR {continuation})");
                                 update_clauses.push(build_upsert_set_clause_if(
                                     col,
                                     &formatted_table_name,
@@ -491,17 +517,13 @@ pub fn build_batch_statement(
                 }
             }
 
-            let continuation = (!arithmetic_without_sequence_guard)
-                .then(|| event_continuation(columns, "EXCLUDED", &formatted_table_name))
+            let admission = (!arithmetic_without_sequence_guard)
+                .then(|| event_admission(columns, "EXCLUDED", &formatted_table_name))
                 .flatten();
-            if let Some(continuation) = &continuation {
-                let sequence = super::query_builder::quote_identifier(
-                    sequence_col.expect("event sequence exists"),
-                );
-                let admission = format!("(EXCLUDED.{sequence} > COALESCE({formatted_table_name}.{sequence}, 0) OR {continuation})");
+            if let Some(admission) = &admission {
                 rewritten_where = Some(match rewritten_where {
                     Some(condition) => format!("{admission} AND ({condition})"),
-                    None => admission,
+                    None => admission.clone(),
                 });
             }
             query.push_str(&build_upsert_body(
@@ -509,7 +531,7 @@ pub fn build_batch_statement(
                 &column_names,
                 &conflict_columns,
                 update_clauses,
-                if arithmetic_without_sequence_guard || continuation.is_some() {
+                if arithmetic_without_sequence_guard || admission.is_some() {
                     None
                 } else {
                     sequence_col
@@ -543,9 +565,9 @@ pub fn build_batch_statement(
     if let Some(seq_col) = sequence_col {
         if let Some(condition) = build_sequence_condition(seq_col, op_type) {
             let condition = match op_type {
-                BatchOperationType::Update => event_continuation(columns, "tp", "am")
-                    .map(|continuation| format!("({condition} OR {continuation})"))
-                    .unwrap_or(condition),
+                BatchOperationType::Update => {
+                    event_admission(columns, "tp", "am").unwrap_or(condition)
+                }
                 _ => condition,
             };
             where_conditions.push(condition);
