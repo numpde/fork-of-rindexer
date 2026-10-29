@@ -1687,3 +1687,6 @@ mod event_operation_tests;
 
 #[path = "cross_chain_recovery_tests.rs"]
 mod cross_chain_recovery_tests;
+
+#[path = "recovery_boundary_tests.rs"]
+mod recovery_boundary_tests;
