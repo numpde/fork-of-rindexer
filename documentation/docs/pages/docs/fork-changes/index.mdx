@@ -197,3 +197,12 @@ update model for the column. Different columns may still use different actions;
 networks without reorg handling retain their existing behavior. Editing YAML does
 not repair earlier incorrect rollbacks: coordinate verified canonical repair of
 derived state and journals with application receipts and cursors.
+
+## PostgreSQL transaction-identity compatibility
+
+The same-event continuation query now uses the transaction-ID API available on
+both the native PostgreSQL 11 fixture and the prepared PostgreSQL 16 fixture. It
+reduces the epoch-extended ID to the 32-bit transaction ID stored in tuple `xmin`.
+The ownership regression checks both the active transaction and a later
+transaction observing the committed row. Existing configurations need no
+PostgreSQL version upgrade for this fix.

@@ -55,7 +55,11 @@ fn event_continuation(
         .map(|name| format!("{input}.{name} = {target}.{name}"))
         .collect::<Vec<_>>()
         .join(" AND ");
-    Some(format!("({target}.xmin = pg_current_xact_id()::xid AND {same_event})"))
+    // txid_current is available on the PostgreSQL 11 native fixture. Its
+    // epoch-extended ID must be reduced to the 32 bits stored in tuple xmin.
+    Some(format!(
+        "({target}.xmin::text::bigint = (txid_current() % 4294967296::bigint) AND {same_event})"
+    ))
 }
 
 /// Executes a dynamic batch operation with runtime-defined columns.
