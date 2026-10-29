@@ -22,6 +22,9 @@ use crate::{
     StringOrArray,
 };
 
+#[path = "recovery_validation.rs"]
+mod recovery_validation;
+
 pub const YAML_CONFIG_NAME: &str = "rindexer.yaml";
 
 /// Checks if a value string contains arithmetic operators indicating it's a computed expression.
@@ -242,25 +245,10 @@ fn validate_manifest(
         }
     }
 
-    if manifest.native_transfers.enabled
-        && manifest.networks.iter().any(|network| {
-            network.reorg_handling.as_ref().is_some_and(|config| config.enabled)
-                && manifest.native_transfers.networks.as_ref().is_none_or(|details| {
-                    details.iter().any(|detail| detail.network == network.name)
-                })
-        })
-    {
-        for table in manifest.native_transfers.tables.iter().flatten() {
-            table.validate_reorg_operations().map_err(|error| {
-                ValidateManifestError::CustomIndexingValidationError(
-                    error,
-                    "native_transfers".to_string(),
-                )
-            })?;
-        }
-    }
+    let contracts = manifest.all_contracts();
+    recovery_validation::validate(manifest, &contracts)?;
 
-    for contract in &manifest.all_contracts() {
+    for contract in &contracts {
         if contract.name.to_lowercase().contains("filter") {
             return Err(ValidateManifestError::ContractNameCanNotIncludeFilter(
                 contract.name.clone(),
@@ -361,20 +349,6 @@ fn validate_manifest(
         // Validate tables (custom aggregation tables)
         if let Some(tables) = &contract.tables {
             for table in tables {
-                if contract.details.iter().any(|detail| {
-                    manifest.networks.iter().any(|network| {
-                        network.name == detail.network
-                            && network.reorg_handling.as_ref().is_some_and(|config| config.enabled)
-                    })
-                }) {
-                    table.validate_reorg_operations().map_err(|error| {
-                        ValidateManifestError::CustomIndexingValidationError(
-                            error,
-                            contract.name.clone(),
-                        )
-                    })?;
-                }
-
                 // Validate that all operations have consistent where columns
                 // (which become the primary key)
                 if let Err(e) = table.validate_where_columns() {

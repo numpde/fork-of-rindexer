@@ -34,6 +34,36 @@ apply to its storage and configuration:
 These notes retain their existing URLs. Their place in this section identifies
 them as maintained fork documentation.
 
+## Physical destination ownership during recovery
+
+A derived destination participating in reorg recovery requires one manifest
+`Table` declaration. Validation resolves the same `database:` override and
+normalized table name used by runtime writes before applying recovery rules.
+It covers contracts and native transfers, explicit/default-schema aliases, and
+PostgreSQL identifier truncation and quoted schema aliases. In projects with
+reorg handling, `database:` must identify one schema; database-qualified schema
+paths cannot be resolved safely during offline validation. Recovered identifiers must use lowercase so
+quoted writes and bare recovery SQL address the same catalog object.
+
+Separate declarations cannot hide a partial assignment group, a set/arithmetic
+mixture, an insert/mutable mixture or a missing extrema baseline from each
+other's local checks. Recovery currently merges plans by destination without a
+complete cross-declaration write model; startup therefore refuses shared recovered
+targets and names the destination and all declaring owners. This applies when
+any participating source enables recovery, including aliases whose own source
+has recovery disabled. The existing operation restrictions run once at this
+physical ownership boundary.
+
+One declaration can still watch multiple addresses and networks. Tables with the
+same basename in different schemas, or different names in one schema, remain
+independent. Shared destinations without reorg handling retain their behavior.
+For recovered data, consolidate into one declaration only when it represents the
+complete write model and satisfies every recovery rule, or choose distinct
+physical destinations. Do not remove a declaration merely to hide its existing
+history: reconstruct conflicting derived state and journals with coordinated
+receipts and cursors before reuse. No automatic shared-history migration is
+attempted. This is manifest ownership, not distributed writer fencing.
+
 ## Arithmetic predicates and recovered tables
 
 Mutable tables on a reorg-enabled network now reject arithmetic expressions in
