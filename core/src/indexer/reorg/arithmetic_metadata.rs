@@ -43,7 +43,10 @@ impl ReorgTask {
             } else {
                 format!(" AND dt.network = '{}'", self.network)
             };
-            let affected = format!("dt.rindexer_block_number >= {}{scope}", self.fork_point);
+            let affected = format!(
+                "dt.rindexer_block_number >= {} AND dt.rindexer_block_number <= {}{scope}",
+                self.fork_point, self.detection_point
+            );
             let mut candidates = Vec::new();
             for (index, operation) in table.rollback_ops.iter().enumerate() {
                 let metadata = plan.operation(&table.full_table_name, index);

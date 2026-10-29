@@ -479,7 +479,43 @@ impl ReorgCoordinator {
                 self.pending_recovery.writer_guard =
                     Some(event_writer_barrier(&self.network).write_owned().await);
             }
-            let reorg_task = self.pending_recovery.tasks.front().expect("pending recovery");
+            let reorg_task = self.pending_recovery.tasks.front_mut().expect("pending recovery");
+            // A lagging subscription's fetch range is not the network's durable
+            // high-water mark. Resolve the suffix only after every admitted writer
+            // has drained, and retain that same endpoint across retries/notifications.
+            let mut rollback_end = reorg_task
+                .detection_point
+                .max(self.window.latest_block().unwrap_or(reorg_task.detection_point));
+            if let Some(postgres) = ctx.postgres {
+                for table in &reorg_task.event_tables {
+                    let maximum: Option<String> = postgres
+                        .query_one(
+                            &format!(
+                                "SELECT max(block_number)::text FROM {} WHERE network = $1",
+                                table.full_name
+                            ),
+                            &[&self.network],
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "Cannot determine committed rollback coverage for {} on network {}",
+                                table.full_name, self.network
+                            )
+                        })?
+                        .get(0);
+                    if let Some(maximum) = maximum {
+                        rollback_end =
+                            rollback_end.max(maximum.parse::<u64>().with_context(|| {
+                                format!(
+                                    "Invalid committed block height {maximum:?} in {}",
+                                    table.full_name
+                                )
+                            })?);
+                    }
+                }
+            }
+            reorg_task.detection_point = rollback_end;
             let mut providers = ctx.recovery_providers();
             if let Some(provider) = &self.provider {
                 providers.insert(self.network.clone(), provider.clone());

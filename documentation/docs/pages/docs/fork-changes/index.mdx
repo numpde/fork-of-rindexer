@@ -34,6 +34,21 @@ apply to its storage and configuration:
 These notes retain their existing URLs. Their place in this section identifies
 them as maintained fork documentation.
 
+## Network-wide rollback coverage
+
+A detecting subscription can lag behind other subscriptions on the same network.
+The coordinator now holds the exclusive network writer barrier while resolving
+the rollback endpoint from retained header coverage and the greatest committed
+height across its registered raw event tables. It keeps that endpoint for recovery
+retries and notifications. Raw events, receipts, arithmetic reversal, journal
+invalidation and insert-only cleanup use the same inclusive range.
+
+This prevents a faster subscription's receipts from surviving after its effects
+have been invalidated. Providers must supply canonical headers for the full
+resolved range; a failed proof leaves recovery pending and writers fenced.
+Existing mismatches created by older rollback code still require verified repair;
+this change does not reconstruct effects suppressed by already-retained receipts.
+
 ## Runtime lifecycle integration check
 
 After building an image separately with `make runtime/image/build`, run:

@@ -1313,8 +1313,11 @@ impl ReorgTask {
                 pg.batch_execute(&format!(
                     "CREATE TEMP TABLE {orphaned_columns} ON COMMIT DROP AS
                      SELECT DISTINCT where_key, column_name FROM rindexer_internal.derived_op_log
-                     WHERE derived_table = '{}' AND block_number >= {}{}",
-                    dt.full_table_name, self.fork_point, source_network_filter,
+                     WHERE derived_table = '{}' AND block_number >= {} AND block_number <= {}{}",
+                    dt.full_table_name,
+                    self.fork_point,
+                    self.detection_point,
+                    source_network_filter,
                 ))
                 .await
                 .with_context(|| {
@@ -1328,13 +1331,13 @@ impl ReorgTask {
             // Delete journal entries in the reorg range
             let pg_delete = format!(
                 "DELETE FROM rindexer_internal.derived_op_log \
-                 WHERE derived_table = '{}' AND block_number >= {}{}",
-                dt.full_table_name, self.fork_point, source_network_filter,
+                 WHERE derived_table = '{}' AND block_number >= {} AND block_number <= {}{}",
+                dt.full_table_name, self.fork_point, self.detection_point, source_network_filter,
             );
             let ch_delete = format!(
                 "ALTER TABLE rindexer_internal.derived_op_log DELETE \
-                 WHERE derived_table = '{}' AND block_number >= {}{} SETTINGS mutations_sync = 1",
-                dt.full_table_name, self.fork_point, source_network_filter,
+                 WHERE derived_table = '{}' AND block_number >= {} AND block_number <= {}{} SETTINGS mutations_sync = 1",
+                dt.full_table_name, self.fork_point, self.detection_point, source_network_filter,
             );
 
             if let Some(pg) = pg {
@@ -1367,11 +1370,12 @@ impl ReorgTask {
                     // A row created only by orphaned inputs has no canonical state
                     // to restore. Do not leave its last orphaned aggregate behind.
                     let delete = format!(
-                        "DELETE FROM {} AS dt WHERE dt.rindexer_block_number >= {}{} \
+                        "DELETE FROM {} AS dt WHERE dt.rindexer_block_number >= {} AND dt.rindexer_block_number <= {}{} \
                          AND NOT EXISTS (SELECT 1 FROM rindexer_internal.derived_op_log sub \
                              WHERE sub.derived_table = '{}'{} AND {})",
                         dt.full_table_name,
                         self.fork_point,
+                        self.detection_point,
                         network_join,
                         dt.full_table_name,
                         network_filter,
@@ -1822,8 +1826,8 @@ impl ReorgTask {
 
                 if let Some(pg) = pg {
                     let query = format!(
-                        "DELETE FROM {} WHERE rindexer_block_number >= {}{}",
-                        dt.full_table_name, self.fork_point, network_filter
+                        "DELETE FROM {} WHERE rindexer_block_number >= {} AND rindexer_block_number <= {}{}",
+                        dt.full_table_name, self.fork_point, self.detection_point, network_filter
                     );
                     pg.batch_execute(&query).await.with_context(|| {
                         format!(
@@ -1839,8 +1843,8 @@ impl ReorgTask {
                 }
                 if let Some(ch) = clickhouse {
                     let query = format!(
-                        "ALTER TABLE {} DELETE WHERE rindexer_block_number >= {}{} SETTINGS mutations_sync = 1",
-                        dt.full_table_name, self.fork_point, network_filter
+                        "ALTER TABLE {} DELETE WHERE rindexer_block_number >= {} AND rindexer_block_number <= {}{} SETTINGS mutations_sync = 1",
+                        dt.full_table_name, self.fork_point, self.detection_point, network_filter
                     );
                     ch.execute(&query).await.with_context(|| {
                         format!(

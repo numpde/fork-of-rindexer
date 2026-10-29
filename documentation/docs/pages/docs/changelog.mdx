@@ -63,6 +63,7 @@
 
 ### Bug fixes
 -------------------------------------------------
+- fix: network reorg recovery now resolves the rollback endpoint after draining admitted writers, including event rows committed ahead of the detecting subscription. Raw rows, application receipts, journals, arithmetic and insert-only effects use the same closed interval so faster subscriptions cannot retain receipts for erased effects.
 - fix: keep configured subscription cursor identities stable across historical-to-live handoff. PostgreSQL live processing and health now use the same checkpoint after recovery; durable coverage, including a rewind to zero, takes precedence over in-process resume hints. Stateless handlers retain their historical resume position.
 - fix: PostgreSQL cross-chain arithmetic recovery resolves missing canonical timestamps through each contribution’s source-network provider, including contract and native-transfer registries. Missing providers and inconsistent source hashes report the network and block and leave rollback uncommitted. Hash diagnostics now begin `Cannot restore row timestamp on network` instead of `Cannot restore row timestamp at block`; update log-grep alerts.
 - fix: sequence-superseded PostgreSQL upserts now retain canonical journal candidates without replacing newer live state. Rollback can restore an older canonical value, provenance and receipt even when independent streams delivered the newer block first. Missing-target updates and false SQL table-state guards remain excluded; no journal schema change is needed.
