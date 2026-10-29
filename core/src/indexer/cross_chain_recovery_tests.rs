@@ -1,6 +1,8 @@
 //! Cross-chain sharing must retain each source network's independent history.
 use std::collections::HashMap;
 
+use alloy::primitives::U256;
+
 use super::journal_recovery_tests::at;
 use super::*;
 use crate::{
@@ -8,7 +10,7 @@ use crate::{
         BlockChainWindow, EventTableInfo, ReorgBlockHashPersistence, ReorgContext, ReorgCoordinator,
     },
     manifest::contract::ColumnType,
-    provider::mock::MockChainProvider,
+    provider::{mock::MockChainProvider, ChainProvider},
 };
 
 async fn fixture(operation: &str, action: &str, timestamp: bool) -> Fixture {
@@ -60,6 +62,11 @@ async fn rollback(fixture: &Fixture) -> anyhow::Result<()> {
     )
     .unwrap()
     .with_rollback_plan(plans.remove("ethereum").unwrap());
+    let mut registry = super::super::permanent_failure_tests::registry(
+        &fixture.params,
+        Arc::new(|_| Box::pin(async { Ok(()) })),
+    );
+    registry.events[0].providers = fixture.params.providers.clone();
     let task = coordinator.try_create_reorg_task_for_block_range(100, 100).unwrap();
     coordinator
         .handle_reorg(
@@ -67,7 +74,7 @@ async fn rollback(fixture: &Fixture) -> anyhow::Result<()> {
             &ReorgContext {
                 postgres: Some(&fixture.client),
                 clickhouse: None,
-                registry: None,
+                registry: Some(&registry),
                 trace_registry: None,
             },
         )
@@ -224,4 +231,126 @@ async fn postgres_cross_chain_equal_position_winner_survives_recovery() {
 #[tokio::test]
 async fn postgres_cross_chain_equal_position_winner_is_independent_of_arrival_order() {
     equal_position_case(true).await;
+}
+
+fn source_header(number: u64, branch: u8, timestamp: u64) -> alloy::network::AnyRpcBlock {
+    let mut header =
+        crate::indexer::tables::view_call_cache_tests::header(B256::repeat_byte(branch), timestamp);
+    header.header.inner.number = number;
+    header
+}
+
+async fn timestamp_fixture(other_provider: Option<u8>) -> Fixture {
+    let mut fixture = Fixture::with_table_on_networks(
+        serde_json::to_value(params().event).unwrap(), "Contract",
+        json!({"name":"shared", "cross_chain":true, "timestamp":true,
+            "columns":[{"name":"id", "type":"address"}, {"name":"amount", "type":"uint256", "default":"0"}],
+            "events":[{"event":"Value", "operations":[{"type":"upsert", "where":{"id":"$rindexer_contract_address"}, "set":[{"column":"amount", "action":"add", "value":"$value"}]}]}]
+        }), &["ethereum", "other"],
+    ).await;
+    let own: Arc<dyn ChainProvider> = Arc::new(
+        MockChainProvider::new(1)
+            .with_blocks(vec![source_header(99, 11, 1099), source_header(100, 101, 1101)]),
+    );
+    let mut providers = HashMap::from([("ethereum".to_string(), own)]);
+    if let Some(branch) = other_provider {
+        providers.insert(
+            "other".to_string(),
+            Arc::new(MockChainProvider::new(2).with_blocks(vec![source_header(99, branch, 2099)])),
+        );
+    }
+    fixture.params.providers = Arc::new(providers);
+    fixture
+}
+
+fn timestamped_input(
+    fixture: &Fixture,
+    network: &str,
+    block: u64,
+    branch: u8,
+    value: u64,
+    timestamp: u64,
+) -> EventResult {
+    let mut result = at(fixture, network, block, B256::repeat_byte(branch), value);
+    result.tx_information.block_timestamp = Some(U256::from(timestamp));
+    result.log.block_timestamp = Some(timestamp);
+    if network == "other" {
+        result.tx_information.chain_id = 2;
+    }
+    result
+}
+
+async fn remove_other_raw_timestamp(fixture: &Fixture) {
+    fixture
+        .client
+        .batch_execute(&format!(
+            "UPDATE {} SET block_timestamp = NULL WHERE network = 'other'",
+            fixture.params.sql_event_table_name
+        ))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn postgres_cross_chain_timestamp_recovery_uses_the_contributors_network() {
+    let fixture = timestamp_fixture(Some(22)).await;
+    fixture.params.tables[0].table.validate_reorg_operations().unwrap();
+    let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+    callback(vec![timestamped_input(&fixture, "other", 99, 22, 10, 2099)]).await.unwrap();
+    let canonical = shared_state(&fixture).await;
+    remove_other_raw_timestamp(&fixture).await;
+    callback(vec![timestamped_input(&fixture, "ethereum", 100, 100, 20, 1100)]).await.unwrap();
+    rollback(&fixture).await.expect(
+        "B's canonical contributor requires B's provider, not A's header at the same height",
+    );
+    assert_eq!(
+        shared_state(&fixture).await,
+        canonical,
+        "value and all source provenance must return to B's canonical row"
+    );
+    assert_eq!(fixture.position().await.0, 1);
+    let receipts: i64 = fixture
+        .client
+        .query_one("SELECT count(*) FROM rindexer_internal.event_applications", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(receipts, 1);
+    drop(callback);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_cross_chain_timestamp_recovery_rejects_missing_or_wrong_source_provider() {
+    for provider in [None, Some(33)] {
+        let fixture = timestamp_fixture(provider).await;
+        let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+        callback(vec![timestamped_input(&fixture, "other", 99, 22, 10, 2099)]).await.unwrap();
+        remove_other_raw_timestamp(&fixture).await;
+        callback(vec![timestamped_input(&fixture, "ethereum", 100, 100, 20, 1100)]).await.unwrap();
+        let before = shared_state(&fixture).await;
+        let error = rollback(&fixture)
+            .await
+            .expect_err("missing or inconsistent source identity cannot certify rollback");
+        let detail = format!("{error:#}");
+        assert!(detail.contains("other") && detail.contains("timestamp"), "{detail}");
+        if provider.is_none() {
+            assert!(detail.contains("provider"), "{detail}");
+        }
+        assert_eq!(
+            shared_state(&fixture).await,
+            before,
+            "failed recovery must leave effects and provenance uncommitted"
+        );
+        assert_eq!(fixture.position().await.0, 2);
+        let receipts: i64 = fixture
+            .client
+            .query_one("SELECT count(*) FROM rindexer_internal.event_applications", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(receipts, 2);
+        drop(callback);
+        fixture.finish().await;
+    }
 }
