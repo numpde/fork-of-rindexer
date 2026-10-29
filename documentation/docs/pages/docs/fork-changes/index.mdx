@@ -103,3 +103,18 @@ Changing YAML does not repair old journal history or earlier incorrect rollbacks
 Rebuild affected derived state and recovery journals from verified canonical
 history, coordinating application receipts and cursors as described in the
 [sequence-ordering migration](/docs/migrations/sequence-ordering).
+
+## Deletes require row reconstruction
+
+`delete` now fails startup on reorg-enabled derived tables, including native-transfer
+tables. An orphan delete can remove a row created by a canonical upsert. Recovery
+has no complete deletion before-image and cannot recreate that row.
+
+Retain the row and update a journaled status field, filtering it in downstream
+queries, or move deletion outside the recovered table. A status update changes the
+storage model: review consumers that previously expected the row to disappear.
+Deletes on networks without reorg handling retain their existing behavior.
+
+This restriction prevents new accepted delete histories; it does not restore rows
+lost during an earlier rollback. Verify affected canonical ranges and coordinate
+any repair with derived state, journals, application receipts and cursors.

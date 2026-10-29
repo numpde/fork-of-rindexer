@@ -362,6 +362,13 @@ impl Table {
                 self.name
             ));
         }
+        if self.all_operations().any(|operation| operation.operation_type == OperationType::Delete)
+        {
+            return Err(format!(
+                "Table '{}' uses delete on a reorg-enabled network. Recovery cannot recreate deleted canonical rows; retain rows and update a journaled status column instead, or move deletion outside this recovered table.",
+                self.name
+            ));
+        }
         if self.is_insert_only() {
             return Ok(());
         }
