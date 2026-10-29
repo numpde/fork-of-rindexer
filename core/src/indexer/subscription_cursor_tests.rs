@@ -343,3 +343,211 @@ async fn postgres_non_reorg_literal_arithmetic_survives_startup_and_restart() {
     );
     fixture.finish().await;
 }
+
+fn handoff_detail(provider: Arc<dyn crate::provider::ChainProvider>) -> NetworkContract {
+    NetworkContract {
+        id: "handoff-subscription".into(),
+        network: "ethereum".into(),
+        indexing_contract_setup: IndexingContractSetup::Address(AddressDetails {
+            address: ValueOrArray::Value(Address::ZERO),
+            indexed_filters: None,
+        }),
+        cached_provider: provider.clone(),
+        block_clock: BlockClock::new(None, None, provider),
+        decoder: noop_decoder(),
+        start_block: Some(U64::from(98)),
+        end_block: None,
+        disable_logs_bloom_checks: true,
+    }
+}
+
+#[tokio::test]
+async fn postgres_historical_handoff_updates_the_configured_cursor_after_reorg() {
+    let fixture = Fixture::new().await;
+    let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+    let mut registry = super::super::permanent_failure_tests::registry(&fixture.params, callback);
+    let detail = handoff_detail(Arc::new(MockChainProvider::new(1)));
+    let key = detail.cursor_key();
+    let detail_id = detail.id.clone();
+    let event_id = registry.events[0].id.clone();
+    registry.events[0].contract.details.push(detail);
+    let schema = generate_indexer_contract_schema_name(
+        &fixture.params.indexer_name,
+        &fixture.params.contract_name,
+    );
+    let table = generate_internal_event_table_name(&schema, &fixture.params.event_info.name);
+    fixture.client.execute(&format!("INSERT INTO rindexer_internal.{table} (network,cursor_key,last_synced_block) VALUES ('ethereum',$1,0) ON CONFLICT DO NOTHING"),&[&key]).await.unwrap();
+    for (block, value) in [(99, 10), (100, 20)] {
+        let mut event = super::journal_recovery_tests::at(
+            &fixture,
+            "ethereum",
+            block,
+            B256::repeat_byte(block as u8),
+            value,
+        );
+        event.found_in_request.cursor_key = key.clone();
+        registry.trigger_event(&event_id, vec![event]).await.unwrap();
+    }
+    let live =
+        registry.reapply_after_historic(vec![crate::indexer::start::ProcessedNetworkContract {
+            id: detail_id,
+            processed_up_to: U64::from(100),
+        }]);
+    let live_detail = Arc::new(live.events[0].contract.details[0].clone());
+    let live_key = live_detail.cursor_key();
+    fixture.client.execute(&format!("INSERT INTO rindexer_internal.{table} (network,cursor_key,last_synced_block) VALUES ('ethereum',$1,0) ON CONFLICT DO NOTHING"),&[&live_key]).await.unwrap();
+    let replay =
+        super::journal_recovery_tests::at(&fixture, "ethereum", 100, B256::repeat_byte(100), 20);
+    live.trigger_event(
+        &event_id,
+        vec![EventResult::try_new(live_detail.clone(), replay.log, U64::from(100), U64::from(100))
+            .unwrap()],
+    )
+    .await
+    .unwrap();
+    super::arithmetic_recovery_tests::rollback(&fixture).await;
+    let replacement =
+        super::journal_recovery_tests::at(&fixture, "ethereum", 100, B256::repeat_byte(101), 30);
+    live.trigger_event(
+        &event_id,
+        vec![EventResult::try_new(
+            live_detail.clone(),
+            replacement.log,
+            U64::from(100),
+            U64::from(100),
+        )
+        .unwrap()],
+    )
+    .await
+    .unwrap();
+    let state = fixture.position().await;
+    assert_eq!((state.0, state.1), (2, "40".into()), "canonical effects remain exactly once");
+    let receipts: i64 = fixture
+        .client
+        .query_one("SELECT count(*) FROM rindexer_internal.event_applications", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(receipts, 2);
+    let cursor: String = fixture.client.query_one(&format!("SELECT last_synced_block::text FROM rindexer_internal.{table} WHERE network='ethereum' AND cursor_key=$1"),&[&key]).await.unwrap().get(0);
+    assert_eq!(
+        cursor, "100",
+        "live replacement work must advance the original configured subscription after rollback"
+    );
+    let keys = fixture
+        .client
+        .query(
+            &format!(
+                "SELECT cursor_key FROM rindexer_internal.{table} WHERE cursor_key <> '__event__'"
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(keys.len(), 1, "handoff cannot create a second durable query identity");
+    assert_eq!(live_detail.start_block, Some(U64::from(98)));
+    assert_eq!(live_key, key);
+    drop(live);
+    drop(registry);
+    fixture.finish().await;
+}
+
+async fn handoff_startup_scope(with_postgres: bool) {
+    let fixture = Fixture::new().await;
+    let received = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let observed = received.clone();
+    let callback: EventCallbackType = Arc::new(move |events| {
+        let observed = observed.clone();
+        Box::pin(async move {
+            for event in events {
+                observed.lock().await.push(event.found_in_request);
+            }
+            Ok(())
+        })
+    });
+    let logs = [99, 101]
+        .into_iter()
+        .map(|number| {
+            super::journal_recovery_tests::at(
+                &fixture,
+                "ethereum",
+                number,
+                B256::repeat_byte(number as u8),
+                1,
+            )
+            .log
+        })
+        .collect();
+    let blocks = (99..=101)
+        .map(|number| {
+            let mut block = header(B256::repeat_byte(number as u8), number);
+            block.header.inner.number = number;
+            block.header.inner.parent_hash = B256::repeat_byte((number - 1) as u8);
+            block
+        })
+        .collect();
+    let provider = Arc::new(
+        MockChainProvider::new(1).with_block_number(101).with_blocks(blocks).with_logs(logs),
+    );
+    let mut detail = handoff_detail(provider);
+    detail.start_block = Some(U64::ZERO);
+    let key = detail.cursor_key();
+    let mut registry = super::super::permanent_failure_tests::registry(&fixture.params, callback);
+    registry.events[0].contract.details.push(detail);
+    let registry =
+        registry.reapply_after_historic(vec![crate::indexer::start::ProcessedNetworkContract {
+            id: "handoff-subscription".into(),
+            processed_up_to: U64::from(100),
+        }]);
+    let progress = IndexingEventsProgressState::monitor(&registry.events, &[], None).await;
+    let manifest = serde_json::from_value(json!({"name":"Replay","project_type":"no-code","contracts":[],"networks":[{"name":"ethereum","chain_id":1,"rpc":"http://unused.invalid"}]})).unwrap();
+    let (handles, _, _, _, _) = crate::indexer::start::start_indexing_contract_events(
+        &manifest,
+        fixture._directory.path(),
+        with_postgres.then(|| fixture.client.clone()),
+        None,
+        &fixture.indexer,
+        registry,
+        Arc::new(TraceCallbackRegistry::new()),
+        &[],
+        true,
+        Default::default(),
+        progress,
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for handle in handles {
+            handle.await.unwrap().unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    let observed = received.lock().await;
+    assert_eq!(
+        observed.len(),
+        if with_postgres { 2 } else { 1 },
+        "a zero durable cursor cannot be replaced by a later in-process hint"
+    );
+    for event in observed.iter() {
+        assert_eq!((event.from_block,event.to_block),
+            (U64::from(if with_postgres {0} else {100}),U64::from(101)),
+            "durable coverage owns stored subscriptions; an untracked handler uses the historical handoff");
+        assert_eq!(
+            event.cursor_key, key,
+            "runtime resume bounds cannot redefine the configured query"
+        );
+    }
+    drop(observed);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn historical_handoff_without_storage_resumes_without_changing_query_identity() {
+    handoff_startup_scope(false).await;
+}
+
+#[tokio::test]
+async fn postgres_historical_handoff_respects_zero_durable_coverage() {
+    handoff_startup_scope(true).await;
+}
