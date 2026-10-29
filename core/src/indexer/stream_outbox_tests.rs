@@ -823,3 +823,123 @@ async fn postgres_required_stream_finalized_uses_current_distance_for_pending_re
     );
     assert!(released, "relaxing the current distance must make the same pending record eligible");
 }
+
+#[tokio::test]
+async fn postgres_required_stream_hanging_destination_does_not_starve_healthy_destination() {
+    use crate::event::callback_registry::FailedStream;
+    let fixture = Fixture::new().await;
+    let failing = Endpoint::start().await;
+    failing.state.hanging.store(true, Ordering::SeqCst);
+    let healthy = Endpoint::start().await;
+    healthy.state.failing.store(false, Ordering::SeqCst);
+    let streams=serde_json::from_value(json!({"delivery_guarantee":"at_least_once","webhooks":[
+        {"endpoint":failing.url,"shared_secret":"test","networks":["ethereum"],"events":[{"event_name":"Value"}]},
+        {"endpoint":healthy.url,"shared_secret":"test","networks":["ethereum"],"events":[{"event_name":"Value"}]}
+    ]})).unwrap();
+    let clients = Arc::new(Some(crate::streams::StreamsClients::new(streams).await));
+    let weak = Arc::downgrade(&clients);
+    let mut params = fixture.params.clone();
+    params.streams_clients = clients.clone();
+    let callback = no_code_callback(Arc::new(params)).event_callback;
+    callback(fixture.events(&[10])).await.unwrap();
+    let registry = crate::event::callback_registry::EventCallbackRegistry::new();
+    let cancel = CancellationToken::new();
+    crate::streams::StreamsClients::start_delivery_worker(
+        &clients,
+        fixture.client.clone(),
+        "ethereum".into(),
+        cancel.clone(),
+        registry.failure_state(),
+        FailedStream {
+            id: "delivery-timeout-fairness".into(),
+            indexer: "Replay".into(),
+            contract: "Contract".into(),
+            event: "Value".into(),
+            network: "ethereum".into(),
+            from_block: 2,
+            to_block: 2,
+        },
+    );
+    let delivered = tokio::time::timeout(Duration::from_secs(40), async {
+        loop {
+            let pending: i64 = fixture.client.query_one(
+                "SELECT COUNT(*) FROM rindexer_internal.stream_outbox WHERE acknowledged_at IS NULL",
+                &[],
+            ).await.unwrap().get(0);
+            if !healthy.state.attempts.lock().unwrap().is_empty() && pending == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .is_ok();
+    cancel.cancel();
+    drop(callback);
+    drop(clients);
+    drop(registry);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while weak.upgrade().is_some() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        delivered,
+        "a publisher that never responds must be deferred so a healthy destination progresses"
+    );
+    let deferred: bool = fixture.client.query_one(
+        "SELECT retry_after > created_at AND acknowledged_at IS NULL FROM rindexer_internal.stream_outbox WHERE (destination->>'config_index')::integer=0",
+        &[],
+    ).await.unwrap().get(0);
+    assert!(deferred, "timeout deferral must be committed, preserving the hanging route for retry");
+    assert_eq!(fixture.position().await.0, 1);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_required_stream_expired_retry_yields_to_an_older_unattempted_route() {
+    use crate::database::postgres::stream_outbox;
+    let fixture = Fixture::new().await;
+    let streams = serde_json::from_value(json!({"delivery_guarantee":"at_least_once", "webhooks":[
+        {"endpoint":"http://first.invalid", "shared_secret":"test", "networks":["ethereum"], "events":[{"event_name":"Value"}]},
+        {"endpoint":"http://second.invalid", "shared_secret":"test", "networks":["ethereum"], "events":[{"event_name":"Value"}]}
+    ]})).unwrap();
+    let clients = Arc::new(Some(crate::streams::StreamsClients::new(streams).await));
+    let mut params = fixture.params.clone();
+    params.streams_clients = clients.clone();
+    let callback = no_code_callback(Arc::new(params)).event_callback;
+    callback(fixture.events(&[10])).await.unwrap();
+    let source = clients.as_ref().as_ref().unwrap().delivery_source().unwrap();
+    let mut connection = fixture.client.raw_connection().await.unwrap();
+    let tx = connection.transaction().await.unwrap();
+    let first = stream_outbox::next(&tx, source, "ethereum", None).await.unwrap().unwrap();
+    let first_id: String = first.get(0);
+    stream_outbox::defer(&tx, &first_id).await.unwrap();
+    tx.commit().await.unwrap();
+    // Another hanging route can consume the retry interval. Expiry must not
+    // restore the failed route's precedence over an untouched obligation.
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    let tx = connection.transaction().await.unwrap();
+    let retry_due: bool = tx
+        .query_one(
+            "SELECT retry_after <= now() FROM rindexer_internal.stream_outbox WHERE id=$1",
+            &[&first_id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(retry_due, "the fairness check must include an eligible expired retry");
+    let next = stream_outbox::next(&tx, source, "ethereum", None).await.unwrap().unwrap();
+    let destination: serde_json::Value = next.get(1);
+    tx.rollback().await.unwrap();
+    drop(connection);
+    drop(callback);
+    drop(clients);
+    fixture.finish().await;
+    assert_eq!(
+        destination["config_index"], 1,
+        "an expired retry must not monopolize the oldest queue position"
+    );
+}
