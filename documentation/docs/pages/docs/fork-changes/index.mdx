@@ -162,12 +162,17 @@ An event whose second effect was previously skipped may already have a receipt.
 Upgrading does not replay it automatically. Verify affected ranges and coordinate
 canonical derived-state repair with journals, application receipts and cursors.
 
-## Journals record applied inputs
+## Recovery candidates and actual writes
 
-PostgreSQL journals now follow each journaled input's affected-row result. An
-`update` against a missing row, or an input rejected by sequence or table-state
-conditions, contributes no recovery entry. Its valid raw event and application
-receipt can still commit: an UPDATE that matches no row is a configured no-op.
+PostgreSQL distinguishes applied inputs, sequence-superseded upserts and rejected
+inputs. An unguarded `upsert` defines a canonical state version even when a newer
+live row wins the sequence comparison. That version remains in the journal so
+rollback can recover it; recording the candidate does not replace newer live state.
+
+An `update` against a missing target and an input rejected by a SQL table-state
+guard contribute no recovery entry. Their valid raw events and receipts can still
+commit: an UPDATE that matches no row is a configured no-op. Reorg-enabled tables
+already reject SQL table-state guards at startup.
 
 Journaled inputs execute individually in event order. This also prevents a
 rejected older operand from being aggregated into an admitted newer UPDATE.
@@ -206,3 +211,14 @@ reduces the epoch-extended ID to the 32-bit transaction ID stored in tuple `xmin
 The ownership regression checks both the active transaction and a later
 transaction observing the committed row. Existing configurations need no
 PostgreSQL version upgrade for this fix.
+
+## Out-of-order upsert versions
+
+Independent streams can deliver block 100 before canonical block 99. A later
+`upsert set(20)` from block 99 must leave block 100's live value 30 intact while
+retaining its canonical version. If block 100 is then orphaned, recovery restores
+20 with block 99's provenance, and its application receipt remains committed.
+
+This differs from a missing-row UPDATE, which neither creates a row nor defines
+an unconditional replacement version. Recovery candidate selection follows that
+operation distinction rather than treating every zero-row SQL result alike.

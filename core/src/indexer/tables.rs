@@ -4008,6 +4008,12 @@ fn postgres_event_order(row: &TableRowData) -> Result<(&str, u128), String> {
     }
 }
 
+enum PostgresInputOutcome {
+    Applied,
+    SupersededUpsert,
+    Ignored,
+}
+
 // Journaled writes arrive one input at a time so PostgreSQL's command result
 // identifies that input's outcome. Non-journaled operations can retain batching.
 async fn apply_postgres_rows(
@@ -4024,8 +4030,21 @@ async fn apply_postgres_rows(
         op.sql_condition.as_deref(),
     )
     .await?;
-    if affected > 0 {
-        journal_non_reversible_ops(tx, &op.table.full_table_name, op.operation, rows).await?;
+    let outcome = match affected {
+        // An unguarded UPSERT still defines a canonical state version when a
+        // newer live row wins. SQL table-state guards are rejected for reorg
+        // tables; a rejected business guard must not create a candidate.
+        0 if op.operation.operation_type == OperationType::Upsert && op.sql_condition.is_none() => {
+            PostgresInputOutcome::SupersededUpsert
+        }
+        0 => PostgresInputOutcome::Ignored,
+        _ => PostgresInputOutcome::Applied,
+    };
+    match outcome {
+        PostgresInputOutcome::Applied | PostgresInputOutcome::SupersededUpsert => {
+            journal_non_reversible_ops(tx, &op.table.full_table_name, op.operation, rows).await?;
+        }
+        PostgresInputOutcome::Ignored => {}
     }
     Ok(())
 }
