@@ -1233,21 +1233,23 @@ async fn test_reorg_derived_table_cross_chain() {
         .await
         .expect("cross-chain derived table reorg failed");
 
-    // cross_chain=true deletes ALL networks at block >= fork_point
-    let cross_count: i64 =
-        pg.query_one("SELECT count(*) FROM test_schema.cross_stats", &[]).await.unwrap().get(0);
-    assert_eq!(
-        cross_count, 1,
-        "cross_chain=true should delete rows for ALL networks at reorged blocks"
-    );
-
-    // The surviving row should be at block1
-    let surviving_block: i64 = pg
-        .query_one("SELECT rindexer_block_number FROM test_schema.cross_stats", &[])
+    // Shared tables retain independent source-network rollback boundaries.
+    let survivors = pg
+        .query(
+            "SELECT network, rindexer_block_number FROM test_schema.cross_stats \
+             ORDER BY network, rindexer_block_number",
+            &[],
+        )
         .await
         .unwrap()
-        .get(0);
-    assert_eq!(surviving_block, block1 as i64, "surviving row should be at block1");
+        .into_iter()
+        .map(|row| (row.get::<_, String>(0), row.get::<_, i64>(1)))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        survivors,
+        [("dev".to_string(), block1 as i64), ("other_network".to_string(), block2 as i64)],
+        "rollback must remove dev's orphaned row while preserving the other network at the same height"
+    );
 }
 
 // ---------------------------------------------------------------------------
