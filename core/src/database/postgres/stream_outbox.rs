@@ -91,6 +91,9 @@ pub(crate) async fn next(
     network: &str,
     distance: Option<u64>,
 ) -> anyhow::Result<Option<Row>> {
+    // A slow publish elsewhere can outlast the retry delay. Requeue deferred
+    // records at their retry time so creation order cannot monopolize other
+    // routes; the predecessor check still preserves order within each route.
     Ok(tx.query_opt(
         "SELECT id, destination, message FROM rindexer_internal.stream_outbox job
         WHERE owner_key=$1 AND network=$2 AND acknowledged_at IS NULL AND NOT invalidated
@@ -102,7 +105,7 @@ pub(crate) async fn next(
             WHERE earlier.owner_key=job.owner_key AND earlier.network=job.network
             AND earlier.destination=job.destination AND earlier.created_sequence<job.created_sequence
             AND earlier.acknowledged_at IS NULL AND NOT earlier.invalidated))
-        ORDER BY (source_table IS NULL) DESC, created_sequence LIMIT 1 FOR UPDATE",
+        ORDER BY (source_table IS NULL) DESC, GREATEST(created_at, retry_after), created_sequence LIMIT 1 FOR UPDATE",
         &[&source.key(),&network,&distance.map(|value|value.to_string())],
     ).await?)
 }

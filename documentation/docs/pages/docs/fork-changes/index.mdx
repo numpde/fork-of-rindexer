@@ -64,3 +64,20 @@ For an existing deployment, stop the writer and verify affected canonical ranges
 before resuming. Changing the manifest does not repair a row lost in an earlier
 rollback. Coordinate any required rebuild with derived state, recovery journals,
 application receipts and cursors; see the [sequence-ordering migration](/docs/migrations/sequence-ordering).
+
+## Hanging destinations with durable delivery
+
+With `delivery_guarantee: at_least_once`, a hanging publisher now receives a
+persisted retry delay instead of immediately blocking the next eligible route.
+The admitted delivery attempt remains bounded to 30 seconds. The worker stops
+waiting for publishers five seconds before that deadline to leave time for
+PostgreSQL deferral or acknowledgement. Time waiting for the delivery lease or recovery barrier is
+outside this budget and remains cancellable during shutdown or recovery.
+
+Healthy destinations can then progress while the hanging destination remains
+pending. Expired retries rejoin the queue at their retry time, behind older
+untouched obligations of the same recovery priority. Later records for that same destination still wait for its earlier
+record. A timeout cannot establish whether the destination accepted a message;
+retries retain the same message ID, so consumers should deduplicate it. If the
+database cannot commit the retry delay, durable database state determines the
+next attempt. This changes no best-effort delivery configuration.

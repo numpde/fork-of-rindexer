@@ -250,13 +250,24 @@ impl StreamsClients {
                         let _lease =
                             DELIVERY_LEASE.acquire().await.expect("delivery lease stays open");
                         let _guard = barrier.read().await;
-                        client.deliver_one(&postgres, &network).await
+                        // Admission may wait behind another worker or recovery. Once
+                        // admitted, reserve the last five seconds for durable deferral
+                        // or acknowledgement after the publisher wait ends.
+                        let deadline =
+                            tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+                        let publish_deadline = deadline - std::time::Duration::from_secs(5);
+                        tokio::time::timeout_at(deadline, client.deliver_one(&postgres, &network, publish_deadline))
+                            .await
+                            .unwrap_or_else(|_| {
+                                Err(anyhow::anyhow!(
+                                    "Required delivery attempt timed out before confirmation; durable PostgreSQL state will determine retry"
+                                ))
+                            })
                     };
                     let result = tokio::select! {
                         _=worker_cancel.cancelled()=>break,
                         _=epoch.cancelled()=>Ok(false),
-                        result=tokio::time::timeout(std::time::Duration::from_secs(30),attempt)=>
-                            result.unwrap_or_else(|_|Err(anyhow::anyhow!("Required delivery attempt timed out before confirmation; durable PostgreSQL state will determine retry"))),
+                        result=attempt=>result,
                     };
                     drop(owner);
                     let delay = match result {
@@ -287,7 +298,12 @@ impl StreamsClients {
         workers.insert(network, (cancel, handle.abort_handle()));
     }
 
-    async fn deliver_one(&self, postgres: &PostgresClient, network: &str) -> anyhow::Result<bool> {
+    async fn deliver_one(
+        &self,
+        postgres: &PostgresClient,
+        network: &str,
+        publish_deadline: tokio::time::Instant,
+    ) -> anyhow::Result<bool> {
         let source = self.delivery_source()?;
         let mut connection = postgres.raw_connection().await?;
         let tx = connection.transaction().await?;
@@ -325,13 +341,16 @@ impl StreamsClients {
         );
         let tasks =
             tasks.into_iter().map(tokio_util::task::AbortOnDropHandle::new).collect::<Vec<_>>();
-        let published = async {
+        let published = tokio::time::timeout_at(publish_deadline, async {
             for result in futures::future::join_all(tasks).await {
                 result??;
             }
             Ok::<(), anyhow::Error>(())
-        }
-        .await;
+        })
+        .await
+        .unwrap_or_else(|_| Err(anyhow::anyhow!(
+            "Required stream publisher for record {id} exceeded its deadline; destination confirmation is unknown"
+        )));
         if let Err(error) = published {
             stream_outbox::defer(&tx, &id).await?;
             tx.commit().await?;
