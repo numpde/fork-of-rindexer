@@ -271,3 +271,101 @@ async fn postgres_applied_same_event_set_order_survives_recovery() {
     drop(callback);
     fixture.finish().await;
 }
+
+async fn assignment_fixture(condition: Option<&str>) -> Fixture {
+    let mut operation =
+        json!({"type":"upsert", "set":[{"column":"amount", "action":"set", "value":"$value"}]});
+    if let Some(condition) = condition {
+        operation["if"] = condition.into();
+    }
+    Fixture::with_table(
+        serde_json::to_value(params().event).unwrap(),
+        "Contract",
+        json!({
+            "name":"totals", "global":true,
+            "columns":[{"name":"amount", "type":"uint256", "default":"0"}],
+            "events":[{"event":"Value", "operations":[operation]}]
+        }),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn postgres_superseded_upsert_retains_canonical_value_provenance_and_receipt() {
+    let fixture = assignment_fixture(None).await;
+    fixture.params.tables[0].table.validate_reorg_operations().unwrap();
+    let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+    callback(vec![event(&fixture, 100, 100, 30)]).await.unwrap();
+    let canonical = event(&fixture, 99, 99, 20);
+    let transaction = format!("{:#x}", canonical.tx_information.transaction_hash);
+    let address = format!("{:#x}", canonical.tx_information.address);
+    callback(vec![canonical]).await.unwrap();
+    let value: String = fixture
+        .client
+        .query_one(
+            &format!("SELECT amount::text FROM {}", fixture.params.tables[0].full_table_name),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(value, "30", "the superseded upsert must not replace live newer state");
+    callback(vec![event(&fixture, 99, 99, 20), event(&fixture, 100, 100, 30)]).await.unwrap();
+    super::arithmetic_recovery_tests::rollback(&fixture).await;
+    let table = &fixture.params.tables[0].full_table_name;
+    let rows = fixture.client.query(&format!("SELECT amount::text, rindexer_sequence_id::text, rindexer_block_number, rindexer_block_hash, rindexer_tx_hash, rindexer_contract_address FROM {table}"), &[]).await.unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "a superseded canonical upsert must keep the row alive after its replacement is orphaned"
+    );
+    let row = &rows[0];
+    assert_eq!(row.get::<_, String>(0), "20");
+    assert_eq!(
+        row.get::<_, String>(1),
+        crate::manifest::contract::compute_sequence_id(99, 3, 4).to_string()
+    );
+    assert_eq!(row.get::<_, i64>(2), 99);
+    assert_eq!(row.get::<_, String>(3), format!("{:#x}", B256::repeat_byte(99)));
+    assert_eq!(row.get::<_, String>(4), transaction);
+    assert_eq!(row.get::<_, String>(5), address);
+    assert_eq!(fixture.position().await.0, 1);
+    let receipts: i64 = fixture
+        .client
+        .query_one("SELECT count(*) FROM rindexer_internal.event_applications", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(receipts, 1, "the canonical receipt survives rollback");
+    callback(vec![event(&fixture, 99, 99, 20)]).await.unwrap();
+    assert_eq!(fixture.position().await.0, 1);
+    drop(callback);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_superseded_upsert_policy_does_not_journal_a_false_table_guard() {
+    let fixture = assignment_fixture(Some("@amount == 0")).await;
+    let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+    callback(vec![event(&fixture, 99, 99, 30)]).await.unwrap();
+    callback(vec![event(&fixture, 100, 100, 20)]).await.unwrap();
+    let value: String = fixture
+        .client
+        .query_one(
+            &format!("SELECT amount::text FROM {}", fixture.params.tables[0].full_table_name),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(value, "30");
+    let journal: i64 = fixture
+        .client
+        .query_one("SELECT count(*) FROM rindexer_internal.derived_op_log", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(journal, 1, "a failed table-state guard is not a superseded canonical assignment");
+    drop(callback);
+    fixture.finish().await;
+}
