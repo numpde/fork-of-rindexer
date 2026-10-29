@@ -685,3 +685,64 @@ fn read_manifest_rejects_arithmetic_updates_without_applied_effect_tracking() {
         }
     }
 }
+
+fn partial_assignment_table(shape: &str) -> serde_json::Value {
+    let mut table = serde_json::json!({"name":"totals","global":true,
+    "columns":[{"name":"amount","type":"uint256","default":"0"},{"name":"b","type":"uint256","default":"0"}],
+    "events":[{"event":"Transfer","operations":[
+        {"type":"upsert","set":[{"column":"amount","action":"set","value":"$value"}]},
+        {"type":"upsert","set":[{"column":"b","action":"set","value":"$value"}]}
+    ]}]});
+    if shape != "creators" {
+        table["events"][0]["operations"][0]["set"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"column":"b","action":"set","value":"$value"}));
+        if shape == "update" {
+            table["events"][0]["operations"][1]["type"] = "update".into();
+        } else {
+            table["columns"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({"name":"total","type":"uint256","default":"0"}));
+            table["events"][0]["operations"][1]["set"] = serde_json::json!([
+                {"column":"total","action":"add","value":"$value"}]);
+        }
+    }
+    table
+}
+
+#[test]
+fn read_manifest_rejects_partial_set_recovery_without_row_versions() {
+    for shape in ["creators", "update", "arithmetic"] {
+        for native in [false, true] {
+            let (_directory, path) =
+                recovery_table_manifest(partial_assignment_table(shape), true, native);
+            let error = read_manifest(&path).expect_err("partial assignment history cannot satisfy whole-row admission during reconstruction").to_string();
+            assert!(
+                error.contains("partial") && error.contains("set") && error.contains("totals"),
+                "{shape}: {error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn read_manifest_keeps_complete_assignment_versions_and_non_reorg_partials() {
+    for native in [false, true] {
+        for complete in [false, true] {
+            let mut table = partial_assignment_table("creators");
+            if complete {
+                for operation in table["events"][0]["operations"].as_array_mut().unwrap() {
+                    operation["set"] = serde_json::json!([
+                        {"column":"amount","action":"set","value":"$value"},
+                        {"column":"b","action":"set","value":"$value"}]);
+                }
+            }
+            let (_directory, path) = recovery_table_manifest(table, complete, native);
+            read_manifest(&path).expect(
+                "complete recovered versions and non-reorg partial assignments remain supported",
+            );
+        }
+    }
+}

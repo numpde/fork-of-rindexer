@@ -159,3 +159,64 @@ async fn postgres_recovery_interval_includes_faster_journal_subscription() {
 async fn postgres_recovery_interval_includes_faster_insert_subscription() {
     uneven_subscription_rollback("insert", "set").await;
 }
+
+#[tokio::test]
+async fn postgres_partial_assignment_recovery_requires_complete_versions() {
+    let fixture = Fixture::with_table(
+        serde_json::to_value(params().event).unwrap(),"Contract",
+        json!({"name":"totals","global":true,
+            "columns":[{"name":"amount","type":"uint256","default":"0"},{"name":"b","type":"uint256","default":"0"}],
+            "events":[{"event":"Value","operations":[
+                {"type":"upsert","if":"value == 1","set":[{"column":"amount","action":"set","value":"$value"}]},
+                {"type":"upsert","if":"value == 2","set":[{"column":"b","action":"set","value":"$value"}]}
+            ]}]}),
+    ).await;
+    // A clear admission error is safe until the journal has whole-row versions.
+    // If this shape is ever admitted again, it must satisfy the recovery law below.
+    if let Err(error) = fixture.params.tables[0].table.validate_reorg_operations() {
+        assert!(
+            error.contains("partial") && error.contains("set") && error.contains("totals"),
+            "{error}"
+        );
+        assert_eq!(fixture.position().await, (0, "0".into(), "0".into()));
+        fixture.finish().await;
+        return;
+    }
+    let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+    callback(vec![at(&fixture, "ethereum", 100, B256::repeat_byte(100), 2)]).await.unwrap();
+    callback(vec![at(&fixture, "ethereum", 99, B256::repeat_byte(99), 1)]).await.unwrap();
+    let table = &fixture.params.tables[0].full_table_name;
+    let before: serde_json::Value = fixture
+        .client
+        .query_one(&format!("SELECT (to_jsonb(t) - 'rindexer_sequence_id') || jsonb_build_object('rindexer_sequence_id', rindexer_sequence_id::text) FROM {table} t"), &[])
+        .await
+        .unwrap()
+        .get(0);
+    let amount: String = fixture
+        .client
+        .query_one(&format!("SELECT amount::text FROM {table}"), &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(amount, "0", "the late partial upsert loses whole-row admission");
+    // This fork removes neither contributing event. Recovery cannot materialize
+    // an assignment that was suppressed by the still-canonical newer row.
+    rollback(&fixture, 103, 103).await.unwrap();
+    let after: serde_json::Value = fixture
+        .client
+        .query_one(&format!("SELECT (to_jsonb(t) - 'rindexer_sequence_id') || jsonb_build_object('rindexer_sequence_id', rindexer_sequence_id::text) FROM {table} t"), &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(after, before, "an unrelated rollback must preserve the complete surviving row");
+    assert_eq!(fixture.position().await.0, 2);
+    let receipts: i64 = fixture
+        .client
+        .query_one("SELECT count(*) FROM rindexer_internal.event_applications", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(receipts, 2);
+    drop(callback);
+    fixture.finish().await;
+}
