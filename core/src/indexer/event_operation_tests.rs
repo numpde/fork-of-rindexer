@@ -95,3 +95,47 @@ async fn postgres_same_event_operations_follow_event_order_across_a_batch() {
     drop(callback);
     fixture.finish().await;
 }
+
+#[tokio::test]
+async fn postgres_same_event_upserts_apply_both_columns_and_replay_once() {
+    let mut fixture = fixture().await;
+    for operation in
+        Arc::make_mut(&mut fixture.params.tables)[0].table.events[0].operations.iter_mut().skip(1)
+    {
+        operation.operation_type = crate::manifest::contract::OperationType::Upsert;
+    }
+    let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+    callback(vec![event(&fixture, 98, 98, 0)]).await.unwrap();
+    callback(vec![event(&fixture, 100, 100, 1)]).await.unwrap();
+    assert_eq!(values(&fixture).await, ("1".into(), "2".into()));
+    callback(vec![event(&fixture, 100, 100, 1)]).await.unwrap();
+    assert_eq!(values(&fixture).await, ("1".into(), "2".into()));
+    drop(callback);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_same_event_arithmetic_upsert_keeps_its_state_setting_fields() {
+    let mut fixture = fixture().await;
+    let table = &mut Arc::make_mut(&mut fixture.params.tables)[0].table;
+    table.events[0].operations[0].set.retain(|column| column.column == "amount");
+    table.events[0].operations[2] =
+        serde_json::from_value(json!({"type":"upsert", "if":"value > 0", "set":[
+            {"column":"amount", "action":"set", "value":"$value * 2"},
+            {"column":"b", "action":"add", "value":"$value"}
+        ]}))
+        .unwrap();
+    table.validate_reorg_operations().unwrap();
+    let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+    callback(vec![event(&fixture, 98, 98, 0)]).await.unwrap();
+    callback(vec![event(&fixture, 100, 100, 1)]).await.unwrap();
+    assert_eq!(
+        values(&fixture).await,
+        ("2".into(), "1".into()),
+        "the arithmetic upsert must apply its same-event state fields too"
+    );
+    callback(vec![event(&fixture, 100, 100, 1)]).await.unwrap();
+    assert_eq!(values(&fixture).await, ("2".into(), "1".into()));
+    drop(callback);
+    fixture.finish().await;
+}

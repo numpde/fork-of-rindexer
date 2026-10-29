@@ -3999,18 +3999,45 @@ async fn apply_table_operations_in_tx(
     prepared: &PreparedTableOps<'_>,
     tx: &PgTransaction<'_>,
 ) -> Result<(), String> {
-    for op in &prepared.ops {
+    let ordered = prepared.ops.len() > 1
+        && prepared.ops.iter().any(|op| op.operation.operation_type != OperationType::Insert);
+    let mut inputs = Vec::new();
+    if ordered {
+        // Event order precedes operation order: a later event must not advance
+        // row metadata before an earlier event has finished all of its writes.
+        for (operation_index, op) in prepared.ops.iter().enumerate() {
+            for (row_index, row) in op.rows.iter().enumerate() {
+                let sequence = match row.columns.get(injected_columns::RINDEXER_SEQUENCE_ID) {
+                    Some(EthereumSqlTypeWrapper::U128(sequence)) => *sequence,
+                    _ => return Err(
+                        "Cannot apply derived event operations: prepared row has no event sequence"
+                            .into(),
+                    ),
+                };
+                inputs.push((
+                    (row.network.as_str(), sequence, operation_index, row_index),
+                    op,
+                    std::slice::from_ref(row),
+                ));
+            }
+        }
+        inputs.sort_by_key(|(order, _, _)| *order);
+    } else {
+        for op in &prepared.ops {
+            inputs.push((("", 0, 0, 0), op, op.rows.as_slice()));
+        }
+    }
+    for (_, op, rows) in inputs {
         execute_postgres_operation(
             PgWriteMode::Tx(tx),
             &op.table.full_table_name,
             &op.table.table,
             op.operation,
-            &op.rows,
+            rows,
             op.sql_condition.as_deref(),
         )
         .await?;
-
-        journal_non_reversible_ops(tx, &op.table.full_table_name, op.operation, &op.rows).await?;
+        journal_non_reversible_ops(tx, &op.table.full_table_name, op.operation, rows).await?;
     }
 
     Ok(())

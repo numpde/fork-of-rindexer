@@ -6,9 +6,9 @@ use super::query_builder::{
     build_arithmetic_insert_expr, build_cte_header, build_delete_body, build_sequence_condition,
     build_set_clause, build_to_process_cte, build_to_process_cte_aggregated, build_update_body,
     build_upsert_body, build_upsert_set_clause, build_upsert_set_clause_arithmetic,
-    build_upsert_set_clause_latest_by_sequence, build_where_clause, build_where_condition,
-    format_table_name, rewrite_custom_where_for_arithmetic, ColumnAggregate, ColumnInfo,
-    SetClauseType, UpsertClauseType,
+    build_upsert_set_clause_if, build_upsert_set_clause_latest_by_sequence, build_where_clause,
+    build_where_condition, format_table_name, rewrite_custom_where_for_arithmetic, ColumnAggregate,
+    ColumnInfo, SetClauseType, UpsertClauseType,
 };
 use crate::database::batch_operations::{
     BatchOperationAction, BatchOperationColumnBehavior, BatchOperationType, DynamicColumnDefinition,
@@ -29,6 +29,33 @@ pub enum DynamicBatchStatement {
         column_types: Vec<tokio_postgres::types::Type>,
         rows: Vec<Vec<EthereumSqlTypeWrapper>>,
     },
+}
+
+// Same-event continuation is owned by the active PostgreSQL transaction, not
+// by equality of heights alone. Event callbacks use a top-level transaction;
+// committed rows and rows from another event retain the strict sequence guard.
+fn event_continuation(
+    columns: &[DynamicColumnDefinition],
+    input: &str,
+    target: &str,
+) -> Option<String> {
+    use crate::manifest::contract::injected_columns::*;
+    if !columns.iter().any(|column| {
+        column.name == RINDEXER_SEQUENCE_ID
+            && matches!(column.behavior, BatchOperationColumnBehavior::Sequence)
+    }) {
+        return None;
+    }
+    let identity = [RINDEXER_SEQUENCE_ID, BLOCK_HASH, TX_HASH, CONTRACT_ADDRESS];
+    if !identity.iter().all(|name| columns.iter().any(|column| column.name == *name)) {
+        return None;
+    }
+    let same_event = identity
+        .iter()
+        .map(|name| format!("{input}.{name} = {target}.{name}"))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    Some(format!("({target}.xmin = pg_current_xact_id()::xid AND {same_event})"))
 }
 
 /// Executes a dynamic batch operation with runtime-defined columns.
@@ -379,11 +406,25 @@ pub fn build_batch_statement(
                                 UpsertClauseType::Max,
                             ));
                         } else {
-                            update_clauses.push(build_upsert_set_clause_latest_by_sequence(
-                                col,
-                                &formatted_table_name,
-                                sequence_col.expect("sequence column exists"),
-                            ));
+                            if let Some(continuation) =
+                                event_continuation(columns, "EXCLUDED", &formatted_table_name)
+                            {
+                                let sequence = super::query_builder::quote_identifier(
+                                    sequence_col.expect("sequence column exists"),
+                                );
+                                let condition = format!("(EXCLUDED.{sequence} > COALESCE({formatted_table_name}.{sequence}, 0) OR {continuation})");
+                                update_clauses.push(build_upsert_set_clause_if(
+                                    col,
+                                    &formatted_table_name,
+                                    &condition,
+                                ));
+                            } else {
+                                update_clauses.push(build_upsert_set_clause_latest_by_sequence(
+                                    col,
+                                    &formatted_table_name,
+                                    sequence_col.expect("sequence column exists"),
+                                ));
+                            }
                         }
                     } else {
                         update_clauses.push(build_upsert_set_clause(
@@ -446,12 +487,29 @@ pub fn build_batch_statement(
                 }
             }
 
+            let continuation = (!arithmetic_without_sequence_guard)
+                .then(|| event_continuation(columns, "EXCLUDED", &formatted_table_name))
+                .flatten();
+            if let Some(continuation) = &continuation {
+                let sequence = super::query_builder::quote_identifier(
+                    sequence_col.expect("event sequence exists"),
+                );
+                let admission = format!("(EXCLUDED.{sequence} > COALESCE({formatted_table_name}.{sequence}, 0) OR {continuation})");
+                rewritten_where = Some(match rewritten_where {
+                    Some(condition) => format!("{admission} AND ({condition})"),
+                    None => admission,
+                });
+            }
             query.push_str(&build_upsert_body(
                 &formatted_table_name,
                 &column_names,
                 &conflict_columns,
                 update_clauses,
-                if arithmetic_without_sequence_guard { None } else { sequence_col },
+                if arithmetic_without_sequence_guard || continuation.is_some() {
+                    None
+                } else {
+                    sequence_col
+                },
                 rewritten_where.as_deref(),
                 &insert_exprs,
             ));
@@ -480,6 +538,12 @@ pub fn build_batch_statement(
 
     if let Some(seq_col) = sequence_col {
         if let Some(condition) = build_sequence_condition(seq_col, op_type) {
+            let condition = match op_type {
+                BatchOperationType::Update => event_continuation(columns, "tp", "am")
+                    .map(|continuation| format!("({condition} OR {continuation})"))
+                    .unwrap_or(condition),
+                _ => condition,
+            };
             where_conditions.push(condition);
         }
     }

@@ -143,3 +143,21 @@ only for reorg-enabled networks, preserving literal arithmetic on other networks
 Insert-only tables retain their existing behavior. Editing YAML does not repair
 state previously lost through an incomplete rollback plan: coordinate any verified
 canonical rebuild with derived state, journals, receipts and cursors.
+
+## Multiple derived writes from one event
+
+PostgreSQL event application now orders work by event position before manifest
+operation order. Multiple writes from one event may continue at its sequence only
+when PostgreSQL identifies the existing row version as written by the active
+event transaction and its sequence, block hash, transaction hash and contract
+address match. Committed equal-position rows and different events retain the
+strict ordering protection. Application receipts still suppress event replay.
+
+Multi-operation mutable batches execute per input to preserve this order, which
+can issue more SQL statements than the former operation-first batching. Single
+operations and insert-only batches retain their batching in this repair. The
+sequence encoding and schema do not change.
+
+An event whose second effect was previously skipped may already have a receipt.
+Upgrading does not replay it automatically. Verify affected ranges and coordinate
+canonical derived-state repair with journals, application receipts and cursors.

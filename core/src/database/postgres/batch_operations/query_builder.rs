@@ -448,19 +448,20 @@ pub fn build_upsert_set_clause_latest_by_sequence(
     formatted_table_name: &str,
     sequence_col: &str,
 ) -> String {
-    let column_name = quote_identifier(col);
     let sequence_name = quote_identifier(sequence_col);
-
-    format!(
-        "{} = CASE WHEN EXCLUDED.{} > COALESCE({}.{}, 0) THEN EXCLUDED.{} ELSE {}.{} END",
-        column_name,
-        sequence_name,
+    build_upsert_set_clause_if(
+        col,
         formatted_table_name,
-        sequence_name,
-        column_name,
-        formatted_table_name,
-        column_name
+        &format!(
+            "EXCLUDED.{} > COALESCE({}.{}, 0)",
+            sequence_name, formatted_table_name, sequence_name
+        ),
     )
+}
+
+pub(super) fn build_upsert_set_clause_if(col: &str, table: &str, condition: &str) -> String {
+    let name = quote_identifier(col);
+    format!("{name} = CASE WHEN {condition} THEN EXCLUDED.{name} ELSE {table}.{name} END")
 }
 
 /// Type of upsert SET clause to generate.
