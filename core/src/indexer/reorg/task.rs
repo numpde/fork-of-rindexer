@@ -2327,6 +2327,66 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_reorg_condition_rejects_unquoted_hex_literals() {
+        let source_column_types = HashMap::from([("value".to_string(), ColumnType::Uint256)]);
+        for dialect in [SqlDialect::Postgres, SqlDialect::Clickhouse] {
+            let source =
+                ReversalSource { dialect, iterate: &[], source_column_types: &source_column_types };
+            for condition in [
+                "$value > 0 && 0x00 == 0x0",
+                "0x00 == 0x0 && $value > 0",
+                "$value > 0 || 0x00 != 0x0",
+                "$value > 0 && !(0x00 != 0x0)",
+                "$value == 0x0A",
+                "0x0A == $value",
+            ] {
+                assert!(
+                    crate::event::filter_by_expression(
+                        condition,
+                        &serde_json::json!({"value":"10"})
+                    )
+                    .unwrap(),
+                    "the forward evaluator must admit this contribution: {condition}"
+                );
+                let error = render_reorg_condition(condition, &source)
+                    .expect_err("parsed hex strings must not reach recovery SQL")
+                    .to_string();
+                assert!(error.contains("predicate") && error.contains("string"), "{error}");
+            }
+            for (condition, expected) in [("0x00 == 0x0", "TRUE"), ("0x00 != 0x0", "FALSE")] {
+                assert_eq!(render_reorg_condition(condition, &source).unwrap(), expected);
+            }
+            assert!(render_reorg_condition("$value > 0 && 1 == 1", &source).is_ok());
+        }
+    }
+
+    #[test]
+    fn test_reorg_condition_rejects_address_and_bytes_inputs() {
+        for kind in [ColumnType::Address, ColumnType::Bytes, ColumnType::Bytes32] {
+            let source_column_types = HashMap::from([
+                ("value".to_string(), ColumnType::Uint256),
+                ("subject".to_string(), kind.clone()),
+                ("wanted".to_string(), kind),
+            ]);
+            for dialect in [SqlDialect::Postgres, SqlDialect::Clickhouse] {
+                let source = ReversalSource {
+                    dialect,
+                    iterate: &[],
+                    source_column_types: &source_column_types,
+                };
+                // No literal or quote characters: checking only literal syntax
+                // cannot fence value-dependent coercion of ABI hex strings.
+                for condition in ["$subject == $wanted", "$value > 0 && !($subject != $wanted)"] {
+                    let error = render_reorg_condition(condition, &source)
+                        .expect_err("address and bytes inputs require forward-equivalent coercion")
+                        .to_string();
+                    assert!(error.contains("predicate") && error.contains("string"), "{error}");
+                }
+            }
+        }
+    }
+
     // ======================================================================
     // DerivedTableInfo::try_new
     // ======================================================================
