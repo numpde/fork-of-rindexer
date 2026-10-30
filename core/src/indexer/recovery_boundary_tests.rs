@@ -5,7 +5,6 @@ use crate::{
     indexer::reorg::{
         BlockChainWindow, EventTableInfo, ReorgBlockHashPersistence, ReorgContext, ReorgCoordinator,
     },
-    manifest::contract::ColumnType,
     provider::mock::MockChainProvider,
 };
 
@@ -13,12 +12,18 @@ pub(super) async fn rollback(fixture: &Fixture, fork: u64, detection: u64) -> an
     let schema = generate_indexer_contract_schema_name(&fixture.params.indexer_name, "Contract");
     let mut derived = std::collections::HashMap::new();
     let mut plans = std::collections::HashMap::new();
+    let mut source_types = std::collections::HashMap::new();
+    crate::indexer::start::collect_source_column_types(
+        &fixture.params.event_info.inputs,
+        None,
+        &mut source_types,
+    );
     crate::indexer::start::build_derived_tables_for_event(
         "Value",
         &fixture.params.indexer_name,
         "Contract",
         "ethereum",
-        &[("value".into(), ColumnType::Uint256)].into(),
+        &source_types,
         &fixture.params.tables,
         &mut derived,
         &mut plans,

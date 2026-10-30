@@ -454,7 +454,7 @@ fn collect_streams_clients_for_network(
     out
 }
 
-fn collect_source_column_types(
+pub(super) fn collect_source_column_types(
     inputs: &[ABIInput],
     prefix: Option<&str>,
     source_column_types: &mut HashMap<String, ColumnType>,

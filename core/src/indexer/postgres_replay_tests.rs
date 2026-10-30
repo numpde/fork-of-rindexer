@@ -1690,3 +1690,6 @@ mod cross_chain_recovery_tests;
 
 #[path = "recovery_boundary_tests.rs"]
 mod recovery_boundary_tests;
+
+#[path = "predicate_recovery_tests.rs"]
+mod predicate_recovery_tests;
