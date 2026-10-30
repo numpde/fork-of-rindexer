@@ -208,9 +208,9 @@ pub fn validate_sql_identifier(name: &str, kind: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Validates that a SQL condition expression (from YAML `if`/`filter` field) is safe
-/// to interpolate into a WHERE clause. Rejects strings containing characters or patterns
-/// that could be used for SQL injection: semicolons, comments, quotes, UNION, etc.
+/// Rejects dangerous tokens in a raw SQL snippet.
+/// This does not establish event-filter syntax or evaluation semantics. Recovery
+/// predicates use the filter parser and renderer instead of this SQL token check.
 pub fn validate_sql_condition(condition: &str) -> anyhow::Result<()> {
     anyhow::ensure!(!condition.is_empty(), "SQL condition must not be empty");
     // Reject injection patterns (comments, statement terminators, string literals)

@@ -219,6 +219,7 @@ async fn postgres_constant_string_predicates_share_forward_recovery_semantics() 
         ("'İ' == 'i\u{307}'", true),
         ("'001' == '1'", true),
         ("'READY' != 'ready'", false),
+        ("'DROP TABLE x;--' == 'drop table x;--'", true),
     ] {
         let fixture = arithmetic_fixture(json!([]), condition, json!([])).await;
         let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
@@ -245,7 +246,13 @@ async fn postgres_legacy_string_or_untyped_predicates_fail_without_changing_hist
         BlockChainWindow, EventTableInfo,
     };
     use crate::manifest::contract::{ColumnType, SetAction};
-    for typed in [true, false] {
+    for mode in ["string", "untyped", "quoted"] {
+        let typed = mode != "untyped";
+        let condition = if mode == "quoted" {
+            "$value > 0 && 'READY' == 'ready'"
+        } else {
+            "$status == $wanted"
+        };
         let fixture = arithmetic_fixture(
             json!([
             {"name":"status","type":"string","indexed":false},
@@ -295,7 +302,7 @@ async fn postgres_legacy_string_or_untyped_predicates_fail_without_changing_hist
                         SetAction::Add,
                     )
                     .unwrap()],
-                    Some("$status == $wanted".into()),
+                    Some(condition.into()),
                 )
                 .unwrap()],
                 vec![],
@@ -334,7 +341,11 @@ async fn postgres_legacy_string_or_untyped_predicates_fail_without_changing_hist
         let error = format!("{error:#}");
         assert!(
             error.contains("predicate")
-                && error.contains(if typed { "string" } else { "type metadata" }),
+                && error.contains(match mode {
+                    "string" => "string",
+                    "untyped" => "type metadata",
+                    _ => "quoted",
+                }),
             "{error}"
         );
         assert_eq!(
@@ -352,4 +363,38 @@ async fn postgres_legacy_string_or_untyped_predicates_fail_without_changing_hist
         drop(callback);
         fixture.finish().await;
     }
+}
+
+#[tokio::test]
+async fn postgres_journal_only_string_predicate_remains_recoverable() {
+    let mut definition = serde_json::to_value(params().event).unwrap();
+    definition["inputs"].as_array_mut().unwrap().extend([
+        json!({"name":"status","type":"string","indexed":false}),
+        json!({"name":"wanted","type":"string","indexed":false}),
+    ]);
+    let fixture = Fixture::with_table(
+        definition,
+        "Contract",
+        json!({"name":"totals","global":true,
+        "columns":[{"name":"amount","type":"uint256","default":"0"}],
+        "events":[{"event":"Value","operations":[{"type":"upsert","if":"$status == $wanted",
+            "set":[{"column":"amount","action":"set","value":"$value"}]}]}]}),
+    )
+    .await;
+    let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+    for (block, value) in [(99, 10), (100, 20)] {
+        callback(vec![predicate_event(
+            &fixture,
+            block,
+            value,
+            vec![DynSolValue::String("READY".into()), DynSolValue::String("ready".into())],
+        )])
+        .await
+        .unwrap();
+    }
+    assert_eq!(fixture.position().await, (2, "20".into(), "100".into()));
+    super::recovery_boundary_tests::rollback(&fixture, 100, 100).await.unwrap();
+    assert_canonical_amount(&fixture, "10").await;
+    drop(callback);
+    fixture.finish().await;
 }

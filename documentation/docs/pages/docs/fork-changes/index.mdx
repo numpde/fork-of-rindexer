@@ -34,6 +34,41 @@ apply to its storage and configuration:
 These notes retain their existing URLs. Their place in this section identifies
 them as maintained fork documentation.
 
+## Typed predicate admission for arithmetic recovery
+
+Operations reversed from raw history now validate their predicates during
+recovery-plan preparation, before indexing. Event-dependent ABI `string` inputs
+are rejected: forward filters apply Unicode lowercase conversion and may parse
+numeric-looking strings as numbers, while database text comparisons do not have
+the same semantics. A SQL `LOWER()` or `citext` substitution alone would not prove
+equivalence. Use a source event carrying a verified numeric/boolean admission
+field with an equivalent predicate, or maintain the aggregation outside this
+raw-history recovery path. Journal-only operations use their recorded applied
+contributions and do not need this predicate reevaluation.
+
+Every referenced event input must have a known scalar source type. Arrays must
+select a supported scalar leaf. Public callers of conditional arithmetic rollback
+tasks must populate `DerivedTableRollbackPlan::try_add_operation` with the source
+types and call `execute_with_rollback_plan`; the untyped `execute` shortcut remains
+usable for unconditional operations and predicates using only known transaction
+metadata. Direct tuple-array component types use dotted declaration paths such as
+`items.amount`, without array indexes.
+
+Execution applies the same checks to legacy plans before committing changes to
+raw rows, effects, receipts or cursors. A refusal leaves recovery unfinished; it
+does not repair existing orphaned or missing effects. Verify and reconstruct
+already-damaged state from canonical history with coordinated journals, receipts
+and cursors before reuse. Constant predicates are evaluated by the same Rust
+filter evaluator as forward processing, preserving Unicode and numeric-string
+semantics without database collation assumptions. Constructors use the filter
+parser, so quoted literal text can include SQL keywords or punctuation as data;
+unparseable SQL is rejected rather than passed to a SQL token blacklist.
+Quoted syntax in event-dependent raw-history predicates remains unsupported,
+including constant string clauses combined with an event condition. Use
+unquoted scalar paths and typed numeric/boolean values only when the rewrite
+preserves the intended meaning. Fully constant predicates and journal-only
+predicates retain their separate evaluation paths.
+
 ## Compound event predicates
 
 Forward table predicates retain ABI component names through nested tuples,

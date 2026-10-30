@@ -18,7 +18,6 @@ use crate::manifest::contract::{ColumnType, IterateBinding, SetAction};
 use crate::metrics::indexing as metrics;
 use crate::provider::ChainProvider;
 
-use super::validate_sql_condition;
 use super::window::BlockChainWindow;
 
 #[derive(Clone)]
@@ -137,7 +136,11 @@ impl DerivedTableRollbackOp {
             parse_event_operand(ev_col, "rollback op WHERE event column")?;
         }
         if let Some(cond) = &condition {
-            validate_sql_condition(cond)?;
+            // Conditions are filter syntax. Quoted literal contents are data,
+            // while execution also checks types for public mutable struct callers.
+            parse_filter_expression(cond).map_err(|error| {
+                anyhow::anyhow!("Cannot configure recovery predicate {cond:?}: expected an event-filter expression, not raw SQL. Parse error: {error}")
+            })?;
         }
         Ok(Self { event_table, where_columns, columns, condition })
     }
@@ -176,7 +179,9 @@ pub(crate) struct RollbackIterateBinding {
 impl DerivedTableRollbackPlan {
     /// Add metadata for one rollback operation.
     /// Tuple-array element types use dotted keys such as `accounts.owner`;
-    /// their raw PostgreSQL column is represented as JSONB.
+    /// their raw PostgreSQL column is represented as JSONB. Conditional arithmetic
+    /// recovery requires the source types of every referenced event scalar; ABI
+    /// string inputs cannot be reevaluated by recovery SQL.
     ///
     /// # Errors
     ///
@@ -250,6 +255,31 @@ impl DerivedTableRollbackPlan {
             operation_index,
             DerivedTableRollbackMetadata { iterate, source_column_types, derived_column_types },
         );
+        Ok(())
+    }
+
+    /// Check the same predicate renderer at startup that execution uses for snapshots.
+    pub(crate) fn validate_conditions(&self, table: &DerivedTableInfo) -> anyhow::Result<()> {
+        let empty_types = HashMap::new();
+        for (index, operation) in table.rollback_ops.iter().enumerate() {
+            let Some(condition) = &operation.condition else {
+                continue;
+            };
+            let metadata = self.operation(&table.full_table_name, index);
+            let source = ReversalSource {
+                dialect: SqlDialect::Postgres,
+                iterate: metadata.map(|metadata| metadata.iterate.as_slice()).unwrap_or(&[]),
+                source_column_types: metadata
+                    .map(|metadata| &metadata.source_column_types)
+                    .unwrap_or(&empty_types),
+            };
+            render_reorg_condition(condition, &source).with_context(|| {
+                format!(
+                    "Cannot prepare recovery predicate for {} operation {}",
+                    table.full_table_name, index
+                )
+            })?;
+        }
         Ok(())
     }
 
@@ -705,6 +735,37 @@ fn render_reorg_condition(condition: &str, source: &ReversalSource<'_>) -> anyho
         !expression.has_arithmetic(),
         "Cannot reconstruct recovery predicate {condition:?}: arithmetic predicates use checked unsigned-integer semantics during forward execution and are unsupported by recovery SQL; use verified equivalent comparisons before retrying recovery"
     );
+    let mut has_variables = false;
+    let mut unsupported = None;
+    expression.visit_variables(&mut |variable| {
+        has_variables = true;
+        if unsupported.is_some() || variable.source() != VariableSource::Event { return; }
+        let (_, kind) = source.resolve_variable(variable);
+        unsupported = match kind {
+            Some(ColumnType::String) => Some(format!("ABI string input {variable:?} uses value-dependent numeric conversion and Unicode case folding in forward filters; raw-history recovery cannot reproduce those semantics in SQL. Use a verified numeric/boolean admission field or maintain this aggregation outside raw-history recovery")),
+            Some(ColumnType::Array(_)) => Some(format!("input {variable:?} is an array; select a supported scalar leaf for recovery")),
+            None => Some(format!("source type metadata is missing for {variable:?}; check the field path and supply source types through DerivedTableRollbackPlan::try_add_operation and execute_with_rollback_plan")),
+            Some(_) => None,
+        };
+    });
+    if let Some(reason) = unsupported {
+        anyhow::bail!("Cannot reconstruct recovery predicate {condition:?}: {reason}");
+    }
+    anyhow::ensure!(
+        !has_variables || !condition.contains(['\'', '"']),
+        "Cannot reconstruct recovery predicate {condition:?}: quoted syntax in event-dependent predicates is unsupported by raw-history recovery; use supported unquoted scalar paths and numeric/boolean values only after verifying equivalent semantics"
+    );
+    if !has_variables {
+        // Constants need no database comparison or collation: use the same
+        // evaluator that admits their forward effects, including string coercion.
+        let matched = crate::event::filter_by_expression(condition, &serde_json::json!({}))
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "Cannot reconstruct constant recovery predicate {condition:?}: {error}"
+                )
+            })?;
+        return Ok(if matched { "TRUE" } else { "FALSE" }.to_string());
+    }
     expression
         .to_sql_event_condition(|variable| {
             let expression = source.variable_expression(variable);
@@ -1691,6 +1752,10 @@ impl ReorgTask {
         );
         // Validate network before any SQL interpolation
         super::validate_sql_value(&self.network, "reorg task network")?;
+        // A retained snapshot cannot bypass current predicate admission.
+        for table in &self.derived_tables {
+            rollback_plan.validate_conditions(table)?;
+        }
 
         let start = std::time::Instant::now();
 
@@ -2218,6 +2283,31 @@ mod tests {
     }
 
     #[test]
+    fn test_rollback_condition_constructor_uses_filter_grammar() {
+        for condition in ["'DROP TABLE x;--' == 'drop table x;--'", "$value > 0"] {
+            DerivedTableRollbackOp::try_new(
+                "schema.events".into(),
+                vec![],
+                vec![],
+                Some(condition.into()),
+            )
+            .expect("quoted filter literal contents are data");
+        }
+        for condition in ["value = 1", "id::NUMERIC > 7", "value = 1; DROP TABLE x"] {
+            assert!(
+                DerivedTableRollbackOp::try_new(
+                    "schema.events".into(),
+                    vec![],
+                    vec![],
+                    Some(condition.into())
+                )
+                .is_err(),
+                "raw SQL must fail at construction: {condition}"
+            );
+        }
+    }
+
+    #[test]
     fn test_reorg_condition_rejects_legacy_sql_parser_bypass() {
         let source_column_types = HashMap::from([("value".to_string(), ColumnType::Uint256)]);
         for dialect in [SqlDialect::Postgres, SqlDialect::Clickhouse] {
@@ -2225,7 +2315,7 @@ mod tests {
                 ReversalSource { dialect, iterate: &[], source_column_types: &source_column_types };
             for condition in ["value / 1000 = 1", "value = 1", "value::NUMERIC > 7"] {
                 // These are safe SQL tokens but lack a supported filter AST.
-                validate_sql_condition(condition).unwrap();
+                crate::indexer::reorg::validate_sql_condition(condition).unwrap();
                 let error = render_reorg_condition(condition, &source)
                     .expect_err("legacy SQL must not bypass filter arithmetic admission")
                     .to_string();

@@ -27,8 +27,7 @@ pub(super) async fn rollback(fixture: &Fixture, fork: u64, detection: u64) -> an
         &fixture.params.tables,
         &mut derived,
         &mut plans,
-    )
-    .unwrap();
+    )?;
     let blocks = (99..=105)
         .map(|number| {
             let hash = if number == 99 { 99 } else { number + 1 };

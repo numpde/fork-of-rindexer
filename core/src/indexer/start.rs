@@ -694,9 +694,10 @@ pub(super) fn build_derived_tables_for_event(
         }
 
         // Merge into existing entry or create a new one
-        let operation_offset = if let Some(existing) =
-            derived.iter_mut().find(|d| d.full_table_name == tr.full_table_name)
+        let (derived_index, operation_offset) = if let Some(index) =
+            derived.iter().position(|d| d.full_table_name == tr.full_table_name)
         {
+            let existing = &mut derived[index];
             let operation_offset = existing.rollback_ops.len();
             existing.rollback_ops.extend(rollback_ops);
             for jc in journal_columns {
@@ -704,15 +705,16 @@ pub(super) fn build_derived_tables_for_event(
                     existing.journal_columns.push(jc);
                 }
             }
-            operation_offset
+            (index, operation_offset)
         } else {
+            let index = derived.len();
             derived.push(DerivedTableInfo::try_new(
                 tr.full_table_name.clone(),
                 tr.table.cross_chain,
                 rollback_ops,
                 journal_columns,
             )?);
-            0
+            (index, 0)
         };
 
         let rollback_plan = rollback_plans.entry(network.to_string()).or_default();
@@ -727,6 +729,7 @@ pub(super) fn build_derived_tables_for_event(
                 derived_types,
             )?;
         }
+        rollback_plan.validate_conditions(&derived[derived_index])?;
     }
 
     Ok(())
