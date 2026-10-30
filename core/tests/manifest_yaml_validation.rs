@@ -1056,3 +1056,47 @@ fn read_manifest_keeps_one_recovered_owner_with_multiple_sources() {
         read_manifest(&path).expect("source count does not duplicate a logical Table declaration");
     }
 }
+
+#[test]
+fn read_manifest_rejects_utf8_truncation_alias_from_non_reorg_writer() {
+    for native in [false, true] {
+        for component in ["name", "database"] {
+            for suffix in ["é", "中", "𐐨"] {
+                let (_directory, path, _) = shared_recovery_target_manifest("set", true, native);
+                let mut manifest: serde_json::Value =
+                    serde_yaml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+                manifest["storage"]["postgres"]["disable_create_tables"] = true.into();
+                manifest["networks"].as_array_mut().unwrap().push(serde_json::json!({"name":"other","chain_id":2,"rpc":"http://unused.invalid","reorg_handling":{"enabled":false}}));
+                let prefix = "t".repeat(62);
+                manifest["contracts"][0]["tables"][0][component] = prefix.clone().into();
+                let second = if native {
+                    manifest["native_transfers"]["networks"][0]["network"] = "other".into();
+                    &mut manifest["native_transfers"]["tables"][0]
+                } else {
+                    manifest["contracts"][1]["details"][0]["network"] = "other".into();
+                    &mut manifest["contracts"][1]["tables"][0]
+                };
+                second[component] = format!("{prefix}{suffix}").into();
+                fs::write(&path, serde_yaml::to_string(&manifest).unwrap()).unwrap();
+                let error = read_manifest(&path)
+                    .expect_err("PostgreSQL drops the multibyte character crossing byte 63")
+                    .to_string();
+                assert!(
+                    error.contains(&prefix) && error.contains("multiple manifest declarations"),
+                    "{component}/{suffix}: {error}"
+                );
+                // A complete character fitting within the byte limit remains
+                // part of the identifier, and therefore names a distinct target.
+                let second = if native {
+                    &mut manifest["native_transfers"]["tables"][0]
+                } else {
+                    &mut manifest["contracts"][1]["tables"][0]
+                };
+                second[component] = format!("{}{suffix}", "t".repeat(63 - suffix.len())).into();
+                fs::write(&path, serde_yaml::to_string(&manifest).unwrap()).unwrap();
+                read_manifest(&path)
+                    .expect("a multibyte character fitting exactly at byte 63 survives");
+            }
+        }
+    }
+}
