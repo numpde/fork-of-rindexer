@@ -1,3 +1,10 @@
+{{- if ne (int .Values.replicaCount) 1 }}
+{{- fail "Managed indexing requires replicaCount=1; independent writers are not fenced" }}
+{{- end }}
+{{- $digest := required "image.digest must select a reviewed immutable fork image" .Values.image.digest }}
+{{- if not (regexMatch "^sha256:[a-f0-9]{64}$" $digest) }}
+{{- fail "image.digest must be a sha256 digest, not a tag" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -6,6 +13,8 @@ metadata:
     {{- include "rindexer.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       {{- include "rindexer.selectorLabels" . | nindent 6 }}
@@ -22,7 +31,7 @@ spec:
       {{- end }}
       containers:
         - name: {{ .Chart.Name }}
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: "{{ .Values.image.repository }}@{{ $digest }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command:
             {{- if and .Values.postgresql.enabled }}

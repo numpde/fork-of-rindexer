@@ -13,13 +13,15 @@ A Helm chart for deploying the `rindexer` application. This chart supports integ
 
 ## Installing the Chart
 
-To install the chart with the release name `my-release`:
+Set `RINDEXER_IMAGE_DIGEST` to the reviewed fork image's `sha256:...` digest, then
+install the chart with the release name `my-release`:
 
 ```bash
-helm install my-release ./rindexer
+helm install my-release ./rindexer --set-string image.digest="$RINDEXER_IMAGE_DIGEST"
 ```
 
-The command deploys the `rindexer` application on the Kubernetes cluster using the default configuration.
+The command deploys that exact image. An empty digest is rejected; see the fork
+deployment requirements below for image layout and writer coordination.
 
 ## Uninstalling the Chart
 
@@ -37,9 +39,9 @@ The following table lists the configurable parameters of the `rindexer` chart an
 
 | Parameter                                | Description                                      | Default                       |
 |------------------------------------------|--------------------------------------------------|-------------------------------|
-| `replicaCount`                           | Number of replicas to deploy                     | `1`                           |
-| `image.repository`                       | Image repository                                 | `ghcr.io/joshstevens19/rindexer` |
-| `image.tag`                              | Image tag                                        | `latest`                      |
+| `replicaCount`                           | Must be one; independent writers are not fenced   | `1`                           |
+| `image.repository`                       | Fork image repository                            | `ghcr.io/numpde/fork-of-rindexer` |
+| `image.digest`                           | Required reviewed `sha256:` image digest          | Empty; installation fails until set |
 | `image.pullPolicy`                       | Image pull policy                                | `IfNotPresent`                |
 | `service.type`                           | Kubernetes service type                          | `ClusterIP`                   |
 | `service.port`                           | Kubernetes service port                          | `3001`                        |
@@ -170,3 +172,18 @@ ingress:
         - path: /
           pathType: Prefix
 ```
+
+## Fork deployment requirements
+
+Supply `image.digest=sha256:...` for an independently built and reviewed fork image.
+The default repository is `ghcr.io/numpde/fork-of-rindexer`; the chart does not
+publish an image or establish that this registry already contains your revision.
+Tags, including the previous `image.tag`, no longer select a deployment image.
+Use the root-Dockerfile image layout (`/app/rindexer`); the optional scratch runtime
+has a different entrypoint and its own maintained Compose launcher.
+
+Only one replica is admitted. Deployment upgrades use `Recreate` so the previous
+writer stops before replacement. This introduces upgrade downtime and does not
+fence other releases, hosts or handwritten writers; keep those stopped. Back up
+and reconcile database migrations before upgrading. Run the rendered chart checks
+with `python3 helm/rindexer/tests/deployment.py /path/to/helm`.
