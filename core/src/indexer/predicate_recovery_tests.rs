@@ -147,3 +147,209 @@ async fn postgres_tuple_array_numeric_predicates_recover_typed_json_paths() {
         fixture.finish().await;
     }
 }
+
+#[tokio::test]
+async fn postgres_string_predicates_require_equivalent_recovery_or_startup_refusal() {
+    for (status, wanted) in [("READY", "ready"), ("İ", "i\u{307}"), ("001", "1")] {
+        let fixture = arithmetic_fixture(
+            json!([
+            {"name":"status","type":"string","indexed":false},
+            {"name":"wanted","type":"string","indexed":false}]),
+            "$status == $wanted",
+            json!([]),
+        )
+        .await;
+        let mut source_types = std::collections::HashMap::new();
+        crate::indexer::start::collect_source_column_types(
+            &fixture.params.event_info.inputs,
+            None,
+            &mut source_types,
+        );
+        let mut derived = std::collections::HashMap::new();
+        let mut plans = std::collections::HashMap::new();
+        let admitted = crate::indexer::start::build_derived_tables_for_event(
+            "Value",
+            &fixture.params.indexer_name,
+            "Contract",
+            "ethereum",
+            &source_types,
+            &fixture.params.tables,
+            &mut derived,
+            &mut plans,
+        );
+        if let Err(error) = admitted {
+            let error = format!("{error:#}");
+            assert!(error.contains("string") && error.contains("predicate"), "{error}");
+            let raw: i64 = fixture
+                .client
+                .query_one(
+                    &format!("SELECT count(*) FROM {}", fixture.params.sql_event_table_name),
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(raw, 0, "startup refusal must precede event admission");
+            fixture.finish().await;
+            continue;
+        }
+        let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+        for (block, value) in [(99, 10), (100, 20)] {
+            callback(vec![predicate_event(
+                &fixture,
+                block,
+                value,
+                vec![DynSolValue::String(status.into()), DynSolValue::String(wanted.into())],
+            )])
+            .await
+            .unwrap();
+        }
+        assert_eq!(fixture.position().await, (2, "30".into(), "100".into()));
+        super::recovery_boundary_tests::rollback(&fixture, 100, 100).await.unwrap();
+        assert_canonical_amount(&fixture, "10").await;
+        drop(callback);
+        fixture.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn postgres_constant_string_predicates_share_forward_recovery_semantics() {
+    for (condition, matched) in [
+        ("'READY' == 'ready'", true),
+        ("'İ' == 'i\u{307}'", true),
+        ("'001' == '1'", true),
+        ("'READY' != 'ready'", false),
+    ] {
+        let fixture = arithmetic_fixture(json!([]), condition, json!([])).await;
+        let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+        callback(vec![predicate_event(&fixture, 99, 10, vec![])]).await.unwrap();
+        callback(vec![predicate_event(&fixture, 100, 20, vec![])]).await.unwrap();
+        assert_eq!(
+            fixture.position().await,
+            (2, if matched { "30" } else { "0" }.into(), "100".into())
+        );
+        super::recovery_boundary_tests::rollback(&fixture, 100, 100).await.unwrap();
+        assert_canonical_amount(&fixture, if matched { "10" } else { "0" }).await;
+        drop(callback);
+        fixture.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn postgres_legacy_string_or_untyped_predicates_fail_without_changing_history() {
+    use crate::indexer::reorg::{
+        task::{
+            DerivedColumnRollback, DerivedTableInfo, DerivedTableRollbackOp,
+            DerivedTableRollbackPlan, ReorgTask,
+        },
+        BlockChainWindow, EventTableInfo,
+    };
+    use crate::manifest::contract::{ColumnType, SetAction};
+    for typed in [true, false] {
+        let fixture = arithmetic_fixture(
+            json!([
+            {"name":"status","type":"string","indexed":false},
+            {"name":"wanted","type":"string","indexed":false}]),
+            "$status == $wanted",
+            json!([]),
+        )
+        .await;
+        let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+        for (block, value) in [(99, 10), (100, 20)] {
+            callback(vec![predicate_event(
+                &fixture,
+                block,
+                value,
+                vec![DynSolValue::String("READY".into()), DynSolValue::String("ready".into())],
+            )])
+            .await
+            .unwrap();
+        }
+        let before = fixture.position().await;
+        assert_eq!(before, (2, "30".into(), "100".into()));
+        let schema =
+            generate_indexer_contract_schema_name(&fixture.params.indexer_name, "Contract");
+        let table = fixture.params.tables[0].full_table_name.clone();
+        let task = ReorgTask {
+            network: "ethereum".into(),
+            fork_point: 100,
+            detection_point: 100,
+            event_tables: vec![EventTableInfo::try_new(
+                schema.clone(),
+                "value".into(),
+                generate_internal_event_table_name(&schema, "Value"),
+                fixture.params.indexer_name.clone(),
+                "Contract".into(),
+                "Value".into(),
+            )
+            .unwrap()],
+            derived_tables: vec![DerivedTableInfo::try_new(
+                table.clone(),
+                false,
+                vec![DerivedTableRollbackOp::try_new(
+                    fixture.params.sql_event_table_name.clone(),
+                    vec![],
+                    vec![DerivedColumnRollback::try_new(
+                        "amount".into(),
+                        "value".into(),
+                        SetAction::Add,
+                    )
+                    .unwrap()],
+                    Some("$status == $wanted".into()),
+                )
+                .unwrap()],
+                vec![],
+            )
+            .unwrap()],
+            canonical_blocks: vec![],
+        };
+        let mut source_types = std::collections::HashMap::new();
+        if typed {
+            crate::indexer::start::collect_source_column_types(
+                &fixture.params.event_info.inputs,
+                None,
+                &mut source_types,
+            );
+        }
+        let mut plan = DerivedTableRollbackPlan::default();
+        plan.try_add_operation(
+            table,
+            0,
+            vec![],
+            source_types,
+            [("amount".into(), ColumnType::Uint256)].into(),
+        )
+        .unwrap();
+        let result = task
+            .execute_with_rollback_plan(
+                &mut BlockChainWindow::try_new(8).unwrap(),
+                Some(&fixture.client),
+                None,
+                None,
+                &plan,
+            )
+            .await;
+        let error =
+            result.err().expect("legacy string or unknown-type predicates must stop recovery");
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("predicate")
+                && error.contains(if typed { "string" } else { "type metadata" }),
+            "{error}"
+        );
+        assert_eq!(
+            fixture.position().await,
+            before,
+            "refusing recovery must preserve raw rows, effects and cursor"
+        );
+        let receipts: i64 = fixture
+            .client
+            .query_one("SELECT count(*) FROM rindexer_internal.event_applications", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(receipts, 2);
+        drop(callback);
+        fixture.finish().await;
+    }
+}

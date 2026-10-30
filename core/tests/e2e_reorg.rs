@@ -2576,9 +2576,28 @@ async fn test_reorg_reversal_with_condition() {
 
     // Retry only after expressing the same numeric predicate in filter syntax.
     task.derived_tables[0].rollback_ops[0].condition = Some("$id > 7".to_string());
-    task.execute(&mut task_window, Some(&rindexer_pg), None, None)
-        .await
-        .expect("conditional reversal reorg task failed");
+    let mut rollback_plan = DerivedTableRollbackPlan::default();
+    rollback_plan
+        .try_add_operation(
+            "test_schema.filtered_balances".into(),
+            0,
+            vec![],
+            HashMap::from([
+                ("id".into(), ColumnType::Uint256),
+                ("sender".into(), ColumnType::Address),
+            ]),
+            HashMap::from([("balance".into(), ColumnType::Uint256)]),
+        )
+        .unwrap();
+    task.execute_with_rollback_plan(
+        &mut task_window,
+        Some(&rindexer_pg),
+        None,
+        None,
+        &rollback_plan,
+    )
+    .await
+    .expect("conditional reversal reorg task failed");
 
     // In reorg range (block2, block3): block2 id=5 (skipped by condition), block3 id=20 (matches)
     // So only 20 is subtracted: 30 - 20 = 10
