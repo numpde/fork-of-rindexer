@@ -224,13 +224,18 @@ impl DerivedTableRollbackPlan {
                         .map(|path| (path.to_string(), column_type.clone()))
                 })
                 .collect::<Vec<_>>();
+            let nested_array = matches!(source_column_types.get(&binding.array_field), Some(ColumnType::Array(inner)) if matches!(inner.as_ref(), ColumnType::Array(_)));
             let storage = if jsonb_element_types.is_empty() {
                 if let Some(ColumnType::Array(inner)) =
                     source_column_types.get(&binding.array_field).cloned()
                 {
                     source_column_types.insert(binding.alias.clone(), *inner);
                 }
-                IterateStorage::NativeArray
+                if nested_array {
+                    IterateStorage::PostgresJsonb
+                } else {
+                    IterateStorage::NativeArray
+                }
             } else {
                 for (path, column_type) in jsonb_element_types {
                     source_column_types.insert(format!("{}.{}", binding.alias, path), column_type);
@@ -529,11 +534,12 @@ impl ReversalSource<'_> {
             .or_else(|| ColumnType::from_tx_metadata_field(variable.base_name()));
         let mut json_field = db_column;
         let mut json_path = Vec::new();
+        let nested_array = matches!(&column_type, Some(ColumnType::Array(inner)) if matches!(inner.as_ref(), ColumnType::Array(_)));
 
         for accessor in accessors {
             match accessor {
                 Accessor::Index(index) => match column_type.take() {
-                    Some(ColumnType::Array(inner)) if json_path.is_empty() => {
+                    Some(ColumnType::Array(inner)) if json_path.is_empty() && !nested_array => {
                         expression = self.dialect.array_element(expression, *index);
                         column_type = Some(*inner);
                     }
@@ -573,7 +579,7 @@ impl ReversalSource<'_> {
             expression = format!("jsonb_extract_path_text({}, {})", expression, path);
         }
         let expression = match &column_type {
-            Some(kind) => self.dialect.cast(expression, kind),
+            Some(kind) => source_cast(self.dialect, expression, kind),
             None => expression,
         };
         (expression, column_type)
@@ -632,7 +638,7 @@ impl ReversalSource<'_> {
         }
 
         let expression = match &column_type {
-            Some(kind) => self.dialect.cast(expression, kind),
+            Some(kind) => source_cast(self.dialect, expression, kind),
             None => expression,
         };
         (expression, column_type)
@@ -723,6 +729,62 @@ impl ReversalSource<'_> {
     }
 }
 
+// Raw source domains differ from custom-table storage: uint64 needs all 64 bits.
+fn source_cast(dialect: SqlDialect, expression: String, kind: &ColumnType) -> String {
+    if matches!(kind, ColumnType::Uint64) {
+        dialect.cast(expression, &ColumnType::Uint256)
+    } else {
+        dialect.cast(expression, kind)
+    }
+}
+
+fn validate_recovery_comparisons(
+    expression: &crate::event::Expression<'_>,
+    source: &ReversalSource<'_>,
+) -> anyhow::Result<()> {
+    use crate::event::{ComparisonOperator, Expression, LiteralValue};
+    let boolean = |operand: &ArithmeticExpr<'_>| -> anyhow::Result<bool> {
+        match operand {
+            ArithmeticExpr::Variable(variable) => {
+                let (_, kind) = source.resolve_variable(variable);
+                anyhow::ensure!(
+                    !matches!(kind, Some(ColumnType::Int8 | ColumnType::Int16 | ColumnType::Int32 | ColumnType::Int64 | ColumnType::Int128 | ColumnType::Int256)),
+                    "signed predicate inputs have value-dependent forward comparison semantics; use a verified unsigned/boolean admission field"
+                );
+                Ok(matches!(kind, Some(ColumnType::Bool)))
+            }
+            ArithmeticExpr::Literal(LiteralValue::Bool(_)) => Ok(true),
+            ArithmeticExpr::Literal(LiteralValue::Number(value)) => {
+                anyhow::ensure!(crate::event::string_to_u256(value).is_ok(),
+                    "recovery comparison literals must be unsigned 256-bit integers; negative, fractional and overflowing literals are unsupported");
+                Ok(false)
+            }
+            _ => anyhow::bail!("unsupported recovery comparison operand"),
+        }
+    };
+    match expression {
+        Expression::Condition(condition) => {
+            let left = boolean(&condition.left)?;
+            let right = boolean(&condition.right)?;
+            anyhow::ensure!(left == right, "recovery cannot compare boolean and numeric operands");
+            anyhow::ensure!(
+                !left
+                    || matches!(
+                        condition.operator,
+                        ComparisonOperator::Eq | ComparisonOperator::Ne
+                    ),
+                "forward boolean comparisons support only == and !="
+            );
+        }
+        Expression::Logical { left, right, .. } => {
+            validate_recovery_comparisons(left, source)?;
+            validate_recovery_comparisons(right, source)?;
+        }
+        Expression::Not(inner) => validate_recovery_comparisons(inner, source)?,
+    }
+    Ok(())
+}
+
 fn render_reorg_condition(condition: &str, source: &ReversalSource<'_>) -> anyhow::Result<String> {
     let expression = parse_filter_expression(condition).map_err(|error| {
         anyhow::anyhow!(
@@ -767,8 +829,10 @@ fn render_reorg_condition(condition: &str, source: &ReversalSource<'_>) -> anyho
             })?;
         return Ok(if matched { "TRUE" } else { "FALSE" }.to_string());
     }
+    validate_recovery_comparisons(&expression, source)
+        .with_context(|| format!("Cannot reconstruct recovery predicate {condition:?}"))?;
     expression
-        .to_sql_event_condition(|variable| {
+        .to_sql_recovery_condition(|variable| {
             let expression = source.variable_expression(variable);
             // Forward filters expose Unix seconds. Stored timestamp keys still
             // need their native SQL type, so convert only in predicate context.
@@ -2022,6 +2086,59 @@ impl ReorgTask {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readiness_scalar_comparisons_require_forward_equivalence() {
+        let types = HashMap::from([
+            ("amount".into(), ColumnType::Uint256),
+            ("gate".into(), ColumnType::Int256),
+            ("flag".into(), ColumnType::Bool),
+        ]);
+        let source = ReversalSource {
+            dialect: SqlDialect::Postgres,
+            iterate: &[],
+            source_column_types: &types,
+        };
+        for condition in ["$gate != -1", "$amount > 0.5", "$flag > false"] {
+            assert!(crate::event::filter_by_expression(
+                condition,
+                &serde_json::json!({"gate":1,"amount":1,"flag":true})
+            )
+            .is_err());
+            assert!(render_reorg_condition(condition, &source).is_err(), "{condition}");
+        }
+        for condition in ["$amount > 0", "$flag == true", "1 == 1"] {
+            assert!(render_reorg_condition(condition, &source).is_ok(), "{condition}");
+        }
+    }
+
+    #[test]
+    fn readiness_source_uint64_preserves_unsigned_range() {
+        let types = HashMap::from([("amount".into(), ColumnType::Uint64)]);
+        let source = ReversalSource {
+            dialect: SqlDialect::Postgres,
+            iterate: &[],
+            source_column_types: &types,
+        };
+        let sql = source.operand("amount").unwrap();
+        assert!(!sql.contains("BIGINT"), "full-range uint64 cannot pass through BIGINT: {sql}");
+        assert!(sql.contains("NUMERIC"));
+    }
+
+    #[test]
+    fn readiness_fixed_array_retains_native_storage() {
+        let kind = ColumnType::from_solidity_type("uint256[2]").unwrap();
+        assert_eq!(kind, ColumnType::Array(Box::new(ColumnType::Uint256)));
+        let types = HashMap::from([("values".into(), kind)]);
+        let source = ReversalSource {
+            dialect: SqlDialect::Postgres,
+            iterate: &[],
+            source_column_types: &types,
+        };
+        let sql = source.operand("values[0]").unwrap();
+        assert!(!sql.contains("jsonb_extract"), "{sql}");
+        assert!(sql.contains("[1]"), "{sql}");
+    }
 
     // ======================================================================
     // EventTableInfo::try_new
