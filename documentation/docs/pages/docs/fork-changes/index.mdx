@@ -40,10 +40,13 @@ A derived destination participating in reorg recovery requires one manifest
 `Table` declaration. Validation resolves the same `database:` override and
 normalized table name used by runtime writes before applying recovery rules.
 It covers contracts and native transfers, explicit/default-schema aliases, and
-PostgreSQL identifier truncation and quoted schema aliases. In projects with
-reorg handling, `database:` must identify one schema; database-qualified schema
-paths cannot be resolved safely during offline validation. Recovered identifiers must use lowercase so
-quoted writes and bare recovery SQL address the same catalog object.
+PostgreSQL identifier truncation and quoted schema aliases. Truncation uses the
+standard 63-byte limit and drops any UTF-8 character crossing that boundary,
+including names supplied by writers whose own source has recovery disabled. In
+projects with reorg handling, `database:` must identify one schema; database-qualified
+schema paths cannot be resolved safely during offline validation. Recovered
+identifiers must use lowercase so quoted writes and bare recovery SQL address the
+same catalog object.
 
 Separate declarations cannot hide a partial assignment group, a set/arithmetic
 mixture, an insert/mutable mixture or a missing extrema baseline from each

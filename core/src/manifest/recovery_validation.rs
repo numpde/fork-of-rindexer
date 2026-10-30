@@ -49,7 +49,15 @@ fn register<'a>(
     }
     let identity = parts
         .iter()
-        .map(|part| part.trim_matches('"').chars().take(63).collect::<String>())
+        .map(|part| {
+            let identifier = part.trim_matches('"');
+            let mut end = identifier.len().min(63);
+            // PostgreSQL drops a character crossing its byte limit entirely.
+            while !identifier.is_char_boundary(end) {
+                end -= 1;
+            }
+            &identifier[..end]
+        })
         .collect::<Vec<_>>()
         .join(".");
     targets.entry(identity).or_default().push(declaration);
