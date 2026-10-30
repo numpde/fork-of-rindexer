@@ -89,3 +89,61 @@ async fn postgres_named_tuple_predicates_apply_and_revert_the_same_effects() {
         fixture.finish().await;
     }
 }
+
+#[tokio::test]
+async fn postgres_tuple_array_numeric_predicates_recover_typed_json_paths() {
+    for shape in 0..3 {
+        let (array_type, components, condition) = match shape {
+            0 => ("tuple[]", json!([{"name":"amount","type":"uint256"}]), "$items[0].amount > 7"),
+            1 => (
+                "tuple[2]",
+                json!([{"name":"info","type":"tuple","components":[{"name":"tokenAmount","type":"uint256"}]}]),
+                "$items[0].info.tokenAmount > 7",
+            ),
+            _ => (
+                "tuple[]",
+                json!([{"name":"amounts","type":"uint256[]"}]),
+                "$items[0].amounts[0] > 7",
+            ),
+        };
+        let fixture = arithmetic_fixture(
+            json!([{"name":"items","type":array_type,"indexed":false,"components":components}]),
+            condition,
+            json!([]),
+        )
+        .await;
+        let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+        let extra = |value: u64| {
+            let scalar = DynSolValue::Uint(U256::from(value), 256);
+            let tuple = DynSolValue::Tuple(vec![match shape {
+                0 => scalar,
+                1 => DynSolValue::Tuple(vec![scalar]),
+                _ => DynSolValue::Array(vec![scalar]),
+            }]);
+            vec![if shape == 1 {
+                DynSolValue::FixedArray(vec![tuple.clone(), tuple])
+            } else {
+                DynSolValue::Array(vec![tuple])
+            }]
+        };
+        let canonical = predicate_event(&fixture, 99, 10, extra(10));
+        callback(vec![canonical.clone()]).await.unwrap();
+        callback(vec![predicate_event(&fixture, 100, 20, extra(20))]).await.unwrap();
+        callback(vec![predicate_event(&fixture, 101, 999, extra(7))]).await.unwrap();
+        assert_eq!(
+            fixture.position().await,
+            (3, "30".into(), "101".into()),
+            "the false predicate must not contribute"
+        );
+        let result = super::recovery_boundary_tests::rollback(&fixture, 100, 101).await;
+        assert!(
+            result.is_ok(),
+            "{condition} must compare typed numeric leaves, not JSON text: {result:#?}"
+        );
+        assert_canonical_amount(&fixture, "10").await;
+        callback(vec![canonical]).await.unwrap();
+        assert_canonical_amount(&fixture, "10").await;
+        drop(callback);
+        fixture.finish().await;
+    }
+}
