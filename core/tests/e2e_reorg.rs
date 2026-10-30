@@ -2513,7 +2513,7 @@ async fn test_reorg_reversal_with_condition() {
 
     trigger_reorg(&env.http, &env.rpc_url, 2).await; // invalidates block2, block3
 
-    let task = ReorgTask {
+    let mut task = ReorgTask {
         network: network.to_string(),
         fork_point: block2,
         detection_point: block3,
@@ -2548,6 +2548,34 @@ async fn test_reorg_reversal_with_condition() {
     let rindexer_pg = env.rindexer_pg().await;
     let mut task_window = BlockChainWindow::try_new(256).unwrap();
 
+    let error = task
+        .execute(&mut task_window, Some(&rindexer_pg), None, None)
+        .await
+        .err()
+        .expect("legacy SQL must fail before changing canonical data");
+    let error = format!("{error:#}");
+    assert!(error.contains("filter expression"), "{error}");
+    let raw_rows: i64 = pg
+        .query_one(
+            "SELECT count(*) FROM test_schema.ping_pong_ping WHERE network = $1",
+            &[&network],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(raw_rows, 3, "refusing legacy SQL must preserve the source history");
+    let unchanged: rust_decimal::Decimal = pg
+        .query_one(
+            "SELECT balance FROM test_schema.filtered_balances WHERE network = $1",
+            &[&network],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(unchanged, rust_decimal::Decimal::from(30u64));
+
+    // Retry only after expressing the same numeric predicate in filter syntax.
+    task.derived_tables[0].rollback_ops[0].condition = Some("$id > 7".to_string());
     task.execute(&mut task_window, Some(&rindexer_pg), None, None)
         .await
         .expect("conditional reversal reorg task failed");

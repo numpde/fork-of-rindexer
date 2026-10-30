@@ -2197,11 +2197,30 @@ mod tests {
             render_reorg_condition("$ids[0] > @balance", &pg_source).is_err(),
             "table-state conditions must fail before raw events are deleted"
         );
-        assert_eq!(
-            render_reorg_condition("id::NUMERIC > 7", &pg_source).unwrap(),
-            "id::NUMERIC > 7",
-            "validated legacy SQL conditions remain compatible"
+        assert!(
+            render_reorg_condition("id::NUMERIC > 7", &pg_source).is_err(),
+            "unparsed legacy SQL cannot establish forward filter semantics"
         );
+    }
+
+    #[test]
+    fn test_reorg_condition_rejects_legacy_sql_parser_bypass() {
+        let source_column_types = HashMap::from([("value".to_string(), ColumnType::Uint256)]);
+        for dialect in [SqlDialect::Postgres, SqlDialect::Clickhouse] {
+            let source =
+                ReversalSource { dialect, iterate: &[], source_column_types: &source_column_types };
+            for condition in ["value / 1000 = 1", "value = 1", "value::NUMERIC > 7"] {
+                // These are safe SQL tokens but lack a supported filter AST.
+                validate_sql_condition(condition).unwrap();
+                let error = render_reorg_condition(condition, &source)
+                    .expect_err("legacy SQL must not bypass filter arithmetic admission")
+                    .to_string();
+                assert!(
+                    error.contains("recovery predicate") && error.contains("filter expression"),
+                    "{condition}: {error}"
+                );
+            }
+        }
     }
 
     // ======================================================================
