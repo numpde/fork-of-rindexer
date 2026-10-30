@@ -2708,3 +2708,31 @@ mod tests {
         assert_eq!(SetAction::Min.reverse(), None);
     }
 }
+
+#[cfg(test)]
+mod array_type_roundtrip_tests {
+    use super::ColumnType;
+
+    #[test]
+    fn readiness_nested_array_types_round_trip_through_yaml() {
+        for (abi, expected) in [
+            (
+                "uint256[][]",
+                ColumnType::Array(Box::new(ColumnType::Array(Box::new(ColumnType::Uint256)))),
+            ),
+            (
+                "bool[][2]",
+                ColumnType::Array(Box::new(ColumnType::Array(Box::new(ColumnType::Bool)))),
+            ),
+        ] {
+            let inferred = ColumnType::from_solidity_type(abi).unwrap();
+            assert_eq!(inferred, expected);
+            let yaml = serde_yaml::to_string(&inferred).unwrap();
+            let decoded: ColumnType = serde_yaml::from_str(&yaml).unwrap();
+            assert_eq!(
+                decoded, expected,
+                "ABI-inferred dimensions must survive a manifest rewrite: {yaml}"
+            );
+        }
+    }
+}

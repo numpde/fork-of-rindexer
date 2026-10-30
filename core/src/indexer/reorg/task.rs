@@ -2023,6 +2023,54 @@ impl ReorgTask {
 mod tests {
     use super::*;
 
+    #[test]
+    fn readiness_scalar_comparisons_require_forward_equivalence() {
+        let types = HashMap::from([
+            ("amount".into(), ColumnType::Uint256),
+            ("gate".into(), ColumnType::Int256),
+            ("flag".into(), ColumnType::Bool),
+        ]);
+        let source = ReversalSource {
+            dialect: SqlDialect::Postgres,
+            iterate: &[],
+            source_column_types: &types,
+        };
+        for condition in ["$gate != -1", "$amount > 0.5", "$flag > false"] {
+            assert!(render_reorg_condition(condition, &source).is_err(), "{condition}");
+        }
+        for condition in ["$amount > 0", "$flag == true", "1 == 1"] {
+            assert!(render_reorg_condition(condition, &source).is_ok(), "{condition}");
+        }
+    }
+
+    #[test]
+    fn readiness_source_uint64_preserves_unsigned_range() {
+        let types = HashMap::from([("amount".into(), ColumnType::Uint64)]);
+        let source = ReversalSource {
+            dialect: SqlDialect::Postgres,
+            iterate: &[],
+            source_column_types: &types,
+        };
+        let sql = source.operand("amount").unwrap();
+        assert!(!sql.contains("BIGINT"), "full-range uint64 cannot pass through BIGINT: {sql}");
+        assert!(sql.contains("NUMERIC"));
+    }
+
+    #[test]
+    fn readiness_fixed_array_retains_native_storage() {
+        let kind = ColumnType::from_solidity_type("uint256[2]").unwrap();
+        assert_eq!(kind, ColumnType::Array(Box::new(ColumnType::Uint256)));
+        let types = HashMap::from([("values".into(), kind)]);
+        let source = ReversalSource {
+            dialect: SqlDialect::Postgres,
+            iterate: &[],
+            source_column_types: &types,
+        };
+        let sql = source.operand("values[0]").unwrap();
+        assert!(!sql.contains("jsonb_extract"), "{sql}");
+        assert!(sql.contains("[1]"), "{sql}");
+    }
+
     // ======================================================================
     // EventTableInfo::try_new
     // ======================================================================
