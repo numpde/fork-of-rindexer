@@ -743,6 +743,7 @@ fn render_reorg_condition(condition: &str, source: &ReversalSource<'_>) -> anyho
         let (_, kind) = source.resolve_variable(variable);
         unsupported = match kind {
             Some(ColumnType::String) => Some(format!("ABI string input {variable:?} uses value-dependent numeric conversion and Unicode case folding in forward filters; raw-history recovery cannot reproduce those semantics in SQL. Use a verified numeric/boolean admission field or maintain this aggregation outside raw-history recovery")),
+            Some(ColumnType::Address | ColumnType::Bytes | ColumnType::Bytes32) => Some(format!("ABI address/bytes input {variable:?} is evaluated as a string with value-dependent numeric conversion in forward filters; raw-history recovery cannot reproduce those semantics with SQL address/byte comparisons. Use a verified numeric/boolean admission field or maintain this aggregation outside raw-history recovery")),
             Some(ColumnType::Array(_)) => Some(format!("input {variable:?} is an array; select a supported scalar leaf for recovery")),
             None => Some(format!("source type metadata is missing for {variable:?}; check the field path and supply source types through DerivedTableRollbackPlan::try_add_operation and execute_with_rollback_plan")),
             Some(_) => None,
@@ -752,8 +753,8 @@ fn render_reorg_condition(condition: &str, source: &ReversalSource<'_>) -> anyho
         anyhow::bail!("Cannot reconstruct recovery predicate {condition:?}: {reason}");
     }
     anyhow::ensure!(
-        !has_variables || !condition.contains(['\'', '"']),
-        "Cannot reconstruct recovery predicate {condition:?}: quoted syntax in event-dependent predicates is unsupported by raw-history recovery; use supported unquoted scalar paths and numeric/boolean values only after verifying equivalent semantics"
+        !has_variables || (!expression.has_string_literals() && !condition.contains(['\'', '"'])),
+        "Cannot reconstruct recovery predicate {condition:?}: string literals (including unquoted hexadecimal values) or quoted syntax in event-dependent predicates are unsupported by raw-history recovery; use supported unquoted scalar paths and numeric/boolean values only after verifying equivalent semantics"
     );
     if !has_variables {
         // Constants need no database comparison or collation: use the same
@@ -2323,6 +2324,66 @@ mod tests {
                     error.contains("recovery predicate") && error.contains("filter expression"),
                     "{condition}: {error}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn test_reorg_condition_rejects_unquoted_hex_literals() {
+        let source_column_types = HashMap::from([("value".to_string(), ColumnType::Uint256)]);
+        for dialect in [SqlDialect::Postgres, SqlDialect::Clickhouse] {
+            let source =
+                ReversalSource { dialect, iterate: &[], source_column_types: &source_column_types };
+            for condition in [
+                "$value > 0 && 0x00 == 0x0",
+                "0x00 == 0x0 && $value > 0",
+                "$value > 0 || 0x00 != 0x0",
+                "$value > 0 && !(0x00 != 0x0)",
+                "$value == 0x0A",
+                "0x0A == $value",
+            ] {
+                assert!(
+                    crate::event::filter_by_expression(
+                        condition,
+                        &serde_json::json!({"value":"10"})
+                    )
+                    .unwrap(),
+                    "the forward evaluator must admit this contribution: {condition}"
+                );
+                let error = render_reorg_condition(condition, &source)
+                    .expect_err("parsed hex strings must not reach recovery SQL")
+                    .to_string();
+                assert!(error.contains("predicate") && error.contains("string"), "{error}");
+            }
+            for (condition, expected) in [("0x00 == 0x0", "TRUE"), ("0x00 != 0x0", "FALSE")] {
+                assert_eq!(render_reorg_condition(condition, &source).unwrap(), expected);
+            }
+            assert!(render_reorg_condition("$value > 0 && 1 == 1", &source).is_ok());
+        }
+    }
+
+    #[test]
+    fn test_reorg_condition_rejects_address_and_bytes_inputs() {
+        for kind in [ColumnType::Address, ColumnType::Bytes, ColumnType::Bytes32] {
+            let source_column_types = HashMap::from([
+                ("value".to_string(), ColumnType::Uint256),
+                ("subject".to_string(), kind.clone()),
+                ("wanted".to_string(), kind),
+            ]);
+            for dialect in [SqlDialect::Postgres, SqlDialect::Clickhouse] {
+                let source = ReversalSource {
+                    dialect,
+                    iterate: &[],
+                    source_column_types: &source_column_types,
+                };
+                // No literal or quote characters: checking only literal syntax
+                // cannot fence value-dependent coercion of ABI hex strings.
+                for condition in ["$subject == $wanted", "$value > 0 && !($subject != $wanted)"] {
+                    let error = render_reorg_condition(condition, &source)
+                        .expect_err("address and bytes inputs require forward-equivalent coercion")
+                        .to_string();
+                    assert!(error.contains("predicate") && error.contains("string"), "{error}");
+                }
             }
         }
     }

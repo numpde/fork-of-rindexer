@@ -2360,8 +2360,7 @@ contracts:
         use crate::indexer::tables::TableRuntime;
         use crate::manifest::contract::Table;
 
-        let table: Table = serde_yaml::from_str(
-            r#"
+        let table_yaml = r#"
 name: custody_balances
 columns:
   - name: user
@@ -2385,9 +2384,9 @@ events:
           - column: balance
             action: add
             value: $amount
-"#,
-        )
-        .expect("TransferBatch table YAML should parse");
+"#;
+        let table: Table =
+            serde_yaml::from_str(table_yaml).expect("TransferBatch table YAML should parse");
 
         let runtime = TableRuntime::new(table, "test_indexer", "ConditionalTokens");
         let mut accumulator = HashMap::new();
@@ -2397,6 +2396,29 @@ events:
             ("ids".to_string(), ColumnType::Array(Box::new(ColumnType::Uint256))),
             ("values".to_string(), ColumnType::Array(Box::new(ColumnType::Uint256))),
         ]);
+        let error = build_derived_tables_for_event(
+            "TransferBatch",
+            "test_indexer",
+            "ConditionalTokens",
+            "polygon",
+            &source_column_types,
+            &[runtime],
+            &mut accumulator,
+            &mut rollback_plans,
+        )
+        .expect_err("address predicates must fail during recovery-plan preparation");
+        let error = format!("{error:#}");
+        assert!(error.contains("predicate") && error.contains("address/bytes"), "{error}");
+
+        // Preserve the iterator/alias regression using a supported numeric
+        // predicate, without claiming it replaces the original burn filter.
+        let table: Table = serde_yaml::from_str(
+            &table_yaml.replace("$to != 0x0000000000000000000000000000000000000000", "$amount > 0"),
+        )
+        .unwrap();
+        let runtime = TableRuntime::new(table, "test_indexer", "ConditionalTokens");
+        let mut accumulator = HashMap::new();
+        let mut rollback_plans = HashMap::new();
         build_derived_tables_for_event(
             "TransferBatch",
             "test_indexer",
@@ -2407,7 +2429,7 @@ events:
             &mut accumulator,
             &mut rollback_plans,
         )
-        .expect("TransferBatch rollback metadata should compile");
+        .expect("numeric TransferBatch rollback metadata should compile");
 
         let rollback = &accumulator["polygon"][0].rollback_ops[0];
         assert_eq!(rollback.where_columns[0].1, "token_id");

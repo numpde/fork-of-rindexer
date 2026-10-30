@@ -215,6 +215,8 @@ async fn postgres_string_predicates_require_equivalent_recovery_or_startup_refus
 #[tokio::test]
 async fn postgres_constant_string_predicates_share_forward_recovery_semantics() {
     for (condition, matched) in [
+        ("0x00 == 0x0", true),
+        ("0x00 != 0x0", false),
         ("'READY' == 'ready'", true),
         ("'İ' == 'i\u{307}'", true),
         ("'001' == '1'", true),
@@ -246,10 +248,12 @@ async fn postgres_legacy_string_or_untyped_predicates_fail_without_changing_hist
         BlockChainWindow, EventTableInfo,
     };
     use crate::manifest::contract::{ColumnType, SetAction};
-    for mode in ["string", "untyped", "quoted"] {
+    for mode in ["string", "untyped", "quoted", "hex"] {
         let typed = mode != "untyped";
         let condition = if mode == "quoted" {
             "$value > 0 && 'READY' == 'ready'"
+        } else if mode == "hex" {
+            "$value > 0 && 0x00 == 0x0"
         } else {
             "$status == $wanted"
         };
@@ -344,6 +348,7 @@ async fn postgres_legacy_string_or_untyped_predicates_fail_without_changing_hist
                 && error.contains(match mode {
                     "string" => "string",
                     "untyped" => "type metadata",
+                    "hex" => "string",
                     _ => "quoted",
                 }),
             "{error}"
