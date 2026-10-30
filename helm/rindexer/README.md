@@ -170,3 +170,18 @@ ingress:
         - path: /
           pathType: Prefix
 ```
+
+## Fork deployment requirements
+
+Supply `image.digest=sha256:...` for an independently built and reviewed fork image.
+The default repository is `ghcr.io/numpde/fork-of-rindexer`; the chart does not
+publish an image or establish that this registry already contains your revision.
+Tags, including the previous `image.tag`, no longer select a deployment image.
+Use the root-Dockerfile image layout (`/app/rindexer`); the optional scratch runtime
+has a different entrypoint and its own maintained Compose launcher.
+
+Only one replica is admitted. Deployment upgrades use `Recreate` so the previous
+writer stops before replacement. This introduces upgrade downtime and does not
+fence other releases, hosts or handwritten writers; keep those stopped. Back up
+and reconcile database migrations before upgrading. Run the rendered chart checks
+with `python3 helm/rindexer/tests/deployment.py /path/to/helm`.
