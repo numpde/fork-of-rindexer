@@ -466,6 +466,11 @@ pub(super) fn collect_source_column_types(
             None => name,
         };
 
+        if input.storage_type() == "bytes32" && input.indexed == Some(true) {
+            source_column_types
+                .insert(crate::abi::raw_event_abi_column_name(&column), ColumnType::Bytes32);
+            continue;
+        }
         if let Some(components) = &input.components {
             if input.type_.starts_with("tuple[") {
                 collect_jsonb_tuple_element_types(

@@ -560,3 +560,24 @@ raw events, receipts and cursors unchanged; it does not substitute the reorging
 network's header at the same height. Keep a provider capable of serving retained
 source history when shared rows may require this enrichment. No additional
 migration or journal schema is introduced by this timestamp fix.
+
+## Recovery comparison domains and source storage
+
+Raw-history arithmetic recovery admits unsigned integer and Boolean comparisons.
+Boolean operands require `==` or `!=` with another Boolean. Numeric literals must
+fit an unsigned 256-bit integer. Signed event inputs and fractional, negative or
+out-of-range literals are refused because forward filtering can reject them
+according to operand values and order. Constant-only predicates retain the actual
+forward evaluator, and journal-only operations retain their applied-effect history.
+Use a verified unsigned/Boolean admission field or keep the aggregation outside
+raw-history reconstruction; changing a condition is not a historical migration.
+
+Missing array elements remain errors through left-to-right logical evaluation;
+a later true OR operand cannot admit a contribution that forward processing skipped.
+Rollback source casts preserve unsigned 64-bit values without narrowing to BIGINT.
+Fixed primitive arrays retain their native array representation. Indexed complex
+ABI inputs remain topic hashes, not recoverable arrays or tuples.
+
+Stop writers and reconcile previously affected raw events, derived state, journals,
+receipts and cursors together before reuse. These corrections do not repair old
+incorrect reversals or effects skipped under an earlier predicate.
