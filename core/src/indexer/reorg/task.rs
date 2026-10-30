@@ -471,21 +471,24 @@ impl ReversalSource<'_> {
     }
 
     fn variable_expression(&self, variable: &ConditionLeft<'_>) -> String {
+        let (expression, _) = self.resolve_variable(variable);
+        expression
+    }
+
+    /// Resolve a scalar SQL expression together with its declared source type.
+    fn resolve_variable(&self, variable: &ConditionLeft<'_>) -> (String, Option<ColumnType>) {
         let base = normalize_event_field(variable.base_name());
         if let Some(binding) = self.iterate.iter().find(|binding| binding.alias == base) {
-            return self.iterate_variable_expression(variable, binding);
+            return self.resolve_iterate_variable(variable, binding);
         }
 
         let mut field_parts = vec![variable.base_name()];
         let mut accessors = variable.accessors().iter().peekable();
-
-        // Non-array tuple fields are flattened in raw event tables, so
-        // `$data.amount` addresses the `data_amount` column directly.
+        // Non-array tuple fields are flattened into physical raw columns.
         while let Some(Accessor::Key(key)) = accessors.peek() {
             field_parts.push(key);
             accessors.next();
         }
-
         let field = field_parts.join(".");
         let db_column = event_field_to_db_column(&field);
         let mut expression = self.column(&field);
@@ -494,55 +497,63 @@ impl ReversalSource<'_> {
             .get(&db_column)
             .cloned()
             .or_else(|| ColumnType::from_tx_metadata_field(variable.base_name()));
+        let mut json_field = db_column;
+        let mut json_path = Vec::new();
 
         for accessor in accessors {
             match accessor {
-                Accessor::Index(index) => {
-                    match column_type {
-                        Some(ColumnType::Array(inner)) => {
-                            expression = self.dialect.array_element(expression, *index);
-                            column_type = Some(*inner);
-                        }
-                        _ => {
-                            // Tuple arrays are JSONB in PostgreSQL and use
-                            // zero-based JSON indexing rather than one-based
-                            // native SQL-array indexing.
-                            expression = match self.dialect {
-                                SqlDialect::Postgres => format!("({} -> {})", expression, index),
-                                SqlDialect::Clickhouse => expression,
-                            };
-                            column_type = None;
-                        }
+                Accessor::Index(index) => match column_type.take() {
+                    Some(ColumnType::Array(inner)) if json_path.is_empty() => {
+                        expression = self.dialect.array_element(expression, *index);
+                        column_type = Some(*inner);
                     }
-                }
+                    kind => {
+                        json_path.push(index.to_string());
+                        column_type = match kind {
+                            Some(ColumnType::Array(inner)) => Some(*inner),
+                            _ => None,
+                        };
+                    }
+                },
                 Accessor::Key(key) => {
-                    // Tuple arrays are JSONB in PostgreSQL and unsupported in
-                    // ClickHouse raw storage. Preserve their remaining path as
-                    // a JSON lookup when encountered after an array index.
-                    expression = match self.dialect {
-                        SqlDialect::Postgres => {
-                            format!("({} ->> '{}')", expression, key.replace('\'', "''"))
-                        }
-                        SqlDialect::Clickhouse => {
-                            format!("JSONExtractRaw({}, '{}')", expression, key.replace('\'', "''"))
-                        }
-                    };
-                    column_type = None;
+                    json_path.push(key.to_string());
+                    // JSON keys retain ABI spelling; indexes do not change the
+                    // component's declaration path in the type map.
+                    json_field.push('.');
+                    json_field.push_str(key);
+                    column_type = self.source_column_types.get(&json_field).cloned();
+                    if matches!(self.dialect, SqlDialect::Clickhouse) {
+                        expression = format!(
+                            "JSONExtractRaw({}, '{}')",
+                            expression,
+                            key.replace('\'', "''")
+                        );
+                    }
                 }
             }
         }
-
-        match column_type {
-            Some(column_type) => self.dialect.cast(expression, &column_type),
-            None => expression,
+        if !json_path.is_empty() && matches!(self.dialect, SqlDialect::Postgres) {
+            let path = json_path
+                .iter()
+                .map(|part| format!("'{}'", part.replace('\'', "''")))
+                .collect::<Vec<_>>()
+                .join(", ");
+            // Extract text only at the scalar leaf, then restore its ABI type.
+            // Using ->> at an intermediate key would discard nested JSON shape.
+            expression = format!("jsonb_extract_path_text({}, {})", expression, path);
         }
+        let expression = match &column_type {
+            Some(kind) => self.dialect.cast(expression, kind),
+            None => expression,
+        };
+        (expression, column_type)
     }
 
-    fn iterate_variable_expression(
+    fn resolve_iterate_variable(
         &self,
         variable: &ConditionLeft<'_>,
         binding: &RollbackIterateBinding,
-    ) -> String {
+    ) -> (String, Option<ColumnType>) {
         let mut expression = self.column(&binding.alias);
         let mut column_type = self.source_column_types.get(&binding.alias).cloned();
 
@@ -590,10 +601,11 @@ impl ReversalSource<'_> {
             }
         }
 
-        match column_type {
-            Some(column_type) => self.dialect.cast(expression, &column_type),
+        let expression = match &column_type {
+            Some(kind) => self.dialect.cast(expression, kind),
             None => expression,
-        }
+        };
+        (expression, column_type)
     }
 
     fn operand(&self, operand: &str) -> anyhow::Result<String> {

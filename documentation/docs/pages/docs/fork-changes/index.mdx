@@ -45,6 +45,12 @@ named-field predicate silently skipped its derived effect. Correcting the
 expression does not retry those committed receipts. Reindex affected canonical
 history with coordinated derived state, journals, receipts and cursors.
 
+PostgreSQL recovery resolves direct tuple-array paths such as
+`$items[0].amount`, `$items[0].info.tokenAmount` and `$items[0].amounts[0]`
+through JSONB, then casts the scalar leaf using its ABI type. This also applies
+to fixed-size tuple arrays. Intermediate objects and arrays retain their JSON
+shape until the leaf is extracted; native SQL arrays use their existing indexing.
+
 Journal recalculation quotes derived column identifiers in assignments, extrema
 updates and record-field access. Supported names such as `order` no longer fail
 PostgreSQL recovery after successful forward writes. Upgrade and retry a pending

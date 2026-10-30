@@ -68,6 +68,7 @@
 
 ### Bug fixes
 -------------------------------------------------
+- fix: PostgreSQL arithmetic recovery retains ABI leaf types for direct tuple-array predicates, including fixed arrays, nested named components and array-valued members. Numeric JSONB leaves are extracted and cast before comparison, preventing text-versus-integer failures during rollback; canonical replay remains receipt-idempotent.
 - fix: journal recovery quotes derived column identifiers consistently for `set`, `max` and `min`, including supported reserved names such as `order`. PostgreSQL recovery blocked by this syntax error can be retried after upgrading without renaming the column.
 - fix: named tuple predicates now retain ABI component names through nested tuples, dynamic/fixed arrays and `iterate` aliases. Valid matching events no longer commit raw rows and receipts while silently omitting derived effects. Reindex affected history with coordinated derived state, journals, receipts and cursors; replay alone cannot repair committed receipts.
 - fix: recovery predicates now evaluate `$rindexer_block_timestamp` as numeric Unix seconds, matching forward table conditions. Timestamps fetched for required table inputs are persisted in the raw PostgreSQL event transaction, including events filtered out of derived operations, so later recovery uses the original admission inputs.
