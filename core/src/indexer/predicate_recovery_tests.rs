@@ -403,3 +403,41 @@ async fn postgres_journal_only_string_predicate_remains_recoverable() {
     drop(callback);
     fixture.finish().await;
 }
+
+#[tokio::test]
+async fn readiness_missing_array_element_must_not_admit_a_reversal() {
+    let fixture = arithmetic_fixture(
+        json!([
+            {"name":"values","type":"uint256[]","indexed":false},
+            {"name":"enabled","type":"bool","indexed":false}
+        ]),
+        "$values[0] > 0 || $enabled == true",
+        json!([]),
+    )
+    .await;
+    let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+    callback(vec![predicate_event(
+        &fixture,
+        99,
+        10,
+        vec![
+            DynSolValue::Array(vec![DynSolValue::Uint(U256::from(1), 256)]),
+            DynSolValue::Bool(true),
+        ],
+    )])
+    .await
+    .unwrap();
+    callback(vec![predicate_event(
+        &fixture,
+        100,
+        5,
+        vec![DynSolValue::Array(vec![]), DynSolValue::Bool(true)],
+    )])
+    .await
+    .unwrap();
+    assert_eq!(fixture.position().await, (2, "10".into(), "100".into()));
+    super::recovery_boundary_tests::rollback(&fixture, 100, 100).await.unwrap();
+    assert_canonical_amount(&fixture, "10").await;
+    drop(callback);
+    fixture.finish().await;
+}
