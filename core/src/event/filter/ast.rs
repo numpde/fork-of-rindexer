@@ -254,14 +254,34 @@ impl<'a> Expression<'a> {
         })
     }
 
-    pub(crate) fn to_sql_event_condition<F>(&self, event_variable: F) -> Option<String>
+    /// SQL NULL represents a forward path-resolution error, not a false operand.
+    /// CASE preserves the evaluator's left-to-right error and short-circuit rules.
+    pub(crate) fn to_sql_recovery_condition<F>(&self, event_variable: F) -> Option<String>
     where
         F: Fn(&ConditionLeft<'_>) -> String,
     {
         if self.has_table_references() {
             return None;
         }
-        Some(self.to_sql_condition_with(&event_variable))
+        Some(self.recovery_sql(&event_variable))
+    }
+
+    fn recovery_sql<F>(&self, variable_to_sql: &F) -> String
+    where
+        F: Fn(&ConditionLeft<'_>) -> String,
+    {
+        match self {
+            Self::Condition(_) => self.to_sql_condition_with(variable_to_sql),
+            Self::Not(inner) => format!("NOT ({})", inner.recovery_sql(variable_to_sql)),
+            Self::Logical { left, operator, right } => {
+                let left = left.recovery_sql(variable_to_sql);
+                let right = right.recovery_sql(variable_to_sql);
+                match operator {
+                    LogicalOperator::And => format!("(CASE ({left}) WHEN TRUE THEN ({right}) WHEN FALSE THEN FALSE ELSE NULL END)"),
+                    LogicalOperator::Or => format!("(CASE ({left}) WHEN TRUE THEN TRUE WHEN FALSE THEN ({right}) ELSE NULL END)"),
+                }
+            }
+        }
     }
 
     pub(crate) fn to_sql_condition_with<F>(&self, variable_to_sql: &F) -> String
