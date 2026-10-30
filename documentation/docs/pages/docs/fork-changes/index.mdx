@@ -45,6 +45,11 @@ named-field predicate silently skipped its derived effect. Correcting the
 expression does not retry those committed receipts. Reindex affected canonical
 history with coordinated derived state, journals, receipts and cursors.
 
+Journal recalculation quotes derived column identifiers in assignments, extrema
+updates and record-field access. Supported names such as `order` no longer fail
+PostgreSQL recovery after successful forward writes. Upgrade and retry a pending
+rollback caused by this syntax error; the column does not need to be renamed.
+
 ## Physical destination ownership during recovery
 
 A derived destination participating in reorg recovery requires one manifest

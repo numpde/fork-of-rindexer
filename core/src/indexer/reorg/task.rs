@@ -1429,7 +1429,7 @@ impl ReorgTask {
                                  ORDER BY where_key, block_number DESC, tx_index DESC, log_index DESC, network COLLATE \"C\" DESC, id DESC \
                              ) sub \
                              WHERE {} {}",
-                            dt.full_table_name, jc.derived_column, jc.derived_column, jc.derived_column,
+                            dt.full_table_name, quote_pg_ident(&jc.derived_column), jc.derived_column, quote_pg_ident(&jc.derived_column),
                             dt.full_table_name, jc.derived_column, network_filter,
                             Self::journal_where_key_join(&jc.where_columns, "dt", "sub"),
                             network_join,
@@ -1450,7 +1450,7 @@ impl ReorgTask {
                              ) sub \
                              WHERE {} {}",
                             dt.full_table_name,
-                            jc.derived_column,
+                            quote_pg_ident(&jc.derived_column),
                             agg_fn,
                             dt.full_table_name,
                             jc.derived_column,
@@ -1518,7 +1518,10 @@ impl ReorgTask {
 
                     let ch_update = format!(
                         "ALTER TABLE {} UPDATE {} = {} WHERE {} SETTINGS mutations_sync = 1",
-                        dt.full_table_name, jc.derived_column, ch_subquery, ch_network,
+                        dt.full_table_name,
+                        quote_ch_ident(&jc.derived_column),
+                        ch_subquery,
+                        ch_network,
                     );
 
                     ch.execute(&ch_update).await.with_context(|| {
