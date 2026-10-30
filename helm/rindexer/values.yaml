@@ -1,7 +1,7 @@
 replicaCount: 1
 image:
-  repository: ghcr.io/joshstevens19/rindexer
-  tag: "latest"
+  repository: ghcr.io/numpde/fork-of-rindexer
+  digest: ""  # Required: sha256 digest of the reviewed fork image
   pullPolicy: IfNotPresent
 
 service:

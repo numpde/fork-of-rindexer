@@ -597,3 +597,17 @@ do not establish canonical readiness during a same-height replacement. Recovery
 status clears after successful rollback releases the barrier; callback failures
 retain their separate terminal status. Update exhaustive status consumers and
 monitor recovery separately from normal catch-up, which can still return HTTP 200.
+
+## Helm image admission and writer replacement
+
+The chart requires `image.digest=sha256:...` and defaults to the fork image
+repository. Select a reviewed image using the root Dockerfile's `/app/rindexer`
+layout; the chart does not build or publish that image. Existing `image.tag`
+values no longer select the image. Installation fails until a digest is supplied.
+
+Keep `replicaCount: 1`. Fractional and Boolean counts are rejected. Normal
+Deployment upgrades use `Recreate`, introducing downtime while the old writer
+stops. Manual or forced pod deletion and writers in other releases or hosts
+require separate coordination; this strategy does not provide distributed writer
+fencing. See the [chart instructions](https://github.com/numpde/fork-of-rindexer/blob/master/helm/rindexer/README.md)
+and [Kubernetes rollout rules](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/#recreate-deployment).
