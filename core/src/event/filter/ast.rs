@@ -214,6 +214,19 @@ impl<'a> Expression<'a> {
         }
     }
 
+    /// Includes unquoted hexadecimal literals, which the parser represents as strings.
+    pub(crate) fn has_string_literals(&self) -> bool {
+        match self {
+            Self::Condition(condition) => {
+                condition.left.has_string_literals() || condition.right.has_string_literals()
+            }
+            Self::Logical { left, right, .. } => {
+                left.has_string_literals() || right.has_string_literals()
+            }
+            Self::Not(inner) => inner.has_string_literals(),
+        }
+    }
+
     pub(crate) fn visit_variables(&self, visitor: &mut impl FnMut(&ConditionLeft<'a>)) {
         match self {
             Self::Condition(condition) => {
@@ -286,6 +299,16 @@ impl<'a> Expression<'a> {
 }
 
 impl<'a> ArithmeticExpr<'a> {
+    fn has_string_literals(&self) -> bool {
+        match self {
+            Self::Literal(LiteralValue::Str(_)) => true,
+            Self::Variable(_) | Self::Literal(_) => false,
+            Self::Binary { left, right, .. } => {
+                left.has_string_literals() || right.has_string_literals()
+            }
+        }
+    }
+
     fn visit_variables(&self, visitor: &mut impl FnMut(&ConditionLeft<'a>)) {
         match self {
             Self::Variable(variable) => visitor(variable),

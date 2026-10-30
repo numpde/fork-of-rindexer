@@ -2618,7 +2618,7 @@ async fn test_reorg_reversal_with_condition() {
 
 // ---------------------------------------------------------------------------
 // Regression: ERC-1155 TransferBatch rollbacks must expand `ids` and `values`
-// pairwise and compile manifest `$from` / `$to` conditions against raw events.
+// pairwise and compile boolean admission predicates against raw events.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -2641,6 +2641,8 @@ async fn test_reorg_reversal_transfer_batch_iterate() {
              \"to\" CHAR(42) NOT NULL,
              ids VARCHAR(78)[] NOT NULL,
              values VARCHAR(78)[] NOT NULL,
+             from_enabled BOOLEAN NOT NULL,
+             to_enabled BOOLEAN NOT NULL,
              tx_hash CHAR(66) NOT NULL,
              block_number NUMERIC NOT NULL,
              block_hash CHAR(66) NOT NULL,
@@ -2675,6 +2677,8 @@ async fn test_reorg_reversal_transfer_batch_iterate() {
              `to` FixedString(42),
              ids Array(UInt256),
              values Array(UInt256),
+             from_enabled UInt8,
+             to_enabled UInt8,
              tx_hash FixedString(66),
              block_number UInt64,
              block_hash FixedString(66),
@@ -2707,10 +2711,10 @@ async fn test_reorg_reversal_transfer_batch_iterate() {
     let block_hash = zero_tx;
     pg.execute(
         "INSERT INTO test_schema.erc1155_transfer_batch
-         (operator, \"from\", \"to\", ids, values, tx_hash, block_number,
+         (operator, \"from\", \"to\", ids, values, from_enabled, to_enabled, tx_hash, block_number,
           block_hash, network, tx_index, log_index)
          VALUES ($1, $2, $3, ARRAY['101', '202']::VARCHAR(78)[],
-                 ARRAY['7', '11']::VARCHAR(78)[],
+                 ARRAY['7', '11']::VARCHAR(78)[], TRUE, TRUE,
                  $4, $5, $6, $7, 0, '0')",
         &[&sender, &sender, &recipient, &zero_tx, &Decimal::from(block2), &block_hash, &network],
     )
@@ -2718,9 +2722,9 @@ async fn test_reorg_reversal_transfer_batch_iterate() {
     .unwrap();
     ch.execute(&format!(
         "INSERT INTO test_schema.erc1155_transfer_batch
-         (operator, `from`, `to`, ids, values, tx_hash, block_number, block_hash,
+         (operator, `from`, `to`, ids, values, from_enabled, to_enabled, tx_hash, block_number, block_hash,
           network, tx_index, log_index)
-         VALUES ('{sender}', '{sender}', '{recipient}', [101, 202], [7, 11],
+         VALUES ('{sender}', '{sender}', '{recipient}', [101, 202], [7, 11], 1, 1,
                  '{zero_tx}', {block2}, '{block_hash}', '{network}', 0, 0)"
     ))
     .await
@@ -2733,9 +2737,9 @@ async fn test_reorg_reversal_transfer_batch_iterate() {
         let values = amounts.map(|amount| amount.to_string()).to_vec();
         pg.execute(
             "INSERT INTO test_schema.erc1155_transfer_batch
-             (operator, \"from\", \"to\", ids, values, tx_hash, block_number,
+             (operator, \"from\", \"to\", ids, values, from_enabled, to_enabled, tx_hash, block_number,
               block_hash, network, tx_index, log_index)
-             VALUES ($1, $2, $3, ARRAY['101', '202']::VARCHAR(78)[], $4,
+             VALUES ($1, $2, $3, ARRAY['101', '202']::VARCHAR(78)[], $4, FALSE, TRUE,
                      $5, $6, $5, $7, 0, $8)",
             &[
                 &sender,
@@ -2752,9 +2756,9 @@ async fn test_reorg_reversal_transfer_batch_iterate() {
         .unwrap();
         ch.execute(&format!(
             "INSERT INTO test_schema.erc1155_transfer_batch
-             (operator, `from`, `to`, ids, values, tx_hash, block_number, block_hash,
+             (operator, `from`, `to`, ids, values, from_enabled, to_enabled, tx_hash, block_number, block_hash,
               network, tx_index, log_index)
-             VALUES ('{sender}', '{zero_address}', '{user}', [101, 202], [{}, {}],
+             VALUES ('{sender}', '{zero_address}', '{user}', [101, 202], [{}, {}], 0, 1,
                      '{zero_tx}', {}, '{block_hash}', '{network}', 0, {log_index})",
             amounts[0],
             amounts[1],
@@ -2805,6 +2809,8 @@ async fn test_reorg_reversal_transfer_batch_iterate() {
     let source_column_types = HashMap::from([
         ("from".to_string(), ColumnType::Address),
         ("to".to_string(), ColumnType::Address),
+        ("from_enabled".to_string(), ColumnType::Bool),
+        ("to_enabled".to_string(), ColumnType::Bool),
         ("ids".to_string(), ColumnType::Array(Box::new(ColumnType::Uint256))),
         ("values".to_string(), ColumnType::Array(Box::new(ColumnType::Uint256))),
     ]);
@@ -2830,13 +2836,12 @@ async fn test_reorg_reversal_transfer_batch_iterate() {
         )
         .unwrap()
     };
+    // The fixture records explicit admission flags: canonical mints do not
+    // debit the zero address, while the orphan transfer enables both effects.
+    // Address predicates themselves are refused by typed recovery admission.
     let rollback_ops = vec![
-        rollback_op(
-            "from",
-            SetAction::Subtract,
-            "$from != 0x0000000000000000000000000000000000000000",
-        ),
-        rollback_op("to", SetAction::Add, "$to != 0x0000000000000000000000000000000000000000"),
+        rollback_op("from", SetAction::Subtract, "$from_enabled == true"),
+        rollback_op("to", SetAction::Add, "$to_enabled == true"),
     ];
     let derived_table = "test_schema.custody_balances".to_string();
     let mut rollback_plan = DerivedTableRollbackPlan::default();

@@ -46,6 +46,12 @@ field with an equivalent predicate, or maintain the aggregation outside this
 raw-history recovery path. Journal-only operations use their recorded applied
 contributions and do not need this predicate reevaluation.
 
+ABI `address`, `bytes`, and `bytes32` predicate inputs are also rejected. Forward
+filters evaluate their hexadecimal strings using value-dependent numeric
+conversion; native SQL address or byte comparisons do not establish equivalent
+admission. This restriction applies to variable-to-variable comparisons too,
+even when the predicate contains no literals.
+
 Every referenced event input must have a known scalar source type. Arrays must
 select a supported scalar leaf. Public callers of conditional arithmetic rollback
 tasks must populate `DerivedTableRollbackPlan::try_add_operation` with the source
@@ -63,8 +69,13 @@ filter evaluator as forward processing, preserving Unicode and numeric-string
 semantics without database collation assumptions. Constructors use the filter
 parser, so quoted literal text can include SQL keywords or punctuation as data;
 unparseable SQL is rejected rather than passed to a SQL token blacklist.
-Quoted syntax in event-dependent raw-history predicates remains unsupported,
-including constant string clauses combined with an event condition. Use
+String literals and quoted syntax in event-dependent raw-history predicates
+remain unsupported, including constant string clauses combined with an event
+condition. Validation inspects the parsed expression, so unquoted hexadecimal
+literals are included: `$value > 0 && 0x00 == 0x0` is rejected even though it has
+no quote characters. Forward evaluation treats both hex values as numeric zero,
+while the SQL strings would differ. Fully constant `0x00 == 0x0` still evaluates
+to true using the forward evaluator. Use
 unquoted scalar paths and typed numeric/boolean values only when the rewrite
 preserves the intended meaning. Fully constant predicates and journal-only
 predicates retain their separate evaluation paths.
