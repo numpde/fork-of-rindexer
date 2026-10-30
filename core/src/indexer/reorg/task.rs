@@ -113,7 +113,8 @@ pub struct DerivedTableRollbackOp {
     pub where_columns: Vec<(String, String)>,
     /// Columns to reverse
     pub columns: Vec<DerivedColumnRollback>,
-    /// Optional SQL condition re-evaluated against event data.
+    /// Optional event-filter expression re-evaluated against event data.
+    /// Execution requires the filter grammar; raw SQL is not supported.
     pub condition: Option<String>,
 }
 
@@ -681,13 +682,11 @@ impl ReversalSource<'_> {
 }
 
 fn render_reorg_condition(condition: &str, source: &ReversalSource<'_>) -> anyhow::Result<String> {
-    let expression = match parse_filter_expression(condition) {
-        Ok(expression) => expression,
-        Err(_) => {
-            validate_sql_condition(condition)?;
-            return Ok(condition.to_string());
-        }
-    };
+    let expression = parse_filter_expression(condition).map_err(|error| {
+        anyhow::anyhow!(
+            "Cannot reconstruct recovery predicate {condition:?}: use a supported event filter expression with event variables and filter operators such as ==; legacy SQL cannot establish forward filter semantics. Parse error: {error}"
+        )
+    })?;
     // Old stored history and public task callers can bypass current manifest
     // admission. Stop before event deletion instead of guessing integer semantics.
     anyhow::ensure!(

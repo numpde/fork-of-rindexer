@@ -89,6 +89,16 @@ arithmetic, insert-only filters and existing value expressions retain their
 behavior; insert-only recovery deletes rows by provenance without reevaluating
 the filter.
 
+Public and legacy `DerivedTableRollbackOp.condition` values must also parse as
+event-filter expressions. Recovery no longer accepts an unparsed raw SQL
+fallback, even when the SQL token safety validator accepts it. For example,
+`value = 1` must be expressed as `$value == 1`. SQL casts such as
+`value::NUMERIC > 7` must be rewritten using the supported event field and its
+source type; verify equivalence rather than deleting a cast blindly. Arithmetic
+such as `value / 1000 = 1` cannot bypass the restriction by using SQL equality.
+Parse failures stop recovery with the offending predicate and a filter-syntax
+instruction. Token safety alone does not establish forward evaluation semantics.
+
 Legacy recovery plans containing arithmetic now return an explicit error before
 permanent raw data, receipts, effects or cursors change. Verify the rewrite and
 source metadata before retrying recovery; changing a predicate to a different
