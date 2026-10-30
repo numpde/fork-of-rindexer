@@ -560,3 +560,12 @@ raw events, receipts and cursors unchanged; it does not substitute the reorging
 network's header at the same height. Keep a provider capable of serving retained
 source history when shared rows may require this enrichment. No additional
 migration or journal schema is introduced by this timestamp fix.
+
+## Recovery health
+
+Subscription health reports `recovering` and HTTP 503 while recovery has retired
+callbacks or holds/awaits the network writer barrier. Cursor height and zero lag
+do not establish canonical readiness during a same-height replacement. Recovery
+status clears after successful rollback releases the barrier; callback failures
+retain their separate terminal status. Update exhaustive status consumers and
+monitor recovery separately from normal catch-up, which can still return HTTP 200.

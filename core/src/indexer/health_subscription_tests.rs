@@ -158,3 +158,25 @@ async fn postgres_health_does_not_complete_a_finite_query_before_its_end_block()
     }
     fixture.finish().await;
 }
+
+#[tokio::test]
+async fn readiness_health_exposes_recovery_at_the_same_height() {
+    let fixture = Fixture::new().await;
+    let registry = registry(&fixture, Arc::new(MockChainProvider::new(1).with_block_number(100)));
+    let table = cursor_table(&fixture);
+    for detail in &registry.events[0].contract.details {
+        fixture.client.execute(&format!("INSERT INTO rindexer_internal.{table} (network,cursor_key,last_synced_block) VALUES ('ethereum',$1,98)"), &[&detail.cursor_key()]).await.unwrap();
+    }
+    assert_eq!(response(&fixture, &registry).await.0, StatusCode::OK);
+    let barrier = crate::indexer::reorg::event_writer_barrier("ethereum");
+    let guard = barrier.write().await;
+    let (status, body) = response(&fixture, &registry).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    for subscription in body["indexing"]["subscriptions"].as_array().unwrap() {
+        assert_eq!(subscription["lag_blocks"], 0);
+        assert_eq!(subscription["status"], "recovering");
+    }
+    drop(guard);
+    assert_eq!(response(&fixture, &registry).await.0, StatusCode::OK);
+    fixture.finish().await;
+}

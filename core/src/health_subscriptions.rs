@@ -33,6 +33,7 @@ pub struct SubscriptionIdentity {
 #[serde(rename_all = "snake_case")]
 pub enum SubscriptionStatus {
     WaitingForCheckpoint,
+    Recovering,
     Syncing,
     Live,
     Completed,
@@ -197,6 +198,8 @@ pub(super) async fn snapshot(
         });
         let status = if failed {
             SubscriptionStatus::Failed
+        } else if crate::indexer::reorg::recovery_pending(&identity.network) {
+            SubscriptionStatus::Recovering
         } else if unavailable {
             SubscriptionStatus::Unavailable
         } else if last.is_none() {
@@ -238,7 +241,12 @@ pub(super) async fn snapshot(
     let status = if client.is_none() {
         HealthStatusType::NotConfigured
     } else if states.iter().any(|state| {
-        matches!(state.status, SubscriptionStatus::Failed | SubscriptionStatus::Unavailable)
+        matches!(
+            state.status,
+            SubscriptionStatus::Failed
+                | SubscriptionStatus::Unavailable
+                | SubscriptionStatus::Recovering
+        )
     }) {
         HealthStatusType::Unhealthy
     } else if states
