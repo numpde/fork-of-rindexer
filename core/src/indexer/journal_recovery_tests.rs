@@ -490,3 +490,62 @@ async fn postgres_journal_key_schema_rejects_nonempty_legacy_journal() {
     assert_eq!(count, 1, "failed admission preserves legacy evidence for reviewed recovery");
     fixture.finish().await;
 }
+
+#[tokio::test]
+async fn postgres_reserved_journal_column_restores_set_max_and_min() {
+    for (action, orphan) in [("set", 20u64), ("max", 20), ("min", 5)] {
+        let mut definition = serde_json::to_value(params().event).unwrap();
+        definition["inputs"][0]["type"] = json!("uint64");
+        let fixture = Fixture::with_table(definition, "Contract", json!({"name":"totals",
+            "columns":[{"name":"id","type":"uint64"},{"name":"order","type":"uint64","default":"0"}],
+            "events":[{"event":"Value","operations":[{"type":"upsert","where":{"id":"1"},
+                "set":[{"column":"order","action":action,"value":"$value"}]}]}]})).await;
+        let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+        callback(vec![at(&fixture, "ethereum", 99, B256::repeat_byte(99), 10)]).await.unwrap();
+        let snapshot: serde_json::Value = fixture
+            .client
+            .query_one(
+                &format!("SELECT to_jsonb(t) FROM {} t", fixture.params.tables[0].full_table_name),
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        callback(vec![at(&fixture, "ethereum", 100, B256::repeat_byte(100), orphan)])
+            .await
+            .unwrap();
+        let result = super::recovery_boundary_tests::rollback(&fixture, 100, 100).await;
+        assert!(
+            result.is_ok(),
+            "{action} recovery must quote a supported reserved column: {result:#?}"
+        );
+        let restored: serde_json::Value = fixture
+            .client
+            .query_one(
+                &format!("SELECT to_jsonb(t) FROM {} t", fixture.params.tables[0].full_table_name),
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(restored, snapshot, "{action} must restore value and complete provenance");
+        let raw: i64 = fixture
+            .client
+            .query_one(
+                &format!("SELECT count(*) FROM {}", fixture.params.sql_event_table_name),
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        let receipts: i64 = fixture
+            .client
+            .query_one("SELECT count(*) FROM rindexer_internal.event_applications", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!((raw, receipts), (1, 1));
+        drop(callback);
+        fixture.finish().await;
+    }
+}
