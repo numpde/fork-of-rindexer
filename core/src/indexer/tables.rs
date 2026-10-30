@@ -2692,6 +2692,11 @@ async fn extract_value_from_event_async(
 /// 3. For array access, components describe each element's structure
 /// 4. For named field access after arrays, use components to find tuple position
 fn resolve_field_path(field_path: &str, log_params: &[LogParam]) -> Option<DynSolValue> {
+    resolve_log_param(field_path, log_params).map(|param| param.value)
+}
+
+/// Resolve a decoded value together with the ABI names needed by tuple consumers.
+fn resolve_log_param(field_path: &str, log_params: &[LogParam]) -> Option<LogParam> {
     use alloy::json_abi::Param;
 
     // Parse the path into segments, separating array indices
@@ -2774,7 +2779,11 @@ fn resolve_field_path(field_path: &str, log_params: &[LogParam]) -> Option<DynSo
         }
     }
 
-    Some(current_value)
+    Some(LogParam {
+        name: field_path.to_string(),
+        value: current_value,
+        components: current_components,
+    })
 }
 
 /// Parses a field path into segments, grouping field paths together and separating array indices.
@@ -3301,14 +3310,14 @@ fn literal_to_wrapper(value: &str, column_type: &ColumnType) -> EthereumSqlTypeW
 fn log_params_to_json(log_params: &[LogParam]) -> Value {
     let mut map = serde_json::Map::new();
     for param in log_params {
-        let value = dyn_sol_value_to_json(&param.value);
+        let value = dyn_sol_value_to_json(&param.value, &param.components);
         map.insert(param.name.clone(), value);
     }
     Value::Object(map)
 }
 
 /// Converts a DynSolValue to a JSON Value for filter evaluation.
-fn dyn_sol_value_to_json(value: &DynSolValue) -> Value {
+fn dyn_sol_value_to_json(value: &DynSolValue, components: &[alloy::json_abi::Param]) -> Value {
     match value {
         DynSolValue::Address(addr) => json!(format!("{:?}", addr)),
         DynSolValue::Uint(val, _) => {
@@ -3324,17 +3333,31 @@ fn dyn_sol_value_to_json(value: &DynSolValue) -> Value {
         DynSolValue::String(s) => json!(s),
         DynSolValue::Bytes(b) => json!(format!("0x{}", hex::encode(b))),
         DynSolValue::FixedBytes(b, _) => json!(format!("0x{}", hex::encode(b))),
-        DynSolValue::Tuple(values) => {
-            // Convert tuple to object with index keys
-            let obj: serde_json::Map<String, Value> = values
-                .iter()
-                .enumerate()
-                .map(|(i, v)| (i.to_string(), dyn_sol_value_to_json(v)))
-                .collect();
-            Value::Object(obj)
+        DynSolValue::Tuple(values) | DynSolValue::CustomStruct { tuple: values, .. } => {
+            Value::Object(
+                values
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| {
+                        let component = components.get(index);
+                        let name = component
+                            .filter(|component| !component.name.is_empty())
+                            .map(|component| component.name.clone())
+                            .unwrap_or_else(|| index.to_string());
+                        let nested = component
+                            .map(|component| component.components.as_slice())
+                            .unwrap_or(&[]);
+                        (name, dyn_sol_value_to_json(value, nested))
+                    })
+                    .collect(),
+            )
         }
-        DynSolValue::Array(values) => {
-            json!(values.iter().map(dyn_sol_value_to_json).collect::<Vec<_>>())
+        DynSolValue::Array(values) | DynSolValue::FixedArray(values) => {
+            // Array dimensions preserve the element's ABI component names.
+            json!(values
+                .iter()
+                .map(|value| dyn_sol_value_to_json(value, components))
+                .collect::<Vec<_>>())
         }
         _ => json!(format!("{:?}", value)),
     }
@@ -3393,21 +3416,14 @@ fn expand_iterate_bindings(
     }
 
     // Extract arrays for each binding
-    let mut arrays: Vec<(&IterateBinding, Vec<DynSolValue>)> = Vec::new();
+    let mut arrays: Vec<(&IterateBinding, Vec<DynSolValue>, Vec<alloy::json_abi::Param>)> =
+        Vec::new();
 
     for binding in bindings {
-        // Find the field in log_params (supports nested paths like "data.ids")
-        let value = if binding.array_field.contains('.') {
-            let (root, rest) = binding.array_field.split_once('.')?;
-            let param = log_params.iter().find(|p| p.name == root)?;
-            param.get_param_value(rest)?
-        } else {
-            let param = log_params.iter().find(|p| p.name == binding.array_field)?;
-            param.value.clone()
-        };
+        let param = resolve_log_param(&binding.array_field, log_params)?;
 
         // Extract array elements
-        let elements = match value {
+        let elements = match param.value {
             DynSolValue::Array(arr) | DynSolValue::FixedArray(arr) => arr,
             _ => {
                 debug!("iterate binding '{}' references non-array field", binding.array_field);
@@ -3415,7 +3431,7 @@ fn expand_iterate_bindings(
             }
         };
 
-        arrays.push((binding, elements));
+        arrays.push((binding, elements, param.components));
     }
 
     // Verify all arrays have the same length
@@ -3424,7 +3440,7 @@ fn expand_iterate_bindings(
     }
 
     let expected_len = arrays[0].1.len();
-    for (binding, arr) in &arrays {
+    for (binding, arr, _) in &arrays {
         if arr.len() != expected_len {
             debug!(
                 "iterate binding '{}' has length {} but expected {} (arrays must have equal length)",
@@ -3444,9 +3460,12 @@ fn expand_iterate_bindings(
         let mut expanded_params = log_params.to_vec();
 
         // Add synthetic params for each binding
-        for (binding, arr) in &arrays {
-            let element_value = arr[idx].clone();
-            expanded_params.push(LogParam::new(binding.alias.clone(), element_value));
+        for (binding, arr, components) in &arrays {
+            expanded_params.push(LogParam {
+                name: binding.alias.clone(),
+                value: arr[idx].clone(),
+                components: components.clone(),
+            });
         }
 
         result.push(expanded_params);
@@ -5994,13 +6013,13 @@ mod tests {
     #[test]
     fn test_dyn_sol_value_to_json_address() {
         let addr: Address = "0x1111111111111111111111111111111111111111".parse().unwrap();
-        let result = dyn_sol_value_to_json(&DynSolValue::Address(addr));
+        let result = dyn_sol_value_to_json(&DynSolValue::Address(addr), &[]);
         assert_eq!(result, json!("0x1111111111111111111111111111111111111111"));
     }
 
     #[test]
     fn test_dyn_sol_value_to_json_uint_small() {
-        let result = dyn_sol_value_to_json(&DynSolValue::Uint(U256::from(42u64), 256));
+        let result = dyn_sol_value_to_json(&DynSolValue::Uint(U256::from(42u64), 256), &[]);
         assert_eq!(result, json!(42u64));
     }
 
@@ -6008,14 +6027,14 @@ mod tests {
     fn test_dyn_sol_value_to_json_uint_large() {
         // Value larger than u64::MAX should be serialized as string
         let large = U256::from(u64::MAX) + U256::from(1u64);
-        let result = dyn_sol_value_to_json(&DynSolValue::Uint(large, 256));
+        let result = dyn_sol_value_to_json(&DynSolValue::Uint(large, 256), &[]);
         assert_eq!(result, json!(large.to_string()));
     }
 
     #[test]
     fn test_dyn_sol_value_to_json_uint_boundary() {
         // Exactly u64::MAX — fits, so emitted as number
-        let result = dyn_sol_value_to_json(&DynSolValue::Uint(U256::from(u64::MAX), 256));
+        let result = dyn_sol_value_to_json(&DynSolValue::Uint(U256::from(u64::MAX), 256), &[]);
         assert_eq!(result, json!(u64::MAX));
     }
 
@@ -6023,25 +6042,25 @@ mod tests {
     fn test_dyn_sol_value_to_json_int() {
         use alloy::primitives::I256;
         let neg = I256::try_from(-100i64).unwrap();
-        let result = dyn_sol_value_to_json(&DynSolValue::Int(neg, 256));
+        let result = dyn_sol_value_to_json(&DynSolValue::Int(neg, 256), &[]);
         assert_eq!(result, json!(neg.to_string()));
     }
 
     #[test]
     fn test_dyn_sol_value_to_json_bool() {
-        assert_eq!(dyn_sol_value_to_json(&DynSolValue::Bool(true)), json!(true));
-        assert_eq!(dyn_sol_value_to_json(&DynSolValue::Bool(false)), json!(false));
+        assert_eq!(dyn_sol_value_to_json(&DynSolValue::Bool(true), &[]), json!(true));
+        assert_eq!(dyn_sol_value_to_json(&DynSolValue::Bool(false), &[]), json!(false));
     }
 
     #[test]
     fn test_dyn_sol_value_to_json_string() {
-        let result = dyn_sol_value_to_json(&DynSolValue::String("hello".to_string()));
+        let result = dyn_sol_value_to_json(&DynSolValue::String("hello".to_string()), &[]);
         assert_eq!(result, json!("hello"));
     }
 
     #[test]
     fn test_dyn_sol_value_to_json_bytes() {
-        let result = dyn_sol_value_to_json(&DynSolValue::Bytes(vec![0xde, 0xad]));
+        let result = dyn_sol_value_to_json(&DynSolValue::Bytes(vec![0xde, 0xad]), &[]);
         assert_eq!(result, json!("0xdead"));
     }
 
@@ -6052,7 +6071,7 @@ mod tests {
             0xbe, 0xef, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
             0, 0, 0, 0, 0,
         ]);
-        let result = dyn_sol_value_to_json(&DynSolValue::FixedBytes(word, 2));
+        let result = dyn_sol_value_to_json(&DynSolValue::FixedBytes(word, 2), &[]);
         assert_eq!(result, json!(format!("0x{}", hex::encode(&word[..]))));
     }
 
@@ -6062,7 +6081,7 @@ mod tests {
             DynSolValue::Uint(U256::from(1u64), 256),
             DynSolValue::Bool(true),
         ]);
-        let result = dyn_sol_value_to_json(&tuple);
+        let result = dyn_sol_value_to_json(&tuple, &[]);
         if let Value::Object(map) = result {
             assert_eq!(map["0"], json!(1u64));
             assert_eq!(map["1"], json!(true));
@@ -6077,7 +6096,7 @@ mod tests {
             DynSolValue::Uint(U256::from(10u64), 256),
             DynSolValue::Uint(U256::from(20u64), 256),
         ]);
-        let result = dyn_sol_value_to_json(&arr);
+        let result = dyn_sol_value_to_json(&arr, &[]);
         assert_eq!(result, json!([10u64, 20u64]));
     }
 

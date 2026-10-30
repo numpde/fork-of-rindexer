@@ -34,6 +34,17 @@ apply to its storage and configuration:
 These notes retain their existing URLs. Their place in this section identifies
 them as maintained fork documentation.
 
+## Compound event predicates
+
+Forward table predicates retain ABI component names through nested tuples,
+dynamic/fixed arrays and `iterate` aliases. For example, `$data.info.amount`
+and `$item.amount` address the same named components used by recovery planning.
+
+Older callbacks could commit raw rows and application receipts while a valid
+named-field predicate silently skipped its derived effect. Correcting the
+expression does not retry those committed receipts. Reindex affected canonical
+history with coordinated derived state, journals, receipts and cursors.
+
 ## Physical destination ownership during recovery
 
 A derived destination participating in reorg recovery requires one manifest

@@ -68,6 +68,7 @@
 
 ### Bug fixes
 -------------------------------------------------
+- fix: named tuple predicates now retain ABI component names through nested tuples, dynamic/fixed arrays and `iterate` aliases. Valid matching events no longer commit raw rows and receipts while silently omitting derived effects. Reindex affected history with coordinated derived state, journals, receipts and cursors; replay alone cannot repair committed receipts.
 - fix: recovery predicates now evaluate `$rindexer_block_timestamp` as numeric Unix seconds, matching forward table conditions. Timestamps fetched for required table inputs are persisted in the raw PostgreSQL event transaction, including events filtered out of derived operations, so later recovery uses the original admission inputs.
 - fix: network reorg recovery now resolves the rollback endpoint after draining admitted writers, including event rows committed ahead of the detecting subscription. Raw rows, application receipts, journals, arithmetic and insert-only effects use the same closed interval so faster subscriptions cannot retain receipts for erased effects.
 - fix: keep configured subscription cursor identities stable across historical-to-live handoff. PostgreSQL live processing and health now use the same checkpoint after recovery; durable coverage, including a rewind to zero, takes precedence over in-process resume hints. Stateless handlers retain their historical resume position.
