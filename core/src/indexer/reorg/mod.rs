@@ -121,6 +121,13 @@ pub(crate) fn callback_recovery_token(network: &str) -> tokio_util::sync::Cancel
         .clone()
 }
 
+/// Recovery retires callbacks before waiting for writers, and holds the write
+/// barrier through rollback. Include both phases without blocking health probes.
+pub(crate) fn recovery_pending(network: &str) -> bool {
+    callback_recovery_token(network).is_cancelled()
+        || event_writer_barrier(network).try_read().is_err()
+}
+
 pub(crate) fn retire_callbacks(network: &str) {
     callback_recovery_token(network).cancel();
 }
