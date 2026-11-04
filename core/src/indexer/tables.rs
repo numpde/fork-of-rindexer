@@ -3556,6 +3556,12 @@ pub(crate) async fn prepare_table_operations<'t>(
         return Err("Shutdown requested".to_string());
     }
 
+    // Programmatic callers can bypass manifest admission. Reject ambiguous
+    // mappings before any timestamp or view-call prefetch.
+    for runtime in tables {
+        runtime.table.validate_event_mappings()?;
+    }
+
     let needs_timestamp_value = |value: &str| {
         if value.contains("$constant(") {
             events_data.iter().any(|(_, network, _)| {

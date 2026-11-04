@@ -600,6 +600,11 @@ pub(super) fn build_derived_tables_for_event(
     derived_tables: &mut HashMap<String, Vec<DerivedTableInfo>>,
     rollback_plans: &mut HashMap<String, DerivedTableRollbackPlan>,
 ) -> anyhow::Result<()> {
+    // Validate the complete input before changing either accumulated plan map.
+    for runtime in tables {
+        runtime.table.validate_event_mappings().map_err(anyhow::Error::msg)?;
+    }
+
     let schema = generate_indexer_contract_schema_name(indexer_name, contract_name);
     let event_table_full = format!("{}.{}", schema, camel_to_snake(event_name));
 

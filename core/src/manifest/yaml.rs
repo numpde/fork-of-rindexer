@@ -246,6 +246,23 @@ fn validate_manifest(
     }
 
     let contracts = manifest.all_contracts();
+    for contract in &contracts {
+        for table in contract.tables.iter().flatten() {
+            table.validate_event_mappings().map_err(|error| {
+                ValidateManifestError::CustomIndexingValidationError(error, contract.name.clone())
+            })?;
+        }
+    }
+    if manifest.native_transfers.enabled {
+        for table in manifest.native_transfers.tables.iter().flatten() {
+            table.validate_event_mappings().map_err(|error| {
+                ValidateManifestError::CustomIndexingValidationError(
+                    error,
+                    "native_transfers".to_string(),
+                )
+            })?;
+        }
+    }
     recovery_validation::validate(manifest, &contracts)?;
 
     for contract in &contracts {

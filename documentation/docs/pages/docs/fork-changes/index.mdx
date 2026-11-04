@@ -418,6 +418,27 @@ Insert-only tables retain their existing behavior. Editing YAML does not repair
 state previously lost through an incomplete rollback plan: coordinate any verified
 canonical rebuild with derived state, journals, receipts and cursors.
 
+## Unique event mappings within each table
+
+Each `tables[].events[].event` name must appear at most once within its table.
+This applies to contract tables and enabled `native_transfers.tables`, whether
+reorg handling is enabled or disabled. Manifest loading, forward table preparation
+and recovery-plan construction reject duplicates, including tables constructed
+directly by Rust callers. `TableRuntime::new` retains its existing signature.
+
+Combine all intended operations under one event mapping when they share the same
+`iterate` scope. Mappings with different iteration scopes cannot be merged
+automatically: redesign a common scope or use separate physical tables with
+complete write models. Multiple operations within one mapping, distinct event
+names within a table, and the same event name in separate tables remain valid.
+
+Previously, forward processing selected the first matching mapping, while
+recovery planned operations from every matching mapping. Later mappings could
+therefore remain unapplied, yet be reversed during a reorg. Correcting the YAML
+does not replay existing application receipts or repair previously reversed
+state. Verify the intended effects against canonical history and coordinate any
+derived-state rebuild with journals, receipts and cursors before resuming writes.
+
 ## Multiple derived writes from one event
 
 PostgreSQL event application now orders work by event position before manifest
