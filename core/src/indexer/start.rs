@@ -739,7 +739,7 @@ pub(super) fn build_derived_tables_for_event(
                 derived_types,
             )?;
         }
-        rollback_plan.validate_conditions(&derived[derived_index])?;
+        rollback_plan.validate_operations(&derived[derived_index])?;
     }
 
     Ok(())

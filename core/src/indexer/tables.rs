@@ -142,6 +142,9 @@
 //!                 value: $value
 //! ```
 
+#[path = "table_scalar.rs"]
+pub(crate) mod scalar;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -2531,6 +2534,69 @@ fn try_bytes32_as_string(bytes: &[u8]) -> Option<String> {
     None
 }
 
+/// Required arithmetic inputs are resolved before any effects can commit.
+/// Defaults initialize new rows; they never replace an unresolved explicit input.
+async fn extract_required_arithmetic_value(
+    value_ref: &str,
+    log_params: &[LogParam],
+    tx_metadata: &TxMetadata,
+    column_type: &ColumnType,
+    provider: Option<&dyn ChainProvider>,
+    network: &str,
+    constants: &Constants,
+) -> Result<EthereumSqlTypeWrapper, String> {
+    let missing = || {
+        format!("Cannot resolve required arithmetic input {value_ref:?}; column defaults cannot replace an explicit key or operand")
+    };
+    if let Some(field) = value_ref.strip_prefix('$') {
+        let event_reference = matches!(
+            crate::event::parse_arithmetic_expression(value_ref),
+            Ok(crate::event::ArithmeticExpr::Variable(variable))
+                if variable.source() == crate::event::VariableSource::Event
+        );
+        if event_reference {
+            let value = match field {
+                "rindexer_block_number" => {
+                    DynSolValue::Uint(U256::from(tx_metadata.block_number), 64)
+                }
+                "rindexer_tx_index" => DynSolValue::Uint(U256::from(tx_metadata.tx_index), 64),
+                "rindexer_log_index" => DynSolValue::Uint(tx_metadata.log_index, 256),
+                "rindexer_block_timestamp" => {
+                    DynSolValue::Uint(tx_metadata.block_timestamp.ok_or_else(missing)?, 256)
+                }
+                "rindexer_tx_hash" => DynSolValue::String(format!("{:#x}", tx_metadata.tx_hash)),
+                "rindexer_block_hash" => {
+                    DynSolValue::String(format!("{:#x}", tx_metadata.block_hash))
+                }
+                "rindexer_contract_address" => DynSolValue::Address(tx_metadata.contract_address),
+                _ => resolve_field_path(field, log_params).ok_or_else(missing)?,
+            };
+            let source = ColumnType::from_tx_metadata_field(field).or_else(|| {
+                value.sol_type_name().as_deref().and_then(ColumnType::from_solidity_type)
+            }).ok_or_else(|| format!("Required arithmetic input {value_ref:?} must resolve to a supported scalar"))?;
+            return scalar::ScalarConversion::new(&source, column_type)?
+                .normalize(&value)
+                .map_err(|error| format!("Cannot normalize {value_ref:?}: {error}"));
+        }
+    }
+    // Non-reorg tables also use this preparation path and may have constants,
+    // view calls or expressions. Their existing evaluator remains authoritative.
+    match extract_value_from_event_async(
+        value_ref,
+        log_params,
+        tx_metadata,
+        column_type,
+        provider,
+        network,
+        constants,
+    )
+    .await?
+    {
+        Some(value) if !matches!(value, EthereumSqlTypeWrapper::Null) => Ok(value),
+        _ => Err(missing()),
+    }
+}
+
 /// Async version of extract_value_from_event that supports view calls and constants.
 /// Falls back to sync extraction for non-view-call values.
 async fn extract_value_from_event_async(
@@ -3661,6 +3727,9 @@ pub(crate) async fn prepare_table_operations<'t>(
         };
 
         for operation in &event_mapping.operations {
+            let arithmetic_inputs =
+                matches!(operation.operation_type, OperationType::Upsert | OperationType::Update)
+                    && operation.set.iter().any(|column| column.action.reverse().is_some());
             let mut rows_to_process: Vec<TableRowData> = Vec::new();
             // Track max block per network for this batch of rows
             let mut batch_max_blocks: HashMap<String, u64> = HashMap::new();
@@ -3709,14 +3778,19 @@ pub(crate) async fn prepare_table_operations<'t>(
                 }
 
                 // Expand iterate bindings - creates multiple virtual events from array fields
-                let expanded_params_list =
-                    match expand_iterate_bindings(&event_mapping.iterate, log_params) {
-                        Some(params) => params,
-                        None => {
-                            debug!("Failed to expand iterate bindings for event {}", event_name);
-                            continue;
-                        }
-                    };
+                let expanded_params_list = match expand_iterate_bindings(
+                    &event_mapping.iterate,
+                    log_params,
+                ) {
+                    Some(params) => params,
+                    None if arithmetic_inputs => {
+                        return Err(format!("Cannot resolve required arithmetic iterate inputs for {event_name} in {}; check array paths and equal lengths", table_runtime.full_table_name));
+                    }
+                    None => {
+                        debug!("Failed to expand iterate bindings for event {}", event_name);
+                        continue;
+                    }
+                };
 
                 for expanded_log_params in &expanded_params_list {
                     if should_filter_in_rust {
@@ -3742,17 +3816,32 @@ pub(crate) async fn prepare_table_operations<'t>(
                             table_runtime.table.columns.iter().find(|c| &c.name == column_name);
 
                         if let Some(column_def) = column_def {
-                            if let Some(value) = extract_value_from_event_async(
-                                value_ref,
-                                expanded_log_params,
-                                tx_metadata,
-                                column_def.resolved_type(),
-                                provider,
-                                network,
-                                constants,
-                            )
-                            .await?
-                            {
+                            let value = if arithmetic_inputs {
+                                Some(
+                                    extract_required_arithmetic_value(
+                                        value_ref,
+                                        expanded_log_params,
+                                        tx_metadata,
+                                        column_def.resolved_type(),
+                                        provider,
+                                        network,
+                                        constants,
+                                    )
+                                    .await?,
+                                )
+                            } else {
+                                extract_value_from_event_async(
+                                    value_ref,
+                                    expanded_log_params,
+                                    tx_metadata,
+                                    column_def.resolved_type(),
+                                    provider,
+                                    network,
+                                    constants,
+                                )
+                                .await?
+                            };
+                            if let Some(value) = value {
                                 columns.insert(column_name.clone(), value);
                             }
                         }
@@ -3764,17 +3853,32 @@ pub(crate) async fn prepare_table_operations<'t>(
                             table_runtime.table.columns.iter().find(|c| c.name == set_col.column);
 
                         if let Some(column_def) = column_def {
-                            if let Some(value) = extract_value_from_event_async(
-                                set_col.effective_value(),
-                                expanded_log_params,
-                                tx_metadata,
-                                column_def.resolved_type(),
-                                provider,
-                                network,
-                                constants,
-                            )
-                            .await?
-                            {
+                            let value = if arithmetic_inputs && set_col.action.reverse().is_some() {
+                                Some(
+                                    extract_required_arithmetic_value(
+                                        set_col.effective_value(),
+                                        expanded_log_params,
+                                        tx_metadata,
+                                        column_def.resolved_type(),
+                                        provider,
+                                        network,
+                                        constants,
+                                    )
+                                    .await?,
+                                )
+                            } else {
+                                extract_value_from_event_async(
+                                    set_col.effective_value(),
+                                    expanded_log_params,
+                                    tx_metadata,
+                                    column_def.resolved_type(),
+                                    provider,
+                                    network,
+                                    constants,
+                                )
+                                .await?
+                            };
+                            if let Some(value) = value {
                                 columns.insert(set_col.column.clone(), value);
                             }
                         }

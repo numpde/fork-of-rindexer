@@ -60,13 +60,11 @@ impl ReorgTask {
                     .where_columns
                     .iter()
                     .map(|(derived, event)| {
-                        let value = source.operand(event)?;
-                        let value = match metadata
-                            .and_then(|metadata| metadata.derived_column_types.get(derived))
-                        {
-                            Some(column_type) => SqlDialect::Postgres.cast(value, column_type),
-                            None => value,
-                        };
+                        let value = source.operand_as(
+                            event,
+                            metadata
+                                .and_then(|metadata| metadata.derived_column_types.get(derived)),
+                        )?;
                         Ok(format!("'{derived}', {value}"))
                     })
                     .collect::<anyhow::Result<Vec<_>>>()?

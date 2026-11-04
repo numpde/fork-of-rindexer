@@ -34,6 +34,90 @@ apply to its storage and configuration:
 These notes retain their existing URLs. Their place in this section identifies
 them as maintained fork documentation.
 
+## Typed arithmetic inputs and recovery keys
+
+Mutable custom-table arithmetic resolves every explicitly configured key and
+`add`/`subtract` operand before committing an event. A column `default` remains
+the baseline for a new row; it does not replace a missing event field, an
+out-of-bounds dynamic or fixed array element, a missing tuple component, or a
+NULL arithmetic input. A conversion outside its supported input range returns
+an error instead of panicking. For PostgreSQL event transactions, the raw rows,
+derived effects, application receipts and cursor remain uncommitted and the
+callback can retry.
+
+Conditions still select which inputs are required. For an optional unsigned
+array element, an event-only guard such as `if: "$values[0] >= 0"` admits a
+present element and skips an absent one. Verify that the guard expresses the
+intended admission rule. Arithmetic `iterate` bindings must resolve and have
+equal lengths; empty arrays contribute no rows.
+
+Forward arithmetic preparation and PostgreSQL recovery select the same scalar
+conversion from the ABI source type and the custom-table destination type. The
+conversion applies to reversal deltas, reversal keys and the keys used to find
+surviving canonical metadata. Supported cases retain their established meaning:
+
+- Unsigned values assigned to signed custom-table types use the existing
+  256-bit two's-complement interpretation before checked narrowing. For example,
+  `uint256` value `2^256 - 1` contributes `-1` to an `int256` accumulator, and
+  recovery reverses that `-1`.
+- Boolean numeric operands contribute `1` for `true` and `0` for `false`.
+  Numeric string keys retain their decimal representation, unsigned Boolean
+  keys use nonzero truth values, and unsigned address keys use the low 20 bytes.
+- Timestamp metadata used as a numeric operand contributes epoch seconds.
+  Unsigned timestamp keys use exact whole seconds throughout the supported
+  date range; recovery does not round large epochs through floating-point
+  microseconds or depend on the database session's time zone.
+- `bytes32` keys retain the established custom-table encoding: the ASCII
+  `0x` prefix and 64 hexadecimal digits stored in `BYTEA`. A `bytes32` source
+  mapped to a `string` key retains the same hexadecimal text. This differs from
+  raw ABI byte storage and does not rewrite existing keys. Address-array keys
+  retain their nonempty array representation. Empty address-array keys are refused
+  because the existing forward encoder represents them as SQL NULL.
+
+This change preserves existing custom-column storage types, including the
+`BIGINT` representation used by custom `uint64` columns. It does not migrate
+column schemas or repair prior arithmetic overflow or already corrupted state.
+
+Some old byte conversions stored Rust debug text as bytes, and fixed-byte
+values converted to strings included padding that dynamic bytes did not.
+Recovery's source type metadata does not distinguish every one of those ABI
+layouts. The following arithmetic key conversions now fail explicitly instead
+of choosing a different key representation:
+
+| ABI source | Custom-table destination |
+| --- | --- |
+| `bytes` or `bytes1` through `bytes31` | `bytes`, `bytes32`, or `string` |
+| `bytes32` | `bytes` |
+
+Use a compatible ABI `bytes32` source with a `bytes32` or `string` key, an ABI
+`string` source with a `string` key, or keep the transformation outside this
+recovery path. Existing data using an affected representation needs a reviewed
+rebuild with coordinated journals, receipts and cursors before changing its
+key configuration. Renaming or recasting a key while retaining old receipts
+does not reapply previously committed contributions.
+
+Recovery checks required inputs in all contributing raw history before
+mutating durable state. This includes the orphan suffix, retained canonical
+history and other contributing networks for cross-chain tables. An older
+writer may have substituted a default for a missing key or operand, so a raw
+NULL cannot safely identify the row or the applied delta. Such history leaves
+recovery unfinished with an explicit error. Reconstruct the affected state
+from canonical history with its [replay metadata](/docs/migrations/postgres-event-replay)
+before retrying. Rows excluded by the operation's event predicate do not need
+the unused operands.
+
+Handwritten Rust recovery callers must provide both source and destination
+column types, including every `where` key, using
+`DerivedTableRollbackPlan::try_add_operation`, then call
+`ReorgTask::execute_with_rollback_plan`. This applies to unconditional
+arithmetic and counters too. Use actual ABI types and destination declarations;
+SQL storage types alone cannot distinguish, for example, signed and unsigned
+256-bit values. Runtime-generated plans supply this metadata automatically.
+`ReorgTask::execute` remains usable for raw, insert-only and journal-only
+recovery, which do not reconstruct arithmetic conversions from raw inputs.
+Incomplete arithmetic plans fail before changing raw rows, derived rows,
+receipts, journals or cursors.
+
 ## Typed predicate admission for arithmetic recovery
 
 Operations reversed from raw history now validate their predicates during
@@ -55,9 +139,9 @@ even when the predicate contains no literals.
 Every referenced event input must have a known scalar source type. Arrays must
 select a supported scalar leaf. Public callers of conditional arithmetic rollback
 tasks must populate `DerivedTableRollbackPlan::try_add_operation` with the source
-types and call `execute_with_rollback_plan`; the untyped `execute` shortcut remains
-usable for unconditional operations and predicates using only known transaction
-metadata. Direct tuple-array component types use dotted declaration paths such as
+types and call `execute_with_rollback_plan`; arithmetic also requires destination
+types for all keys and numeric columns, even for unconditional operations.
+Direct tuple-array component types use dotted declaration paths such as
 `items.amount`, without array indexes.
 
 Execution applies the same checks to legacy plans before committing changes to

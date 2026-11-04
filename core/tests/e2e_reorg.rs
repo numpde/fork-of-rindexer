@@ -34,6 +34,48 @@ use testcontainers_modules::postgres::Postgres;
 #[path = "support/anvil.rs"]
 mod anvil;
 
+/// The scalar Ping/Pong fixtures use an address sender/recipient, a uint256 id,
+/// NUMERIC accumulators and address keys (the named counter uses VARCHAR).
+/// Handwritten tasks must declare these semantics just like runtime ABI plans.
+fn ping_pong_rollback_plan(task: &ReorgTask) -> DerivedTableRollbackPlan {
+    let source_types = HashMap::from([
+        ("sender".to_string(), ColumnType::Address),
+        ("to".to_string(), ColumnType::Address),
+        ("id".to_string(), ColumnType::Uint256),
+    ]);
+    let mut plan = DerivedTableRollbackPlan::default();
+    for table in &task.derived_tables {
+        for (index, operation) in table.rollback_ops.iter().enumerate() {
+            let mut target_types = HashMap::new();
+            for (derived, source) in &operation.where_columns {
+                assert!(
+                    matches!(source.as_str(), "sender" | "to"),
+                    "declare the fixture's new source type"
+                );
+                let target = match derived.as_str() {
+                    "counter_name" => ColumnType::String,
+                    "user_address" | "user_addr" | "holder" => ColumnType::Address,
+                    _ => panic!("declare the fixture's new key type: {derived}"),
+                };
+                target_types.insert(derived.clone(), target);
+            }
+            for column in &operation.columns {
+                assert_eq!(column.event_column, "id", "declare the fixture's new numeric source");
+                target_types.insert(column.derived_column.clone(), ColumnType::Uint256);
+            }
+            plan.try_add_operation(
+                table.full_table_name.clone(),
+                index,
+                vec![],
+                source_types.clone(),
+                target_types,
+            )
+            .unwrap();
+        }
+    }
+    plan
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -2153,9 +2195,15 @@ async fn test_reorg_reversal_add() {
     let rindexer_pg = env.rindexer_pg().await;
     let mut task_window = BlockChainWindow::try_new(256).unwrap();
 
-    task.execute(&mut task_window, Some(&rindexer_pg), None, None)
-        .await
-        .expect("add reversal reorg task failed");
+    task.execute_with_rollback_plan(
+        &mut task_window,
+        Some(&rindexer_pg),
+        None,
+        None,
+        &ping_pong_rollback_plan(&task),
+    )
+    .await
+    .expect("add reversal reorg task failed");
 
     // balance was 180, events at block2 (id=50) + block3 (id=30) = 80 subtracted → 100
     let balance: rust_decimal::Decimal = pg
@@ -2265,9 +2313,15 @@ async fn test_reorg_reversal_reserved_word_column() {
     let rindexer_pg = env.rindexer_pg().await;
     let mut task_window = BlockChainWindow::try_new(256).unwrap();
 
-    task.execute(&mut task_window, Some(&rindexer_pg), None, None)
-        .await
-        .expect("reserved-word reversal reorg task failed");
+    task.execute_with_rollback_plan(
+        &mut task_window,
+        Some(&rindexer_pg),
+        None,
+        None,
+        &ping_pong_rollback_plan(&task),
+    )
+    .await
+    .expect("reserved-word reversal reorg task failed");
 
     // 180 - (50 + 30) = 100 after reversing blocks 2 and 3.
     let total: rust_decimal::Decimal = pg
@@ -2359,9 +2413,15 @@ async fn test_reorg_reversal_subtract() {
     let rindexer_pg = env.rindexer_pg().await;
     let mut task_window = BlockChainWindow::try_new(256).unwrap();
 
-    task.execute(&mut task_window, Some(&rindexer_pg), None, None)
-        .await
-        .expect("subtract reversal reorg task failed");
+    task.execute_with_rollback_plan(
+        &mut task_window,
+        Some(&rindexer_pg),
+        None,
+        None,
+        &ping_pong_rollback_plan(&task),
+    )
+    .await
+    .expect("subtract reversal reorg task failed");
 
     // debt was 800, reversal adds back 200 → 1000
     let debt: rust_decimal::Decimal = pg
@@ -2454,9 +2514,15 @@ async fn test_reorg_reversal_increment() {
     let rindexer_pg = env.rindexer_pg().await;
     let mut task_window = BlockChainWindow::try_new(256).unwrap();
 
-    task.execute(&mut task_window, Some(&rindexer_pg), None, None)
-        .await
-        .expect("increment reversal reorg task failed");
+    task.execute_with_rollback_plan(
+        &mut task_window,
+        Some(&rindexer_pg),
+        None,
+        None,
+        &ping_pong_rollback_plan(&task),
+    )
+    .await
+    .expect("increment reversal reorg task failed");
 
     // counter was 3, two events in reorg range → decremented by 2 → 1
     let count: rust_decimal::Decimal = pg
@@ -2549,7 +2615,13 @@ async fn test_reorg_reversal_with_condition() {
     let mut task_window = BlockChainWindow::try_new(256).unwrap();
 
     let error = task
-        .execute(&mut task_window, Some(&rindexer_pg), None, None)
+        .execute_with_rollback_plan(
+            &mut task_window,
+            Some(&rindexer_pg),
+            None,
+            None,
+            &ping_pong_rollback_plan(&task),
+        )
         .await
         .err()
         .expect("legacy SQL must fail before changing canonical data");
@@ -2586,7 +2658,10 @@ async fn test_reorg_reversal_with_condition() {
                 ("id".into(), ColumnType::Uint256),
                 ("sender".into(), ColumnType::Address),
             ]),
-            HashMap::from([("balance".into(), ColumnType::Uint256)]),
+            HashMap::from([
+                ("balance".into(), ColumnType::Uint256),
+                ("user_address".into(), ColumnType::Address),
+            ]),
         )
         .unwrap();
     task.execute_with_rollback_plan(
@@ -3106,6 +3181,9 @@ async fn test_reorg_reversal_expands_postgres_jsonb_tuple_arrays() {
             HashMap::from([
                 ("owner".to_string(), ColumnType::Address),
                 ("balance".to_string(), ColumnType::Uint256),
+                // A later phase deliberately targets this nonexistent column
+                // to exercise rollback after SQL has begun, not type admission.
+                ("missing_balance".to_string(), ColumnType::Uint256),
             ]),
         )
         .unwrap();
@@ -3510,9 +3588,15 @@ async fn test_reorg_reversal_decrement() {
     let rindexer_pg = env.rindexer_pg().await;
     let mut task_window = BlockChainWindow::try_new(256).unwrap();
 
-    task.execute(&mut task_window, Some(&rindexer_pg), None, None)
-        .await
-        .expect("decrement reversal reorg task failed");
+    task.execute_with_rollback_plan(
+        &mut task_window,
+        Some(&rindexer_pg),
+        None,
+        None,
+        &ping_pong_rollback_plan(&task),
+    )
+    .await
+    .expect("decrement reversal reorg task failed");
 
     // Was 7, 2 decrements reversed (incremented) → 9
     let remaining: rust_decimal::Decimal = pg
@@ -3742,9 +3826,15 @@ async fn test_reorg_mixed_reversible_and_journal() {
     let rindexer_pg = env.rindexer_pg().await;
     let mut task_window = BlockChainWindow::try_new(256).unwrap();
 
-    task.execute(&mut task_window, Some(&rindexer_pg), None, None)
-        .await
-        .expect("mixed reversal+journal reorg task failed");
+    task.execute_with_rollback_plan(
+        &mut task_window,
+        Some(&rindexer_pg),
+        None,
+        None,
+        &ping_pong_rollback_plan(&task),
+    )
+    .await
+    .expect("mixed reversal+journal reorg task failed");
 
     // total_volume: was 800, reversed Add of 500+200 = 700 → 100
     // max_trade: journal block2(500)+block3(200) deleted, remaining block1(100) → MAX = 100
@@ -3855,9 +3945,15 @@ async fn test_reorg_reversal_uninvolved_row_unchanged() {
     let rindexer_pg = env.rindexer_pg().await;
     let mut task_window = BlockChainWindow::try_new(256).unwrap();
 
-    task.execute(&mut task_window, Some(&rindexer_pg), None, None)
-        .await
-        .expect("uninvolved row reorg task failed");
+    task.execute_with_rollback_plan(
+        &mut task_window,
+        Some(&rindexer_pg),
+        None,
+        None,
+        &ping_pong_rollback_plan(&task),
+    )
+    .await
+    .expect("uninvolved row reorg task failed");
 
     // deployer balance: was 80, reversed Add of 30 (block2 only) → 50
     let deployer_bal: rust_decimal::Decimal = pg
@@ -4003,7 +4099,16 @@ async fn test_reorg_clickhouse_add_reversal() {
 
     task.derived_tables[0].rollback_ops[0].columns[0].derived_column =
         "missing_balance".to_string();
-    let error = match task.execute(&mut task_window, None, Some(&ch), None).await {
+    let error = match task
+        .execute_with_rollback_plan(
+            &mut task_window,
+            None,
+            Some(&ch),
+            None,
+            &ping_pong_rollback_plan(&task),
+        )
+        .await
+    {
         Ok(_) => panic!("invalid ClickHouse reversal must fail after raw deletion"),
         Err(error) => error,
     };
@@ -4028,7 +4133,16 @@ async fn test_reorg_clickhouse_add_reversal() {
         rollback_ops: vec![],
         journal_columns: vec![],
     });
-    let error = match task.execute(&mut task_window, None, Some(&ch), None).await {
+    let error = match task
+        .execute_with_rollback_plan(
+            &mut task_window,
+            None,
+            Some(&ch),
+            None,
+            &ping_pong_rollback_plan(&task),
+        )
+        .await
+    {
         Ok(_) => panic!("invalid later ClickHouse phase must fail"),
         Err(error) => error,
     };
@@ -4058,9 +4172,15 @@ async fn test_reorg_clickhouse_add_reversal() {
     assert_eq!(retained_marker, 1, "only the pending-attempt marker should remain");
 
     task.derived_tables.pop();
-    task.execute(&mut task_window, Some(&rindexer_pg), Some(&ch), None)
-        .await
-        .expect("ClickHouse reversal retry must reuse the retained snapshot");
+    task.execute_with_rollback_plan(
+        &mut task_window,
+        Some(&rindexer_pg),
+        Some(&ch),
+        None,
+        &ping_pong_rollback_plan(&task),
+    )
+    .await
+    .expect("ClickHouse reversal retry must reuse the retained snapshot");
 
     // PG: balance was 180, events at block2 (id=50) + block3 (id=30) = 80 subtracted -> 100
     let balance: rust_decimal::Decimal = pg
@@ -4218,9 +4338,15 @@ async fn test_reorg_reversal_reserved_word_column_clickhouse() {
     let rindexer_pg = env.rindexer_pg().await;
     let mut task_window = BlockChainWindow::try_new(256).unwrap();
 
-    task.execute(&mut task_window, Some(&rindexer_pg), Some(&ch), None)
-        .await
-        .expect("clickhouse reserved-word reversal reorg task failed");
+    task.execute_with_rollback_plan(
+        &mut task_window,
+        Some(&rindexer_pg),
+        Some(&ch),
+        None,
+        &ping_pong_rollback_plan(&task),
+    )
+    .await
+    .expect("clickhouse reserved-word reversal reorg task failed");
 
     // CH: "to" was 180, reversing blocks 2 and 3 subtracts 50 + 30 -> 100.
     let ch_total: u64 = ch
@@ -4407,9 +4533,15 @@ async fn test_reorg_two_events_same_table_reversible() {
     let rindexer_pg = env.rindexer_pg().await;
     let mut task_window = BlockChainWindow::try_new(256).unwrap();
 
-    task.execute(&mut task_window, Some(&rindexer_pg), None, None)
-        .await
-        .expect("dual-event reversible reorg task failed");
+    task.execute_with_rollback_plan(
+        &mut task_window,
+        Some(&rindexer_pg),
+        None,
+        None,
+        &ping_pong_rollback_plan(&task),
+    )
+    .await
+    .expect("dual-event reversible reorg task failed");
 
     // Reversal of Ping Add in reorg range: -(200 + 50) = -250
     // Reversal of Pong Subtract in reorg range: +(30 + 10) = +40

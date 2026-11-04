@@ -14,6 +14,7 @@ use crate::event::{
     VariableSource,
 };
 use crate::helpers::{camel_to_snake, generate_random_id};
+use crate::indexer::tables::scalar::ScalarConversion;
 use crate::manifest::contract::{ColumnType, IterateBinding, SetAction};
 use crate::metrics::indexing as metrics;
 use crate::provider::ChainProvider;
@@ -263,13 +264,10 @@ impl DerivedTableRollbackPlan {
         Ok(())
     }
 
-    /// Check the same predicate renderer at startup that execution uses for snapshots.
-    pub(crate) fn validate_conditions(&self, table: &DerivedTableInfo) -> anyhow::Result<()> {
+    /// Startup and execution share predicate and operand-conversion admission.
+    pub(crate) fn validate_operations(&self, table: &DerivedTableInfo) -> anyhow::Result<()> {
         let empty_types = HashMap::new();
         for (index, operation) in table.rollback_ops.iter().enumerate() {
-            let Some(condition) = &operation.condition else {
-                continue;
-            };
             let metadata = self.operation(&table.full_table_name, index);
             let source = ReversalSource {
                 dialect: SqlDialect::Postgres,
@@ -278,12 +276,57 @@ impl DerivedTableRollbackPlan {
                     .map(|metadata| &metadata.source_column_types)
                     .unwrap_or(&empty_types),
             };
-            render_reorg_condition(condition, &source).with_context(|| {
-                format!(
-                    "Cannot prepare recovery predicate for {} operation {}",
-                    table.full_table_name, index
-                )
-            })?;
+            if let Some(condition) = &operation.condition {
+                render_reorg_condition(condition, &source).with_context(|| {
+                    format!(
+                        "Cannot prepare recovery predicate for {} operation {}",
+                        table.full_table_name, index
+                    )
+                })?;
+            }
+            let targets =
+                metadata.map(|metadata| &metadata.derived_column_types).unwrap_or(&empty_types);
+            for (derived, event) in &operation.where_columns {
+                source.operand_as(event, targets.get(derived)).with_context(|| {
+                    format!("Cannot prepare recovery key {}.{}", table.full_table_name, derived)
+                })?;
+            }
+            for column in &operation.columns {
+                let target = targets.get(&column.derived_column).ok_or_else(|| anyhow::anyhow!(
+                    "Arithmetic recovery requires source/target type metadata for {}.{}; populate DerivedTableRollbackPlan::try_add_operation and use execute_with_rollback_plan",
+                    table.full_table_name, column.derived_column
+                ))?;
+                anyhow::ensure!(
+                    matches!(
+                        target,
+                        ColumnType::Uint8
+                            | ColumnType::Uint16
+                            | ColumnType::Uint32
+                            | ColumnType::Uint64
+                            | ColumnType::Uint128
+                            | ColumnType::Uint256
+                            | ColumnType::Int8
+                            | ColumnType::Int16
+                            | ColumnType::Int32
+                            | ColumnType::Int64
+                            | ColumnType::Int128
+                            | ColumnType::Int256
+                    ),
+                    "Cannot prepare recovery for {}.{}: arithmetic requires a numeric destination",
+                    table.full_table_name,
+                    column.derived_column
+                );
+                if !column.action.is_counter_action() {
+                    source
+                        .operand_as(&column.event_column, targets.get(&column.derived_column))
+                        .with_context(|| {
+                            format!(
+                                "Cannot prepare recovery operand {}.{}",
+                                table.full_table_name, column.derived_column
+                            )
+                        })?;
+                }
+            }
         }
         Ok(())
     }
@@ -579,6 +622,7 @@ impl ReversalSource<'_> {
             expression = format!("jsonb_extract_path_text({}, {})", expression, path);
         }
         let expression = match &column_type {
+            Some(kind) if !json_path.is_empty() => source_json_cast(self.dialect, expression, kind),
             Some(kind) => source_cast(self.dialect, expression, kind),
             None => expression,
         };
@@ -638,15 +682,38 @@ impl ReversalSource<'_> {
         }
 
         let expression = match &column_type {
+            Some(kind) if binding.storage == IterateStorage::PostgresJsonb => {
+                source_json_cast(self.dialect, expression, kind)
+            }
             Some(kind) => source_cast(self.dialect, expression, kind),
             None => expression,
         };
         (expression, column_type)
     }
 
+    #[cfg(test)]
     fn operand(&self, operand: &str) -> anyhow::Result<String> {
         let variable = parse_event_operand(operand, "rollback operand")?;
         Ok(self.variable_expression(&variable))
+    }
+
+    /// Normalize values before grouping, summing, or matching surviving keys.
+    /// A target type is required even for legacy public callers: the raw storage
+    /// representation alone cannot prove the forward conversion.
+    fn operand_as(&self, operand: &str, target: Option<&ColumnType>) -> anyhow::Result<String> {
+        let variable = parse_event_operand(operand, "rollback operand")?;
+        let (expression, source) = self.resolve_variable(&variable);
+        let target = target.ok_or_else(|| anyhow::anyhow!(
+            "Arithmetic recovery requires source/target type metadata for operand {operand:?}; populate DerivedTableRollbackPlan::try_add_operation and use execute_with_rollback_plan"
+        ))?;
+        let source = source.ok_or_else(|| anyhow::anyhow!(
+            "source type metadata is missing for arithmetic operand {operand:?}; check the path and supply source types in DerivedTableRollbackPlan"
+        ))?;
+        let conversion = ScalarConversion::new(&source, target).map_err(anyhow::Error::msg)?;
+        Ok(match self.dialect {
+            SqlDialect::Postgres => conversion.postgres_sql(expression),
+            SqlDialect::Clickhouse => self.dialect.cast(expression, target),
+        })
     }
 
     fn iterate_length_mismatch(&self) -> Option<String> {
@@ -726,6 +793,19 @@ impl ReversalSource<'_> {
                 )
             }
         }
+    }
+}
+
+// ABI JSON serializes byte values as 0x-prefixed hexadecimal strings.
+fn source_json_cast(dialect: SqlDialect, expression: String, kind: &ColumnType) -> String {
+    match (dialect, kind) {
+        (SqlDialect::Postgres, ColumnType::Bytes | ColumnType::Bytes32) => {
+            format!("DECODE(SUBSTRING({expression} FROM 3), 'hex')")
+        }
+        (SqlDialect::Postgres, ColumnType::Array(inner)) if **inner == ColumnType::Address => {
+            format!("NULLIF(ARRAY(SELECT jsonb_array_elements_text(CAST({expression} AS JSONB))), ARRAY[]::TEXT[])")
+        }
+        _ => source_cast(dialect, expression, kind),
     }
 }
 
@@ -882,16 +962,18 @@ impl ReorgTask {
                     let Some(mismatch) = source.iterate_length_mismatch() else {
                         continue;
                     };
+                    let network = if dt.cross_chain {
+                        String::new()
+                    } else {
+                        format!(
+                            "_rindexer_event.{} = '{}' AND ",
+                            dialect.quote("network"),
+                            self.network
+                        )
+                    };
                     let query = format!(
-                        "SELECT count(*) FROM {} AS _rindexer_event WHERE _rindexer_event.{} >= {} AND _rindexer_event.{} <= {} AND _rindexer_event.{} = '{}' AND ({})",
-                        op.event_table,
-                        dialect.quote("block_number"),
-                        self.fork_point,
-                        dialect.quote("block_number"),
-                        self.detection_point,
-                        dialect.quote("network"),
-                        self.network,
-                        mismatch,
+                        "SELECT count(*) FROM {} AS _rindexer_event WHERE {}({})",
+                        op.event_table, network, mismatch,
                     );
 
                     let mismatch_count = match (dialect, pg, ch) {
@@ -909,12 +991,83 @@ impl ReorgTask {
                     };
                     anyhow::ensure!(
                         mismatch_count == 0,
-                        "rollback iterate arrays have unequal lengths in {} between blocks {} and {}; aborting before event deletion",
+                        "rollback iterate arrays have unequal lengths in contributing history for {}; aborting before event deletion",
                         op.event_table,
-                        self.fork_point,
-                        self.detection_point,
                     );
                 }
+            }
+        }
+        Ok(())
+    }
+
+    async fn validate_required_arithmetic_inputs(
+        &self,
+        pg: &PgTransaction<'_>,
+        rollback_plan: &DerivedTableRollbackPlan,
+    ) -> anyhow::Result<()> {
+        let empty_types = HashMap::new();
+        for table in &self.derived_tables {
+            for (index, operation) in table.rollback_ops.iter().enumerate() {
+                let metadata = rollback_plan.operation(&table.full_table_name, index);
+                let source = ReversalSource {
+                    dialect: SqlDialect::Postgres,
+                    iterate: metadata.map_or(&[], |metadata| metadata.iterate.as_slice()),
+                    source_column_types: metadata
+                        .map_or(&empty_types, |metadata| &metadata.source_column_types),
+                };
+                let targets =
+                    metadata.map_or(&empty_types, |metadata| &metadata.derived_column_types);
+                let operands =
+                    operation.where_columns.iter().map(|(derived, event)| (derived, event)).chain(
+                        operation
+                            .columns
+                            .iter()
+                            .filter(|column| !column.action.is_counter_action())
+                            .map(|column| (&column.derived_column, &column.event_column)),
+                    );
+                let missing = operands
+                    .map(|(derived, operand)| {
+                        source
+                            .operand_as(operand, targets.get(derived))
+                            .map(|value| format!("({value}) IS NULL"))
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                if missing.is_empty() {
+                    continue;
+                }
+                let missing = missing.join(" OR ");
+                // The predicate is evaluated first, as in forward preparation;
+                // absent operands in unselected rows are not required inputs.
+                let missing = match &operation.condition {
+                    Some(condition) => format!(
+                        "CASE WHEN ({}) THEN ({missing}) ELSE FALSE END",
+                        render_reorg_condition(condition, &source)?
+                    ),
+                    None => missing,
+                };
+                // Canonical metadata reconstruction also consumes retained raw
+                // history, including other contributing networks for shared rows.
+                // A legacy defaulted key cannot identify its affected row, so
+                // validating only the orphan suffix would miss an unsafe baseline.
+                let network = if table.cross_chain {
+                    String::new()
+                } else {
+                    format!("_rindexer_event.network = '{}' AND ", self.network)
+                };
+                let query = format!(
+                    "SELECT EXISTS(SELECT 1 FROM {} WHERE {}({}))",
+                    source.from(&operation.event_table),
+                    network,
+                    missing
+                );
+                let missing: bool = pg
+                    .query_one(&query, &[])
+                    .await
+                    .context("Cannot validate required arithmetic recovery inputs")?
+                    .get(0);
+                anyhow::ensure!(!missing,
+                    "Cannot recover {}: raw history contains an unresolved required arithmetic key or operand. Earlier versions may have substituted a default; rebuild affected derived state, receipts and cursors from canonical history before retrying",
+                    table.full_table_name);
             }
         }
         Ok(())
@@ -931,6 +1084,9 @@ impl ReorgTask {
         rollback_plan: &DerivedTableRollbackPlan,
     ) -> anyhow::Result<ReversalSnapshots> {
         self.validate_iterate_lengths(pg, ch, rollback_plan).await?;
+        if let Some(pg) = pg {
+            self.validate_required_arithmetic_inputs(pg, rollback_plan).await?;
+        }
 
         let (attempt_id, clickhouse_marker, resumed) = match ch {
             Some(ch) => {
@@ -1110,11 +1266,8 @@ impl ReorgTask {
                         .where_columns
                         .iter()
                         .map(|(derived_column, event_column)| {
-                            let expression = source.operand(event_column)?;
-                            Ok(match derived_column_types.get(derived_column) {
-                                Some(column_type) => dialect.cast(expression, column_type),
-                                None => expression,
-                            })
+                            source
+                                .operand_as(event_column, derived_column_types.get(derived_column))
                         })
                         .collect::<anyhow::Result<Vec<_>>>()?;
                     let group = group_expressions.join(", ");
@@ -1143,11 +1296,10 @@ impl ReorgTask {
                             if *is_counter {
                                 Ok(format!("COUNT(*) AS {}", alias))
                             } else {
-                                let expression = source.operand(event_column)?;
-                                let expression = match derived_column_types.get(derived_column) {
-                                    Some(column_type) => dialect.cast(expression, column_type),
-                                    None => expression,
-                                };
+                                let expression = source.operand_as(
+                                    event_column,
+                                    derived_column_types.get(derived_column),
+                                )?;
                                 Ok(format!("SUM({}) AS {}", expression, alias))
                             }
                         })
@@ -1778,11 +1930,13 @@ impl ReorgTask {
             .await
     }
 
-    /// Execute a reorg with optional iterate and type metadata for derived-table rollback.
+    /// Execute a reorg with iterate and type metadata for derived-table rollback.
     ///
-    /// Existing callers can continue using [`Self::execute`]. This additive entry point
-    /// is used by the runtime-generated coordinator plan and by integrations that need
-    /// custom-table iterate rollback without changing `ReorgTask` struct literals.
+    /// Arithmetic operations require source and destination types registered with
+    /// [`DerivedTableRollbackPlan::try_add_operation`], including unconditional
+    /// operations. [`Self::execute`] remains suitable for raw, insert-only and
+    /// journal-only recovery. Runtime coordinators construct the typed plan from
+    /// the ABI and table definitions.
     pub async fn execute_with_rollback_plan(
         &self,
         window: &mut BlockChainWindow,
@@ -1819,7 +1973,7 @@ impl ReorgTask {
         super::validate_sql_value(&self.network, "reorg task network")?;
         // A retained snapshot cannot bypass current predicate admission.
         for table in &self.derived_tables {
-            rollback_plan.validate_conditions(table)?;
+            rollback_plan.validate_operations(table)?;
         }
 
         let start = std::time::Instant::now();
