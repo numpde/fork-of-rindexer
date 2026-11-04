@@ -239,12 +239,16 @@ impl EventProcessingConfig {
     }
 
     pub fn processor_id(&self) -> B256 {
-        let topic_id = self.topic_id();
-        let contract_name = self.contract_name();
-        let network = self.network_contract().network.to_string();
-
-        let combined = format!("{topic_id}{contract_name}{network}");
-        keccak256(combined.as_bytes())
+        let network_contract = self.network_contract();
+        // Runtime progress must have the same scope as the durable subscription
+        // cursor: one event can have several address/filter/start details per network.
+        let identity = serde_json::json!([
+            self.topic_id(),
+            self.contract_name(),
+            network_contract.network,
+            network_contract.cursor_key(),
+        ]);
+        keccak256(identity.to_string().as_bytes())
     }
 
     pub fn config(&self) -> &Config {
