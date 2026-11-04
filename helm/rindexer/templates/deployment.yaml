@@ -31,11 +31,21 @@ spec:
         runAsUser: {{ .Values.securityContext.runAsUser }}
         runAsGroup: {{ .Values.securityContext.runAsGroup }}
         fsGroup: {{ .Values.securityContext.fsGroup }}
+        runAsNonRoot: {{ .Values.securityContext.runAsNonRoot }}
+        seccompProfile:
+          {{- toYaml (.Values.securityContext.seccompProfile | default (dict "type" "RuntimeDefault")) | nindent 10 }}
       {{- end }}
       containers:
         - name: {{ .Chart.Name }}
           image: "{{ .Values.image.repository }}@{{ $digest }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- if .Values.securityContext.enabled }}
+          securityContext:
+            allowPrivilegeEscalation: {{ .Values.securityContext.allowPrivilegeEscalation }}
+            capabilities:
+              drop:
+                {{- toYaml .Values.securityContext.dropCapabilities | nindent 16 }}
+          {{- end }}
           command:
             {{- if and .Values.postgresql.enabled }}
             - "/app/rindexer"

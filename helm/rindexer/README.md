@@ -7,7 +7,7 @@ A Helm chart for deploying the `rindexer` application. This chart supports integ
 
 ## Prerequisites
 
-- Kubernetes 1.16+
+- Kubernetes 1.19+ (for the Pod seccomp profile)
 - Helm 3.0+
 - PersistentVolume provisioner support in the underlying infrastructure
 
@@ -63,6 +63,17 @@ The following table lists the configurable parameters of the `rindexer` chart an
 | `securityContext.allowPrivilegeEscalation` | Allow privilege escalation in the container     | `false`                       |
 | `securityContext.runAsNonRoot`           | Ensure the container runs as a non-root user     | `true`                        |
 | `securityContext.dropCapabilities`       | Capabilities to drop in the container            | `['ALL']`                     |
+| `securityContext.seccompProfile`         | Kubernetes Pod seccomp profile                    | `{type: RuntimeDefault}`      |
+
+With `securityContext.enabled=true`, user/group IDs, `fsGroup`, `runAsNonRoot`,
+and `seccompProfile` apply to the Pod. `allowPrivilegeEscalation` and
+`capabilities.drop` apply to the application container. The defaults request
+non-root execution, block privilege escalation, drop all Linux capabilities,
+and use the container runtime's default seccomp profile. A custom profile can
+use `{type: Localhost, localhostProfile: profiles/rindexer.json}` when that
+profile is installed on the nodes. Setting `securityContext.enabled=false`
+omits both security contexts.
+
 
 ## PostgreSQL Integration
 

@@ -2,6 +2,7 @@
 
 ### Breaking changes
 -------------------------------------------------
+- breaking: the Helm chart's default security profile now requires Kubernetes 1.19 or newer; upgrade older clusters before applying the chart, and review custom image requirements against the now-enforced non-root, privilege-escalation, capability, and seccomp settings.
 - breaking: **Array type round trips** — explicit and inferred nested custom-table array types now preserve every dimension when manifests are read or rewritten. Earlier parsing could collapse nested `type` declarations to one dimension. Review existing derived schemas and reconcile affected state using the [array migration guidance](/docs/migrations/abi-array-storage); manifests and schemas are not migrated automatically.
 - breaking: Helm deployments require an immutable fork `image.digest` and exactly one replica; upgrades use stop-before-start `Recreate` with downtime. Replace `image.tag` with a reviewed image digest and keep all other writers stopped.
 - breaking: subscription health adds `recovering` and returns HTTP 503 while network recovery retires callbacks or fences writers, even at zero cursor lag. Treat this as transient recovery rather than a terminal callback failure; update exhaustive status consumers.
@@ -74,6 +75,7 @@
 
 ### Bug fixes
 -------------------------------------------------
+- fix: Helm now applies `securityContext.runAsNonRoot`, `securityContext.allowPrivilegeEscalation`, and `securityContext.dropCapabilities` at their Kubernetes scopes, and defaults the configurable `securityContext.seccompProfile` to `RuntimeDefault`.
 - fix: Helm upgrades now replace the Pod when generated configuration or ABI content changes, including upgrades that retain the same image digest, so the mounted `rindexer.yaml` and ABI files are reloaded at startup.
 - fix: recovery preserves full-range unsigned 64-bit source values and fixed primitive array storage, including indexed complex-field hash metadata. ABI type inference now retains array dimensions; review existing inferred scalar schemas and reconcile affected history using the [array migration guidance](/docs/migrations/abi-array-storage).
 - fix: PostgreSQL arithmetic recovery retains ABI leaf types for direct tuple-array predicates, including fixed arrays, nested named components and array-valued members. Numeric JSONB leaves are extracted and cast before comparison, preventing text-versus-integer failures during rollback; canonical replay remains receipt-idempotent.

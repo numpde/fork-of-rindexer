@@ -42,6 +42,8 @@ securityContext:
   fsGroup: 2000
   allowPrivilegeEscalation: false
   runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
   dropCapabilities:
     - ALL
 
