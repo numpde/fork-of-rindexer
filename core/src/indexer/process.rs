@@ -20,6 +20,10 @@ use callback_checkpoint::{CallbackCheckpoints, CheckpointTurn};
 #[path = "checkpoint_order_tests.rs"]
 pub(crate) mod checkpoint_order_tests;
 
+#[cfg(test)]
+#[path = "dependency_live_tests.rs"]
+mod dependency_live_tests;
+
 use crate::helpers::is_relevant_block;
 use crate::indexer::heartbeat::{HeartbeatAction, HeartbeatTracker};
 use crate::indexer::reorg::{
