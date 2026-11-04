@@ -963,8 +963,8 @@ impl ColumnType {
 
     /// Parse from a type string (used for YAML deserialization)
     pub fn from_type_string(s: &str) -> Option<Self> {
-        let is_array = s.ends_with("[]");
         let base_type = s.trim_end_matches("[]");
+        let dimensions = (s.len() - base_type.len()) / 2;
 
         let base = match base_type {
             "uint8" => ColumnType::Uint8,
@@ -988,11 +988,7 @@ impl ColumnType {
             _ => return None,
         };
 
-        if is_array {
-            Some(ColumnType::Array(Box::new(base)))
-        } else {
-            Some(base)
-        }
+        Some((0..dimensions).fold(base, |inner, _| ColumnType::Array(Box::new(inner))))
     }
 
     /// Convert to type string (used for YAML serialization)
@@ -1022,8 +1018,7 @@ impl ColumnType {
 
     /// Infer column type from a Solidity ABI type string (e.g., "uint256", "address", "address[]").
     pub fn from_solidity_type(solidity_type: &str) -> Option<Self> {
-        let is_array = solidity_type.ends_with("[]");
-        let base_type = solidity_type.trim_end_matches("[]");
+        let (base_type, dimensions) = crate::helpers::solidity_type_parts(solidity_type);
 
         let base = match base_type {
             "address" => ColumnType::Address,
@@ -1050,11 +1045,7 @@ impl ColumnType {
             _ => return None,
         };
 
-        if is_array {
-            Some(ColumnType::Array(Box::new(base)))
-        } else {
-            Some(base)
-        }
+        Some((0..dimensions).fold(base, |inner, _| ColumnType::Array(Box::new(inner))))
     }
 
     /// Get the column type for transaction metadata fields.
@@ -2706,5 +2697,33 @@ mod tests {
         assert_eq!(SetAction::Set.reverse(), None);
         assert_eq!(SetAction::Max.reverse(), None);
         assert_eq!(SetAction::Min.reverse(), None);
+    }
+}
+
+#[cfg(test)]
+mod array_type_roundtrip_tests {
+    use super::ColumnType;
+
+    #[test]
+    fn readiness_nested_array_types_round_trip_through_yaml() {
+        for (abi, expected) in [
+            (
+                "uint256[][]",
+                ColumnType::Array(Box::new(ColumnType::Array(Box::new(ColumnType::Uint256)))),
+            ),
+            (
+                "bool[][2]",
+                ColumnType::Array(Box::new(ColumnType::Array(Box::new(ColumnType::Bool)))),
+            ),
+        ] {
+            let inferred = ColumnType::from_solidity_type(abi).unwrap();
+            assert_eq!(inferred, expected);
+            let yaml = serde_yaml::to_string(&inferred).unwrap();
+            let decoded: ColumnType = serde_yaml::from_str(&yaml).unwrap();
+            assert_eq!(
+                decoded, expected,
+                "ABI-inferred dimensions must survive a manifest rewrite: {yaml}"
+            );
+        }
     }
 }

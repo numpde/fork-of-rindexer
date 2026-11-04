@@ -403,3 +403,93 @@ async fn postgres_journal_only_string_predicate_remains_recoverable() {
     drop(callback);
     fixture.finish().await;
 }
+
+#[tokio::test]
+async fn readiness_missing_array_element_must_not_admit_a_reversal() {
+    for (condition, expected) in [
+        ("$values[0] > 0 || $enabled == true", "10"),
+        ("$enabled == true || $values[0] > 0", "15"),
+        ("!($values[0] > 0 && $enabled == false)", "10"),
+        ("!($enabled == false && $values[0] > 0)", "15"),
+    ] {
+        let fixture = arithmetic_fixture(
+            json!([
+                {"name":"values","type":"uint256[]","indexed":false},
+                {"name":"enabled","type":"bool","indexed":false}
+            ]),
+            condition,
+            json!([]),
+        )
+        .await;
+        let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+        callback(vec![predicate_event(
+            &fixture,
+            99,
+            10,
+            vec![
+                DynSolValue::Array(vec![DynSolValue::Uint(U256::from(1), 256)]),
+                DynSolValue::Bool(true),
+            ],
+        )])
+        .await
+        .unwrap();
+        callback(vec![predicate_event(
+            &fixture,
+            100,
+            5,
+            vec![DynSolValue::Array(vec![]), DynSolValue::Bool(true)],
+        )])
+        .await
+        .unwrap();
+        assert_eq!(fixture.position().await, (2, expected.into(), "100".into()));
+        super::recovery_boundary_tests::rollback(&fixture, 100, 100).await.unwrap();
+        assert_canonical_amount(&fixture, "10").await;
+        drop(callback);
+        fixture.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn readiness_full_range_and_fixed_array_sources_recover_in_postgres() {
+    for fixed in [false, true] {
+        let mut definition = serde_json::to_value(params().event).unwrap();
+        definition["inputs"][0]["type"] = json!(if fixed { "uint256[2]" } else { "uint64" });
+        let fixture = Fixture::with_table(
+            definition,
+            "Contract",
+            json!({"name":"totals","global":true,
+                "columns":[{"name":"amount","type":"uint256","default":"0"}],
+                "events":[{"event":"Value","operations":[{"type":"upsert",
+                    "set":[{"column":"amount","action":"add","value":if fixed { "$value[0]" } else { "$value" }}]}]}]}),
+        ).await;
+        let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+        for (block, amount) in [(99, 10), (100, u64::MAX)] {
+            let mut event = super::journal_recovery_tests::at(
+                &fixture,
+                "ethereum",
+                block,
+                B256::repeat_byte(block as u8),
+                amount,
+            );
+            let scalar = DynSolValue::Uint(U256::from(amount), if fixed { 256 } else { 64 });
+            let value = if fixed {
+                DynSolValue::FixedArray(vec![scalar, DynSolValue::Uint(U256::ZERO, 256)])
+            } else {
+                scalar
+            };
+            event.log.inner.data = alloy::primitives::LogData::new_unchecked(
+                event.log.topics().to_vec(),
+                DynSolValue::Tuple(vec![value]).abi_encode_params().into(),
+            );
+            callback(vec![event]).await.unwrap();
+        }
+        assert_eq!(
+            fixture.position().await,
+            (2, (U256::from(u64::MAX) + U256::from(10)).to_string(), "100".into())
+        );
+        super::recovery_boundary_tests::rollback(&fixture, 100, 100).await.unwrap();
+        assert_canonical_amount(&fixture, "10").await;
+        drop(callback);
+        fixture.finish().await;
+    }
+}
