@@ -92,6 +92,100 @@ struct Running {
     coordinators: std::collections::HashMap<String, Arc<tokio::sync::Mutex<ReorgCoordinator>>>,
     clients: Weak<Option<crate::streams::StreamsClients>>,
 }
+
+#[tokio::test]
+async fn postgres_required_rabbitmq_retains_outbox_until_broker_ack() {
+    use crate::event::callback_registry::FailedStream;
+    use crate::streams::rabbitmq_test_broker::{BrokerReply, TestBroker};
+
+    let fixture = Fixture::new().await;
+    let mut broker = TestBroker::start().await;
+    let streams = serde_json::from_value(json!({
+        "delivery_guarantee": "at_least_once",
+        "rabbitmq": {"url": broker.url, "exchanges": [{
+            "exchange": "events", "exchange_type": "direct", "routing_key": "values",
+            "networks": ["ethereum"], "events": [{"event_name": "Value"}]
+        }]}
+    }))
+    .unwrap();
+    let clients = Arc::new(Some(crate::streams::StreamsClients::new(streams).await));
+    let weak = Arc::downgrade(&clients);
+    let mut params = fixture.params.clone();
+    params.streams_clients = clients.clone();
+    let callback = no_code_callback(Arc::new(params)).event_callback;
+    callback(fixture.events(&[10])).await.unwrap();
+    let applied_position = fixture.position().await;
+    let original = fixture.client.query_one(
+        "SELECT id, message, acknowledged_at IS NULL AND NOT invalidated FROM rindexer_internal.stream_outbox",
+        &[],
+    ).await.unwrap();
+    let delivery_id: String = original.get(0);
+    let original_payload: Value = original.get(1);
+    assert!(original.get::<_, bool>(2));
+    let registry = crate::event::callback_registry::EventCallbackRegistry::new();
+    let cancel = CancellationToken::new();
+    crate::streams::StreamsClients::start_delivery_worker(
+        &clients,
+        fixture.client.clone(),
+        "ethereum".into(),
+        cancel.clone(),
+        registry.failure_state(),
+        FailedStream {
+            id: "rabbitmq-confirmation".into(),
+            indexer: "Replay".into(),
+            contract: "Contract".into(),
+            event: "Value".into(),
+            network: "ethereum".into(),
+            from_block: 2,
+            to_block: 2,
+        },
+    );
+    let pending = tokio::time::timeout(Duration::from_secs(5), broker.publishes.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let wait_for_retirement = || async {
+        loop {
+            let acknowledged: bool = fixture.client.query_one(
+                "SELECT acknowledged_at IS NOT NULL AND message IS NULL AND NOT invalidated FROM rindexer_internal.stream_outbox WHERE id=$1",
+                &[&delivery_id],
+            ).await.unwrap().get(0);
+            if acknowledged {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), wait_for_retirement()).await.is_err(),
+        "the durable outbox must retain its payload until RabbitMQ confirms broker acceptance"
+    );
+    let retained = fixture.client.query_one(
+        "SELECT message, acknowledged_at IS NULL AND NOT invalidated FROM rindexer_internal.stream_outbox WHERE id=$1",
+        &[&delivery_id],
+    ).await.unwrap();
+    assert_eq!(retained.get::<_, Value>(0), original_payload);
+    assert!(retained.get::<_, bool>(1));
+    pending.reply.send(BrokerReply::Ack).unwrap_or_else(|_| panic!("broker stopped"));
+    tokio::time::timeout(Duration::from_secs(5), wait_for_retirement()).await.unwrap();
+    cancel.cancel();
+    drop(callback);
+    drop(clients);
+    drop(registry);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while weak.upgrade().is_some() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        fixture.position().await,
+        applied_position,
+        "delivery does not replay source effects"
+    );
+    fixture.finish().await;
+}
 impl Running {
     async fn stop_tasks(&mut self) {
         self.cancel.cancel();
