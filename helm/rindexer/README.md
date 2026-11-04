@@ -190,3 +190,8 @@ or forced pod deletion can also overlap a terminating writer with its replacemen
 so coordinate those operations separately. Back up
 and reconcile database migrations before upgrading. Run the rendered chart checks
 with `python3 helm/rindexer/tests/deployment.py /path/to/helm`.
+
+The generated configuration and ABI ConfigMaps are hashed into the Pod template.
+A Helm upgrade that changes either ConfigMap replaces the Pod, including when the
+image digest stays the same. This reloads the `subPath`-mounted `rindexer.yaml`
+and the ABI files at startup. Unchanged chart inputs keep the same checksums.

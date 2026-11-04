@@ -20,6 +20,9 @@ spec:
       {{- include "rindexer.selectorLabels" . | nindent 6 }}
   template:
     metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        checksum/abis: {{ include (print $.Template.BasePath "/configmap-abis.yaml") . | sha256sum }}
       labels:
         {{- include "rindexer.selectorLabels" . | nindent 8 }}
     spec:

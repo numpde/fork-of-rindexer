@@ -74,6 +74,7 @@
 
 ### Bug fixes
 -------------------------------------------------
+- fix: Helm upgrades now replace the Pod when generated configuration or ABI content changes, including upgrades that retain the same image digest, so the mounted `rindexer.yaml` and ABI files are reloaded at startup.
 - fix: recovery preserves full-range unsigned 64-bit source values and fixed primitive array storage, including indexed complex-field hash metadata. ABI type inference now retains array dimensions; review existing inferred scalar schemas and reconcile affected history using the [array migration guidance](/docs/migrations/abi-array-storage).
 - fix: PostgreSQL arithmetic recovery retains ABI leaf types for direct tuple-array predicates, including fixed arrays, nested named components and array-valued members. Numeric JSONB leaves are extracted and cast before comparison, preventing text-versus-integer failures during rollback; canonical replay remains receipt-idempotent.
 - fix: journal recovery quotes derived column identifiers consistently for `set`, `max` and `min`, including supported reserved names such as `order`. PostgreSQL recovery blocked by this syntax error can be retried after upgrading without renaming the column.
