@@ -106,6 +106,56 @@ class DeploymentTests(unittest.TestCase):
                 finally:
                     path.write_text(previous)
 
+    def test_default_security_restricts_container(self):
+        pod = self.deployment(self.resources())['spec']['template']['spec']
+        with self.subTest(scope='pod'):
+            self.assertEqual(pod.get('securityContext'), {
+                'runAsUser': 1000,
+                'runAsGroup': 3000,
+                'fsGroup': 2000,
+                'runAsNonRoot': True,
+                'seccompProfile': {'type': 'RuntimeDefault'},
+            })
+        with self.subTest(scope='container'):
+            self.assertEqual(pod['containers'][0].get('securityContext'), {
+                'allowPrivilegeEscalation': False,
+                'capabilities': {'drop': ['ALL']},
+            })
+
+    def test_security_overrides_reach_correct_scopes(self):
+        rendered = self.resources(
+            '--set-json', 'securityContext.runAsUser=1100',
+            '--set-json', 'securityContext.runAsGroup=3100',
+            '--set-json', 'securityContext.fsGroup=2100',
+            '--set-json', 'securityContext.runAsNonRoot=false',
+            '--set-json', 'securityContext.allowPrivilegeEscalation=true',
+            '--set-json', 'securityContext.dropCapabilities=["NET_RAW","SYS_ADMIN"]',
+            '--set-json', 'securityContext.seccompProfile={"type":"Localhost","localhostProfile":"profiles/rindexer.json"}',
+        )
+        pod = self.deployment(rendered)['spec']['template']['spec']
+        with self.subTest(scope='pod'):
+            self.assertEqual(pod.get('securityContext'), {
+                'runAsUser': 1100,
+                'runAsGroup': 3100,
+                'fsGroup': 2100,
+                'runAsNonRoot': False,
+                'seccompProfile': {
+                    'type': 'Localhost', 'localhostProfile': 'profiles/rindexer.json',
+                },
+            })
+        with self.subTest(scope='container'):
+            self.assertEqual(pod['containers'][0].get('securityContext'), {
+                'allowPrivilegeEscalation': True,
+                'capabilities': {'drop': ['NET_RAW', 'SYS_ADMIN']},
+            })
+
+    def test_security_can_be_disabled(self):
+        rendered = self.resources('--set-json', 'securityContext.enabled=false')
+        pod = self.deployment(rendered)['spec']['template']['spec']
+        self.assertNotIn('securityContext', pod)
+        self.assertNotIn('securityContext', pod['containers'][0])
+
+
 
 if __name__ == '__main__':
     unittest.main()
