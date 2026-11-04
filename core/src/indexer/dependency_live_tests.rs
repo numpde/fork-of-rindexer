@@ -1,6 +1,6 @@
 //! Exercise dependency-ordered live polling through RPC, callbacks, and durable cursors.
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -17,7 +17,7 @@ use alloy::{
 use axum::{routing::post, Json, Router};
 use serde_json::{json, Value};
 use tempfile::TempDir;
-use tokio::{net::TcpListener, task::JoinHandle, time::timeout};
+use tokio::{net::TcpListener, sync::Semaphore, task::JoinHandle, time::timeout};
 use tokio_util::sync::CancellationToken;
 
 use super::{live_indexing_for_contract_event_dependencies, EventDependenciesIndexingConfig};
@@ -35,6 +35,7 @@ use crate::{
     indexer::{
         last_synced::{get_last_synced_block_number, SyncConfig},
         progress::IndexingEventsProgressState,
+        reorg::{BlockChainWindow, ReorgBlockHashPersistence, ReorgCoordinator},
     },
     manifest::{network::BlockPollFrequency, stream::StreamsConfig},
     provider::{create_client, ChainProvider},
@@ -56,6 +57,7 @@ struct Applied {
     address: Address,
     indexed: B256,
     block: u64,
+    hash: B256,
 }
 
 fn header(number: u64) -> AnyRpcBlock {
@@ -110,10 +112,12 @@ struct RpcState {
     head: AtomicU64,
     logs: Vec<Log>,
     log_requests: Mutex<Vec<Value>>,
+    scripted_logs: Mutex<VecDeque<Vec<Log>>>,
+    log_permits: Semaphore,
 }
 
 impl RpcState {
-    fn reply(&self, request: Value) -> Value {
+    async fn reply(&self, request: Value) -> Value {
         let result = match request["method"].as_str().unwrap() {
             "eth_chainId" => json!("0x1"),
             "eth_blockNumber" => json!(format!("{:#x}", self.head.load(Ordering::SeqCst))),
@@ -128,6 +132,16 @@ impl RpcState {
             "eth_getLogs" => {
                 let filter = &request["params"][0];
                 self.log_requests.lock().unwrap().push(filter.clone());
+                // Hold retries at the RPC boundary so tests can inspect durable effects first.
+                let Ok(permit) = self.log_permits.acquire().await else {
+                    return json!({"jsonrpc":"2.0", "id":request["id"], "error":{
+                        "code":-32000, "message":"fixture stopped",
+                    }});
+                };
+                permit.forget();
+                if let Some(logs) = self.scripted_logs.lock().unwrap().pop_front() {
+                    return json!({"jsonrpc":"2.0", "id":request["id"], "result":logs});
+                }
                 let from = hex_number(&filter["fromBlock"]);
                 let to = hex_number(&filter["toBlock"]);
                 json!(self
@@ -167,6 +181,8 @@ impl Rpc {
             head: AtomicU64::new(101),
             logs,
             log_requests: Mutex::new(vec![]),
+            scripted_logs: Mutex::new(VecDeque::new()),
+            log_permits: Semaphore::new(0),
         });
         let shared = state.clone();
         let app = Router::new().route(
@@ -174,12 +190,14 @@ impl Rpc {
             post(move |Json(request): Json<Value>| {
                 let state = shared.clone();
                 async move {
-                    Json(match request {
-                        Value::Array(requests) => Value::Array(
-                            requests.into_iter().map(|request| state.reply(request)).collect(),
-                        ),
-                        request => state.reply(request),
-                    })
+                    let batch = request.is_array();
+                    let requests =
+                        if let Value::Array(requests) = request { requests } else { vec![request] };
+                    let mut replies = Vec::new();
+                    for request in requests {
+                        replies.push(state.reply(request).await);
+                    }
+                    Json(if batch { Value::Array(replies) } else { replies.remove(0) })
                 }
             }),
         );
@@ -202,6 +220,7 @@ impl Rpc {
 
 impl Drop for Rpc {
     fn drop(&mut self) {
+        self.state.log_permits.close();
         self.server.abort();
     }
 }
@@ -214,6 +233,8 @@ struct Fixture {
     progress: Arc<IndexingEventsProgressState>,
     streams: StreamsConfig,
     applied: Arc<Mutex<Vec<Applied>>>,
+    safe_distance: u64,
+    reorg_enabled: bool,
 }
 
 impl Fixture {
@@ -272,6 +293,7 @@ impl Fixture {
                     address: event.log.address(),
                     indexed: event.log.topics()[1],
                     block: event.tx_information.block_number,
+                    hash: event.tx_information.block_hash,
                 }));
                 Box::pin(async { Ok(()) })
             }),
@@ -291,6 +313,8 @@ impl Fixture {
             progress,
             streams: serde_json::from_value(json!({"webhooks":[]})).unwrap(),
             applied,
+            safe_distance: 0,
+            reorg_enabled: false,
         };
         for network in &fixture.networks {
             let path = fixture.cursor_path(network);
@@ -356,7 +380,7 @@ impl Fixture {
                 ),
                 index_event_in_order: true,
                 live_indexing: true,
-                indexing_distance_from_head: U64::ZERO,
+                indexing_distance_from_head: U64::from(self.safe_distance),
                 cancel_token: cancel.clone(),
                 tables: Arc::new(vec![]),
                 reorg_sender: None,
@@ -372,12 +396,26 @@ impl Fixture {
         if reverse {
             events.reverse();
         }
+        let reorg_coordinator = self.reorg_enabled.then(|| {
+            Arc::new(tokio::sync::Mutex::new(
+                ReorgCoordinator::new(
+                    NETWORK.into(),
+                    BlockChainWindow::try_new(20).unwrap(),
+                    Arc::new(ReorgBlockHashPersistence::new(None, None)),
+                    self.rpc.provider.clone(),
+                    vec![],
+                    vec![],
+                    vec![],
+                )
+                .unwrap(),
+            ))
+        });
         let task = tokio::spawn(live_indexing_for_contract_event_dependencies(
             EventDependenciesIndexingConfig {
                 network: NETWORK.into(),
                 cached_provider: self.rpc.provider.clone(),
                 events,
-                reorg_coordinator: None,
+                reorg_coordinator,
                 trace_registry: None,
             },
         ));
@@ -396,7 +434,13 @@ impl Fixture {
             .parse()
             .unwrap();
             for block in 101..=through {
-                expected.push(Applied { cursor: network.cursor_key(), address, indexed, block });
+                expected.push(Applied {
+                    cursor: network.cursor_key(),
+                    address,
+                    indexed,
+                    block,
+                    hash: B256::repeat_byte(block as u8),
+                });
             }
         }
         expected.sort();
@@ -406,6 +450,7 @@ impl Fixture {
     async fn run_through(&self, through: u64, reverse: bool) {
         self.rpc.state.head.store(through, Ordering::SeqCst);
         let expected = self.expected(through);
+        self.rpc.state.log_permits.add_permits(self.networks.len());
         let (task, cancel) = self.start(reverse).await;
         let completed = wait_until(|| {
             self.cursors_at(through)
@@ -472,4 +517,99 @@ async fn dependency_live_keeps_start_coverage_independent_after_restart() {
         Detail { address: Address::repeat_byte(1), indexed: B256::repeat_byte(3), start: 100 },
     ])
     .await;
+}
+
+async fn assert_invalid_batch_retries(logs: Vec<Log>, head: u64, safe_distance: u64) {
+    for reorg_enabled in [true, false] {
+        let mut fixture = Fixture::new(vec![Detail {
+            address: Address::repeat_byte(1),
+            indexed: B256::repeat_byte(3),
+            start: 100,
+        }])
+        .await;
+        fixture.safe_distance = safe_distance;
+        fixture.reorg_enabled = reorg_enabled;
+        fixture.rpc.state.head.store(head, Ordering::SeqCst);
+        fixture.rpc.state.scripted_logs.lock().unwrap().push_back(logs.clone());
+        fixture.rpc.state.log_permits.add_permits(1);
+        let generation_before = crate::indexer::reorg::reorg_generation(NETWORK);
+        let (task, cancel) = fixture.start(false).await;
+        assert!(
+            wait_until(|| {
+                !fixture.applied.lock().unwrap().is_empty()
+                    || fixture.rpc.state.log_requests.lock().unwrap().len() >= 2
+            })
+            .await,
+            "the first response must be consumed"
+        );
+        assert!(
+            fixture.applied.lock().unwrap().is_empty(),
+            "untrusted RPC data must not reach callbacks (reorg handling: {reorg_enabled})"
+        );
+        assert!(fixture.cursors_at(100), "untrusted RPC data must not certify progress");
+        if reorg_enabled && logs.iter().any(|log| log.removed) {
+            assert!(
+                crate::indexer::reorg::reorg_generation(NETWORK) > generation_before,
+                "removed-log responses must complete coordinated recovery before retry"
+            );
+        }
+        assert_eq!(
+            fixture.rpc.state.log_requests.lock().unwrap().len(),
+            2,
+            "retry the same range, with its response still held by the fixture"
+        );
+        fixture.rpc.state.log_permits.add_permits(1);
+        let through = head - safe_distance;
+        let completed = wait_until(|| fixture.cursors_at(through)).await;
+        cancel.cancel();
+        timeout(Duration::from_secs(5), task).await.expect("dependency loop stops").unwrap();
+        assert!(completed, "a canonical retry must resume indexing");
+        let mut actual = fixture.applied.lock().unwrap().clone();
+        actual.sort();
+        assert_eq!(actual, fixture.expected(through));
+        let requests = fixture.rpc.state.log_requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0], requests[1], "failed validation must not advance the filter");
+    }
+}
+
+fn canonical_log(number: u64, index: usize) -> Log {
+    log(
+        &Detail { address: Address::repeat_byte(1), indexed: B256::repeat_byte(3), start: 100 },
+        number,
+        index,
+    )
+}
+
+#[tokio::test]
+async fn dependency_live_rejects_stale_observed_head_before_checkpoint() {
+    let mut stale = canonical_log(101, 0);
+    stale.block_hash = Some(B256::repeat_byte(250));
+    assert_invalid_batch_retries(vec![stale], 101, 0).await;
+}
+
+#[tokio::test]
+async fn dependency_live_rejects_stale_ancestor_behind_safe_head() {
+    let mut stale = canonical_log(101, 0);
+    stale.block_hash = Some(B256::repeat_byte(250));
+    assert_invalid_batch_retries(vec![stale], 102, 1).await;
+}
+
+#[tokio::test]
+async fn dependency_live_rejects_mixed_hashes_before_checkpoint() {
+    let mut stale = canonical_log(101, 1);
+    stale.block_hash = Some(B256::repeat_byte(250));
+    assert_invalid_batch_retries(vec![canonical_log(101, 0), stale], 101, 0).await;
+}
+
+#[tokio::test]
+async fn dependency_live_rejects_out_of_range_logs_before_checkpoint() {
+    assert_invalid_batch_retries(vec![canonical_log(100, 0)], 101, 0).await;
+}
+
+#[tokio::test]
+async fn dependency_live_retries_whole_response_containing_removed_logs() {
+    let mut removed = canonical_log(101, 1);
+    removed.removed = true;
+    assert_invalid_batch_retries(vec![canonical_log(101, 0), removed], 101, 0).await;
 }
