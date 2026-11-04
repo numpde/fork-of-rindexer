@@ -588,3 +588,12 @@ existing declared or inferred schemas before upgrading, especially scalar column
 created for fixed-array inputs. Reconcile affected schemas and history using the
 [ABI array migration guidance](/docs/migrations/abi-array-storage); missing array
 elements cannot be recovered by casting an old scalar into a singleton array.
+
+## Recovery health
+
+Subscription health reports `recovering` and HTTP 503 while recovery has retired
+callbacks or holds/awaits the network writer barrier. Cursor height and zero lag
+do not establish canonical readiness during a same-height replacement. Recovery
+status clears after successful rollback releases the barrier; callback failures
+retain their separate terminal status. Update exhaustive status consumers and
+monitor recovery separately from normal catch-up, which can still return HTTP 200.
