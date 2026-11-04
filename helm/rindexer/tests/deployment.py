@@ -156,6 +156,25 @@ class DeploymentTests(unittest.TestCase):
         self.assertNotIn('securityContext', pod['containers'][0])
 
 
+    def test_service_port_routes_to_graphql_listener(self):
+        for service_port in [3001, 80, 8080]:
+            with self.subTest(service_port=service_port):
+                rendered = self.resources(
+                    '--set-json', 'postgresql.enabled=true',
+                    '--set-json', 'service.port=' + str(service_port),
+                )
+                pod = self.deployment(rendered)['spec']['template']['spec']
+                container = pod['containers'][0]
+                self.assertEqual(container['command'][-1], 'all',
+                                 'this case must start the GraphQL server')
+                service = rendered['Service', 'rindexer-readiness']['spec']['ports'][0]
+                self.assertEqual(service['port'], service_port)
+                target = next(port for port in container['ports']
+                              if port['name'] == service['targetPort'])
+                self.assertEqual(target['containerPort'], 3001,
+                                 'the Service must reach the GraphQL listener on port 3001')
+
+
 
 if __name__ == '__main__':
     unittest.main()
