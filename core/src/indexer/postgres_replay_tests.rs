@@ -1693,3 +1693,6 @@ mod recovery_boundary_tests;
 
 #[path = "predicate_recovery_tests.rs"]
 mod predicate_recovery_tests;
+
+#[path = "operand_recovery_tests.rs"]
+mod operand_recovery_tests;
