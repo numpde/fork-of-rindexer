@@ -44,7 +44,7 @@ The following table lists the configurable parameters of the `rindexer` chart an
 | `image.digest`                           | Required reviewed `sha256:` image digest          | Empty; installation fails until set |
 | `image.pullPolicy`                       | Image pull policy                                | `IfNotPresent`                |
 | `service.type`                           | Kubernetes service type                          | `ClusterIP`                   |
-| `service.port`                           | Kubernetes service port                          | `3001`                        |
+| `service.port`                           | Service port exposed to clients; targets application port `3001` | `3001`                        |
 | `ingress.enabled`                        | Enable Ingress resource                          | `false`                       |
 | `ingress.annotations`                    | Ingress annotations                              | `{}`                          |
 | `ingress.hosts`                          | Ingress accepted hostnames                       | `[]`
@@ -78,6 +78,13 @@ omits both security contexts.
 ## PostgreSQL Integration
 
 If PostgreSQL is enabled, the chart will configure the application to connect to it using the specified credentials.
+
+With `postgresql.enabled=true`, the chart starts both indexing and GraphQL. The
+GraphQL listener uses port `3001` inside the Pod. `service.port` controls the
+Service port exposed to clients: for example, `service.port=80` routes port `80`
+to the same GraphQL listener on port `3001`. With PostgreSQL disabled, the chart
+starts only the indexer and does not start a GraphQL listener.
+
 
 ### Configuring External PostgreSQL
 

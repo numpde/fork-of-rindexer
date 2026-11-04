@@ -62,7 +62,7 @@ spec:
             {{- end }}
           ports:
             - name: http
-              containerPort: {{ .Values.service.port }}
+              containerPort: 3001  # GraphQL listens here; service.port controls exposure.
               protocol: TCP
           env:
             - name: PROJECT_PATH

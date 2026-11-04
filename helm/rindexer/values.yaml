@@ -6,7 +6,7 @@ image:
 
 service:
   type: ClusterIP
-  port: 3001
+  port: 3001  # Service port; the application target remains 3001
 
 ingress:
   enabled: false
