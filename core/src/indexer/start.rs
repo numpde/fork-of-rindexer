@@ -1517,6 +1517,10 @@ async fn await_indexing_tasks(
 #[path = "supervision_tests.rs"]
 mod supervision_tests;
 
+#[cfg(test)]
+#[path = "duplicate_event_mapping_tests.rs"]
+mod duplicate_event_mapping_tests;
+
 pub async fn initialize_database(
     manifest: &Manifest,
 ) -> Result<Option<Arc<PostgresClient>>, StartIndexingError> {
