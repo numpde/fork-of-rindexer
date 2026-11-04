@@ -2,6 +2,7 @@
 
 ### Breaking changes
 -------------------------------------------------
+- breaking: Rust callers matching `RabbitMQError` exhaustively must handle the new `BrokerNack` and `ConfirmationNotRequested` variants. RabbitMQ publish success now requires a broker confirmation; previously unconfirmed publications may now retry or return an error.
 - breaking: the Helm chart's default security profile now requires Kubernetes 1.19 or newer; upgrade older clusters before applying the chart, and review custom image requirements against the now-enforced non-root, privilege-escalation, capability, and seccomp settings.
 - breaking: **Array type round trips** — explicit and inferred nested custom-table array types now preserve every dimension when manifests are read or rewritten. Earlier parsing could collapse nested `type` declarations to one dimension. Review existing derived schemas and reconcile affected state using the [array migration guidance](/docs/migrations/abi-array-storage); manifests and schemas are not migrated automatically.
 - breaking: Helm deployments require an immutable fork `image.digest` and exactly one replica; upgrades use stop-before-start `Recreate` with downtime. Replace `image.tag` with a reviewed image digest and keep all other writers stopped.
@@ -75,6 +76,7 @@
 
 ### Bug fixes
 -------------------------------------------------
+- fix: RabbitMQ publishers now wait for a positive broker confirmation before reporting success. Broker rejection or a lost connection before confirmation triggers retries; required delivery retains its PostgreSQL outbox obligation until confirmation, preserving the original message ID.
 - fix: custom Helm `service.port` values now route to the GraphQL listener on application port `3001`, so Service ports such as `80` and `8080` work without changing the application listening port.
 - fix: Helm now applies `securityContext.runAsNonRoot`, `securityContext.allowPrivilegeEscalation`, and `securityContext.dropCapabilities` at their Kubernetes scopes, and defaults the configurable `securityContext.seccompProfile` to `RuntimeDefault`.
 - fix: Helm upgrades now replace the Pod when generated configuration or ABI content changes, including upgrades that retain the same image digest, so the mounted `rindexer.yaml` and ABI files are reloaded at startup.

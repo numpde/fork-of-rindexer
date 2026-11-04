@@ -322,6 +322,25 @@ before resuming. Changing the manifest does not repair a row lost in an earlier
 rollback. Coordinate any required rebuild with derived state, recovery journals,
 application receipts and cursors; see the [sequence-ordering migration](/docs/migrations/sequence-ordering).
 
+## RabbitMQ broker confirmations
+
+RabbitMQ publishers enable publisher confirmations for each channel and wait for
+its broker acknowledgement. A broker rejection or a connection loss before
+confirmation returns an error to the existing retry policy. With
+`delivery_guarantee: at_least_once`, the PostgreSQL outbox retains the original
+payload and message ID until the confirmed publication is acknowledged in the
+database. An uncertain publication can be retried with the same message ID, so
+consumers should use that ID to deduplicate repeated deliveries.
+
+The confirmation records broker acceptance. Consumer processing has its own
+acknowledgement policy. Queue bindings and persistence settings must support the
+deployment's delivery requirements. Existing obligations already acknowledged by
+an earlier version cannot be reconstructed automatically; reconcile any known
+missing deliveries against retained source history.
+
+Rust callers with exhaustive `RabbitMQError` matches must add `BrokerNack` and
+`ConfirmationNotRequested` cases.
+
 ## Hanging destinations with durable delivery
 
 With `delivery_guarantee: at_least_once`, a hanging publisher now receives a

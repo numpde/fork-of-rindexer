@@ -1,7 +1,8 @@
 use bb8::{Pool, RunError};
 use bb8_lapin::LapinConnectionManager;
 use lapin::{
-    options::*, types::FieldTable, BasicProperties, DefaultConnectionBuilder, ExchangeKind,
+    options::*, types::FieldTable, BasicProperties, Confirmation, DefaultConnectionBuilder,
+    ExchangeKind,
 };
 use serde_json::Value;
 
@@ -18,6 +19,12 @@ pub enum RabbitMQError {
 
     #[error("Connection pool timed out")]
     PoolTimedOut,
+
+    #[error("RabbitMQ broker rejected the publication")]
+    BrokerNack,
+
+    #[error("RabbitMQ publisher confirmation was not requested")]
+    ConfirmationNotRequested,
 }
 
 impl From<RunError<lapin::ErrorKind>> for RabbitMQError {
@@ -86,6 +93,7 @@ impl RabbitMQ {
 
         let conn = self.pool.get().await?;
         let channel = conn.create_channel().await?;
+        channel.confirm_select(ConfirmSelectOptions::default()).await?;
 
         channel
             .exchange_declare(
@@ -101,7 +109,7 @@ impl RabbitMQ {
             _ => routing_key.as_deref().expect("Routing key should be defined"),
         };
 
-        channel
+        let confirmation = channel
             .basic_publish(
                 exchange.into(),
                 routing_key.into(),
@@ -111,9 +119,16 @@ impl RabbitMQ {
                     .with_message_id(id.into())
                     .with_content_type("application/json".into()),
             )
+            .await?
             .await?;
 
-        Ok(())
+        // The first await only writes the frames. Retiring a required outbox
+        // record also needs the broker's positive publisher confirmation.
+        match confirmation {
+            Confirmation::Ack(_) => Ok(()),
+            Confirmation::Nack(_) => Err(RabbitMQError::BrokerNack),
+            Confirmation::NotRequested => Err(RabbitMQError::ConfirmationNotRequested),
+        }
     }
 }
 
