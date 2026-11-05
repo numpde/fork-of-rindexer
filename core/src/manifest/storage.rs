@@ -15,6 +15,7 @@ use crate::{
             DropLastKnownRelationshipsError, Relationship,
         },
     },
+    indexer::{schema::PreparedSchema, Indexer},
     manifest::contract::Contract,
 };
 
@@ -157,6 +158,8 @@ impl<'de> Deserialize<'de> for Storage {
 
 #[derive(thiserror::Error, Debug)]
 pub enum RelationshipsAndIndexersError {
+    #[error("Cannot prepare storage schema: {0}")]
+    InvalidPreparedSchema(String),
     #[error("{0}")]
     DropLastKnownRelationshipsError(#[from] DropLastKnownRelationshipsError),
 
@@ -245,6 +248,25 @@ impl Storage {
         manifest_name: &str,
         contracts: &[Contract],
     ) -> Result<(Vec<Relationship>, Vec<PostgresIndexResult>), RelationshipsAndIndexersError> {
+        if !self.postgres_enabled() || self.postgres_disable_create_tables() {
+            return Ok((vec![], vec![]));
+        }
+        let indexer = Indexer {
+            name: manifest_name.to_owned(),
+            contracts: contracts.to_vec(),
+            native_transfers: Default::default(),
+        };
+        let schema = PreparedSchema::try_new(project_path, &indexer).map_err(|error| {
+            RelationshipsAndIndexersError::InvalidPreparedSchema(error.to_string())
+        })?;
+        self.create_prepared_relationships_and_indexes(&schema).await
+    }
+
+    pub async fn create_prepared_relationships_and_indexes(
+        &self,
+        schema: &PreparedSchema,
+    ) -> Result<(Vec<Relationship>, Vec<PostgresIndexResult>), RelationshipsAndIndexersError> {
+        let manifest_name = &schema.indexer().name;
         if self.postgres_enabled() && !self.postgres_disable_create_tables() {
             if let Some(storage) = &self.postgres {
                 // setup relationships
@@ -257,13 +279,8 @@ impl Storage {
 
                 let mapped_relationships = &storage.relationships;
                 if let Some(mapped_relationships) = mapped_relationships {
-                    let relationships_result = create_relationships(
-                        project_path,
-                        manifest_name,
-                        contracts,
-                        mapped_relationships,
-                    )
-                    .await;
+                    let relationships_result =
+                        create_relationships(schema, mapped_relationships).await;
                     match relationships_result {
                         Ok(result) => {
                             relationships = result;
@@ -278,8 +295,7 @@ impl Storage {
                 drop_last_known_indexes(manifest_name).await?;
 
                 if let Some(indexes) = &storage.indexes {
-                    let indexes_result =
-                        prepare_indexes(project_path, manifest_name, indexes, contracts).await;
+                    let indexes_result = prepare_indexes(schema, indexes).await;
 
                     match indexes_result {
                         Ok(result) => {

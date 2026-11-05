@@ -1,5 +1,6 @@
 use crate::blockclock::BlockClock;
 use crate::helpers::get_full_path;
+use crate::indexer::schema::{PreparedContract, PreparedSchema};
 use crate::manifest::core::Manifest;
 use crate::notifications::ChainStateNotification;
 use crate::{
@@ -7,7 +8,7 @@ use crate::{
     generate_random_id,
     indexer::native_transfer::EVENT_NAME,
     manifest::{
-        contract::{Contract, EventInputIndexedFilters},
+        contract::{Contract, ContractDetails, EventInputIndexedFilters},
         native_transfer::{NativeTransfers, TraceProcessingMethod},
     },
     provider::{get_network_provider, ChainProvider, CreateNetworkProvider},
@@ -68,6 +69,9 @@ pub struct ContractInformation {
 pub enum CreateContractInformationError {
     #[error("Can not find network {0} from providers")]
     CanNotFindNetworkFromProviders(String),
+
+    #[error("Could not use prepared contract: {0}")]
+    InvalidPreparedContract(String),
 }
 
 impl ContractInformation {
@@ -77,6 +81,85 @@ impl ContractInformation {
         network_providers: &[CreateNetworkProvider],
         decoder: Decoder,
         manifest: &Manifest,
+    ) -> Result<ContractInformation, CreateContractInformationError> {
+        Self::create_with_setups(contract, network_providers, decoder, manifest, |detail| {
+            Ok(detail.indexing_contract_setup(project_path))
+        })
+    }
+
+    /// Use the startup snapshot for both target events and factory discovery.
+    pub(crate) fn create_prepared(
+        prepared: &PreparedContract,
+        schema: &PreparedSchema,
+        network_providers: &[CreateNetworkProvider],
+        decoder: Decoder,
+        manifest: &Manifest,
+    ) -> Result<ContractInformation, CreateContractInformationError> {
+        let mut information = Self::create_with_setups(
+            &prepared.declaration,
+            network_providers,
+            decoder,
+            manifest,
+            |detail| {
+                if let Some(address) = &detail.address {
+                    Ok(IndexingContractSetup::Address(AddressDetails {
+                        address: address.clone(),
+                        indexed_filters: detail.indexed_filters.clone(),
+                    }))
+                } else if let Some(factory) = &detail.factory {
+                    let source = schema
+                        .contract(&factory.name)
+                        .map_err(CreateContractInformationError::InvalidPreparedContract)?;
+                    let event = source
+                        .events
+                        .iter()
+                        .find(|event| event.info.name == factory.event_name)
+                        .ok_or_else(|| {
+                            CreateContractInformationError::InvalidPreparedContract(format!(
+                                "factory event {}::{} was not admitted",
+                                factory.name, factory.event_name
+                            ))
+                        })?;
+                    Ok(IndexingContractSetup::Factory(FactoryDetails {
+                        contract_name: source.name.clone(),
+                        address: factory.address.clone(),
+                        input_name: factory.input_name.clone(),
+                        event: event.event.clone(),
+                        indexed_filters: detail.indexed_filters.clone(),
+                    }))
+                } else if let Some(filter) = &detail.filter {
+                    let events = match filter {
+                        ValueOrArray::Value(filter) => {
+                            ValueOrArray::Value(filter.event_name.clone())
+                        }
+                        ValueOrArray::Array(filters) => ValueOrArray::Array(
+                            filters.iter().map(|filter| filter.event_name.clone()).collect(),
+                        ),
+                    };
+                    Ok(IndexingContractSetup::Filter(FilterDetails {
+                        events,
+                        indexed_filters: detail.indexed_filters.clone(),
+                    }))
+                } else {
+                    Err(CreateContractInformationError::InvalidPreparedContract(format!(
+                        "contract {} on network {} has no address, factory or filter",
+                        prepared.declaration.name, detail.network
+                    )))
+                }
+            },
+        )?;
+        information.name = prepared.name.clone();
+        Ok(information)
+    }
+
+    fn create_with_setups(
+        contract: &Contract,
+        network_providers: &[CreateNetworkProvider],
+        decoder: Decoder,
+        manifest: &Manifest,
+        setup: impl Fn(
+            &ContractDetails,
+        ) -> Result<IndexingContractSetup, CreateContractInformationError>,
     ) -> Result<ContractInformation, CreateContractInformationError> {
         let mut details = vec![];
         for c in &contract.details {
@@ -100,7 +183,7 @@ impl ContractInformation {
                             client,
                         ),
                         decoder: Arc::clone(&decoder),
-                        indexing_contract_setup: c.indexing_contract_setup(project_path),
+                        indexing_contract_setup: setup(c)?,
                         start_block: c.start_block,
                         end_block: c.end_block,
                         disable_logs_bloom_checks: provider.disable_logs_bloom_checks,

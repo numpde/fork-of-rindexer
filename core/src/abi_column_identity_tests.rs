@@ -13,7 +13,12 @@ use tempfile::TempDir;
 fn scalar(name: &str) -> Value {
     json!({"name":name,"type":"uint256","indexed":false})
 }
-fn tuple(name: &str, kind: &str, children: Vec<Value>) -> Value {
+fn tuple(name: &str, kind: &str, mut children: Vec<Value>) -> Value {
+    // Tuple members are ABI parameters; only the enclosing event input may
+    // carry an indexed flag. Nested tuples have already cleaned their members.
+    for child in &mut children {
+        child.as_object_mut().unwrap().remove("indexed");
+    }
     json!({"name":name,"type":kind,"indexed":false,"components":children})
 }
 fn event(inputs: Vec<Value>) -> Value {

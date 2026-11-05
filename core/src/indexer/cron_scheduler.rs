@@ -23,13 +23,16 @@ use crate::helpers::to_pascal_case;
 use crate::indexer::last_synced::{
     get_last_synced_cron_block, update_last_synced_cron_block, CronSyncConfig,
 };
+use crate::indexer::schema::PreparedSchema;
 use crate::is_running;
-use crate::manifest::contract::{parse_interval, ColumnType, ResolvedTable, TableCronMapping};
+use crate::manifest::contract::{
+    parse_interval, ColumnType, Contract, ResolvedTable, TableCronMapping,
+};
 use crate::manifest::core::Manifest;
 use crate::provider::ChainProvider;
 use alloy::primitives::U64;
 
-use super::tables::{TableRowData, TxMetadata};
+use super::tables::{TableRowData, TableRuntime, TxMetadata};
 
 // ============================================================================
 // Adaptive Rate Limiter - Scales both concurrency AND batch size
@@ -258,15 +261,61 @@ impl CronScheduler {
         clickhouse: Option<Arc<ClickhouseClient>>,
         providers: Arc<HashMap<String, Arc<dyn ChainProvider>>>,
     ) -> Result<Self, String> {
+        let contracts = manifest
+            .all_contracts()
+            .into_iter()
+            .map(|contract| {
+                let tables = contract
+                    .tables
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|table| TableRuntime::try_new(table, &manifest.name, &contract.name))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok((contract, tables))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Self::from_resolved_tables(
+            &manifest.name,
+            contracts.iter().map(|(contract, tables)| (contract, tables.as_slice())),
+            postgres,
+            clickhouse,
+            providers,
+        )
+    }
+
+    /// Reuse the tables prepared for event writes, schema creation and recovery.
+    pub fn try_new_prepared(
+        schema: &PreparedSchema,
+        postgres: Option<Arc<PostgresClient>>,
+        clickhouse: Option<Arc<ClickhouseClient>>,
+        providers: Arc<HashMap<String, Arc<dyn ChainProvider>>>,
+    ) -> Result<Self, String> {
+        Self::from_resolved_tables(
+            &schema.indexer().name,
+            schema
+                .contracts()
+                .iter()
+                .chain(schema.native())
+                .map(|contract| (&contract.declaration, contract.tables.as_slice())),
+            postgres,
+            clickhouse,
+            providers,
+        )
+    }
+
+    fn from_resolved_tables<'a>(
+        indexer_name: &str,
+        contracts: impl IntoIterator<Item = (&'a Contract, &'a [TableRuntime])>,
+        postgres: Option<Arc<PostgresClient>>,
+        clickhouse: Option<Arc<ClickhouseClient>>,
+        providers: Arc<HashMap<String, Arc<dyn ChainProvider>>>,
+    ) -> Result<Self, String> {
         let mut tasks = Vec::new();
 
-        for contract in &manifest.contracts {
-            let Some(tables) = &contract.tables else {
-                continue;
-            };
-
-            for declaration in tables.iter().filter(|table| table.has_cron()) {
-                let table = declaration.try_resolve_storage_columns()?;
+        for (contract, tables) in contracts {
+            for runtime in tables.iter().filter(|runtime| runtime.table.definition().has_cron()) {
+                let table = &runtime.table;
                 let cron_entries = table.cron_mappings();
 
                 for (cron_index, cron_entry) in cron_entries.iter().enumerate() {
@@ -347,12 +396,7 @@ impl CronScheduler {
                                 (addr, None)
                             };
 
-                        let full_table_name = crate::database::generate::generate_table_full_name(
-                            &manifest.name,
-                            &contract.name,
-                            table.name(),
-                            table.definition().database.as_deref(),
-                        );
+                        let full_table_name = runtime.full_table_name.clone();
 
                         if factory_config.is_some() {
                             info!(
@@ -363,7 +407,7 @@ impl CronScheduler {
                         }
 
                         tasks.push(CronTask {
-                            contract_name: contract.name.clone(),
+                            contract_name: runtime.contract_name.clone(),
                             table: table.clone(),
                             full_table_name,
                             cron_entry: cron_entry.clone(),
@@ -371,7 +415,7 @@ impl CronScheduler {
                             network,
                             contract_address,
                             schedule: schedule.clone(),
-                            indexer_name: manifest.name.clone(),
+                            indexer_name: indexer_name.to_string(),
                             factory_config,
                         });
                     }
@@ -381,7 +425,7 @@ impl CronScheduler {
 
         info!("Cron scheduler initialized with {} tasks", tasks.len());
 
-        Ok(Self { tasks, postgres, clickhouse, providers, indexer_name: manifest.name.clone() })
+        Ok(Self { tasks, postgres, clickhouse, providers, indexer_name: indexer_name.to_string() })
     }
 
     /// Check if there are any cron tasks to run.

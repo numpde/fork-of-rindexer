@@ -8,7 +8,8 @@ use std::collections::{HashMap, HashSet};
 use crate::database::generate::generate_indexer_contract_schema_name;
 use crate::database::postgres::client::PostgresClient;
 use crate::helpers::camel_to_snake;
-use crate::manifest::contract::{injected_columns, Table};
+use crate::indexer::schema::PreparedSchema;
+use crate::manifest::contract::{injected_columns, ResolvedTable, Table};
 use crate::manifest::core::Manifest;
 
 /// Represents a detected schema change that may need to be applied.
@@ -277,139 +278,165 @@ pub async fn detect_schema_changes(
     client: &PostgresClient,
     manifest: &Manifest,
 ) -> Result<Vec<SchemaChange>, String> {
-    let mut changes: Vec<SchemaChange> = vec![];
+    let tables = manifest
+        .custom_table_groups()
+        .flat_map(|(owner, tables)| {
+            tables.iter().map(move |table| {
+                table.try_resolve_storage_columns().map(|resolved| (owner, table, resolved))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let tables: Vec<_> =
+        tables.iter().map(|(owner, table, resolved)| (*owner, *table, resolved)).collect();
+    detect_resolved_schema_changes(client, &manifest.name, &tables).await
+}
 
-    for (owner, tables) in manifest.custom_table_groups() {
-        let schema_name = generate_indexer_contract_schema_name(&manifest.name, owner);
+/// Compare catalogs against the frozen startup schema without resolving declarations again.
+pub async fn detect_prepared_schema_changes(
+    client: &PostgresClient,
+    schema: &PreparedSchema,
+) -> Result<Vec<SchemaChange>, String> {
+    let tables: Vec<_> = schema
+        .contracts()
+        .iter()
+        .chain(schema.native())
+        .flat_map(|contract| {
+            contract.declaration.tables.iter().flatten().zip(contract.tables.iter()).map(
+                move |(declaration, runtime)| (contract.name.as_str(), declaration, &runtime.table),
+            )
+        })
+        .collect();
+    detect_resolved_schema_changes(client, &schema.indexer().name, &tables).await
+}
 
-        for declaration in tables {
-            let resolved = declaration.try_resolve_storage_columns()?;
-            let table = resolved.definition();
-            let schema_name = table.database.as_deref().unwrap_or(&schema_name);
-            let table_name = camel_to_snake(&table.name);
-            let table_full_name = format!("{}.{}", schema_name, table_name);
+async fn detect_resolved_schema_changes(
+    client: &PostgresClient,
+    indexer_name: &str,
+    tables: &[(&str, &Table, &ResolvedTable)],
+) -> Result<Vec<SchemaChange>, String> {
+    let mut changes = Vec::new();
+    for &(owner, declaration, resolved) in tables {
+        let default_schema = generate_indexer_contract_schema_name(indexer_name, owner);
+        let table = resolved.definition();
+        let schema_name = table.database.as_deref().unwrap_or(&default_schema);
+        let table_name = camel_to_snake(&table.name);
+        let table_full_name = format!("{}.{}", schema_name, table_name);
 
-            // Check if table exists
-            if !table_exists(client, schema_name, &table_name).await? {
-                // Table doesn't exist yet, will be created normally
+        // Check if table exists
+        if !table_exists(client, schema_name, &table_name).await? {
+            // Table doesn't exist yet, will be created normally
+            continue;
+        }
+
+        // Get existing columns
+        let existing_columns = get_existing_columns(client, schema_name, &table_name).await?;
+        let existing_col_names: HashSet<String> =
+            existing_columns.iter().map(|c| c.name.clone()).collect();
+        let existing_col_types: HashMap<String, String> =
+            existing_columns.iter().map(|c| (c.name.clone(), c.data_type.clone())).collect();
+
+        // Get expected columns from YAML
+        super::super::generate::check_legacy_column_names(
+            declaration,
+            resolved,
+            &existing_col_names,
+            crate::helpers::postgres_catalog_identifier,
+        )?;
+        let expected_columns = get_expected_columns(table);
+        let expected_col_names: HashSet<String> = expected_columns.keys().cloned().collect();
+
+        // Find new columns (in YAML but not in DB)
+        for col_name in expected_col_names.difference(&existing_col_names) {
+            let col_type = expected_columns.get(col_name).unwrap();
+
+            // Skip columns with unknown types (not yet resolved from ABI)
+            // These will be created when the table is set up with resolved types
+            if col_type == "unknown" {
                 continue;
             }
 
-            // Get existing columns
-            let existing_columns = get_existing_columns(client, schema_name, &table_name).await?;
-            let existing_col_names: HashSet<String> =
-                existing_columns.iter().map(|c| c.name.clone()).collect();
-            let existing_col_types: HashMap<String, String> =
-                existing_columns.iter().map(|c| (c.name.clone(), c.data_type.clone())).collect();
-
-            // Get expected columns from YAML
-            super::super::generate::check_legacy_column_names(
-                declaration,
-                &resolved,
-                &existing_col_names,
-                crate::helpers::postgres_catalog_identifier,
-            )?;
-            let expected_columns = get_expected_columns(table);
-            let expected_col_names: HashSet<String> = expected_columns.keys().cloned().collect();
-
-            // Find new columns (in YAML but not in DB)
-            for col_name in expected_col_names.difference(&existing_col_names) {
-                let col_type = expected_columns.get(col_name).unwrap();
-
-                // Skip columns with unknown types (not yet resolved from ABI)
-                // These will be created when the table is set up with resolved types
-                if col_type == "unknown" {
-                    continue;
-                }
-
-                // Convert back to PostgreSQL CREATE type format
-                let pg_type = match col_type.as_str() {
-                    "character varying" => "VARCHAR(50)",
-                    "character" => {
-                        // Determine length based on column name
-                        if col_name == injected_columns::TX_HASH
-                            || col_name == injected_columns::BLOCK_HASH
-                        {
-                            "CHAR(66)"
-                        } else if col_name == injected_columns::CONTRACT_ADDRESS {
-                            "CHAR(42)"
-                        } else {
-                            "TEXT"
-                        }
+            // Convert back to PostgreSQL CREATE type format
+            let pg_type = match col_type.as_str() {
+                "character varying" => "VARCHAR(50)",
+                "character" => {
+                    // Determine length based on column name
+                    if col_name == injected_columns::TX_HASH
+                        || col_name == injected_columns::BLOCK_HASH
+                    {
+                        "CHAR(66)"
+                    } else if col_name == injected_columns::CONTRACT_ADDRESS {
+                        "CHAR(42)"
+                    } else {
+                        "TEXT"
                     }
-                    "timestamp with time zone" => "TIMESTAMPTZ",
-                    other => other,
-                };
+                }
+                "timestamp with time zone" => "TIMESTAMPTZ",
+                other => other,
+            };
 
-                // Look up the default value from the column definition
-                let default_value = table
-                    .columns
-                    .iter()
-                    .find(|c| &c.name == col_name)
-                    .and_then(|c| c.default.clone());
+            // Look up the default value from the column definition
+            let default_value =
+                table.columns.iter().find(|c| &c.name == col_name).and_then(|c| c.default.clone());
 
-                changes.push(SchemaChange::AddColumn {
+            changes.push(SchemaChange::AddColumn {
+                table_full_name: table_full_name.clone(),
+                column_name: col_name.clone(),
+                column_type: pg_type.to_uppercase(),
+                default_value,
+            });
+        }
+
+        // Find removed columns (in DB but not in YAML)
+        // Exclude internal columns that are auto-managed
+        let internal_columns: HashSet<&str> = ["rindexer_id"].into_iter().collect();
+
+        for col_name in existing_col_names.difference(&expected_col_names) {
+            if !internal_columns.contains(col_name.as_str()) {
+                changes.push(SchemaChange::RemoveColumn {
                     table_full_name: table_full_name.clone(),
                     column_name: col_name.clone(),
-                    column_type: pg_type.to_uppercase(),
-                    default_value,
                 });
             }
+        }
 
-            // Find removed columns (in DB but not in YAML)
-            // Exclude internal columns that are auto-managed
-            let internal_columns: HashSet<&str> = ["rindexer_id"].into_iter().collect();
+        // Check for primary key changes
+        if let Some(current_pk) = get_primary_key_columns(client, schema_name, &table_name).await? {
+            let expected_pk = get_expected_pk_columns(table);
 
-            for col_name in existing_col_names.difference(&expected_col_names) {
-                if !internal_columns.contains(col_name.as_str()) {
-                    changes.push(SchemaChange::RemoveColumn {
-                        table_full_name: table_full_name.clone(),
-                        column_name: col_name.clone(),
-                    });
-                }
+            if current_pk.columns != expected_pk {
+                changes.push(SchemaChange::ChangePrimaryKey {
+                    table_full_name: table_full_name.clone(),
+                    current_pk_columns: current_pk.columns,
+                    new_pk_columns: expected_pk,
+                });
+            }
+        }
+
+        // Check for type changes (only for user-defined columns with resolved types)
+        for column in &table.columns {
+            // Skip type comparison if column type isn't resolved yet
+            if column.column_type.is_none() {
+                continue;
             }
 
-            // Check for primary key changes
-            if let Some(current_pk) =
-                get_primary_key_columns(client, schema_name, &table_name).await?
-            {
-                let expected_pk = get_expected_pk_columns(table);
-
-                if current_pk.columns != expected_pk {
-                    changes.push(SchemaChange::ChangePrimaryKey {
-                        table_full_name: table_full_name.clone(),
-                        current_pk_columns: current_pk.columns,
-                        new_pk_columns: expected_pk,
-                    });
-                }
-            }
-
-            // Check for type changes (only for user-defined columns with resolved types)
-            for column in &table.columns {
-                // Skip type comparison if column type isn't resolved yet
-                if column.column_type.is_none() {
+            if let Some(existing_type) = existing_col_types.get(&column.name) {
+                let expected_type = expected_columns.get(&column.name).unwrap();
+                // Skip if expected type is unknown (not resolved)
+                if expected_type == "unknown" {
                     continue;
                 }
 
-                if let Some(existing_type) = existing_col_types.get(&column.name) {
-                    let expected_type = expected_columns.get(&column.name).unwrap();
-                    // Skip if expected type is unknown (not resolved)
-                    if expected_type == "unknown" {
-                        continue;
-                    }
+                // Normalize types for comparison
+                let normalized_existing = normalize_pg_type(existing_type);
+                let normalized_expected = normalize_pg_type(expected_type);
 
-                    // Normalize types for comparison
-                    let normalized_existing = normalize_pg_type(existing_type);
-                    let normalized_expected = normalize_pg_type(expected_type);
-
-                    if normalized_existing != normalized_expected {
-                        changes.push(SchemaChange::ColumnTypeChanged {
-                            table_full_name: table_full_name.clone(),
-                            column_name: column.name.clone(),
-                            current_type: existing_type.clone(),
-                            new_type: expected_type.clone(),
-                        });
-                    }
+                if normalized_existing != normalized_expected {
+                    changes.push(SchemaChange::ColumnTypeChanged {
+                        table_full_name: table_full_name.clone(),
+                        column_name: column.name.clone(),
+                        current_type: existing_type.clone(),
+                        new_type: expected_type.clone(),
+                    });
                 }
             }
         }

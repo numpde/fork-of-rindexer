@@ -27,16 +27,20 @@ pub use database::{
         client::ClickhouseClient,
         schema_sync::{
             apply_schema_change as apply_clickhouse_schema_change,
+            detect_prepared_schema_changes as detect_prepared_clickhouse_schema_changes,
             detect_schema_changes as detect_clickhouse_schema_changes,
             SchemaChange as ClickhouseSchemaChange,
         },
-        setup::setup_clickhouse,
+        setup::{setup_clickhouse, setup_clickhouse_prepared},
     },
     generate::drop_tables_for_indexer_sql,
     postgres::{
         client::{BulkCursorUpdate, PostgresClient, ToSql},
-        schema_sync::{apply_schema_change, detect_schema_changes, SchemaChange},
-        setup::setup_postgres,
+        schema_sync::{
+            apply_schema_change, detect_prepared_schema_changes, detect_schema_changes,
+            SchemaChange,
+        },
+        setup::{setup_postgres, setup_postgres_prepared},
     },
 };
 
@@ -79,11 +83,13 @@ pub use colored::Colorize as RindexerColorize;
 pub use database::sql_type_wrapper::EthereumSqlTypeWrapper;
 pub use futures::FutureExt;
 pub use indexer::no_code::resolve_table_column_types;
+pub use indexer::schema::PreparedSchema;
 pub use lazy_static::lazy_static;
 pub use reqwest::header::HeaderMap;
 pub use serde_json;
 pub use start::{
-    start_rindexer, start_rindexer_no_code, IndexerNoCodeDetails, IndexingDetails, StartDetails,
+    start_rindexer, start_rindexer_no_code, start_rindexer_no_code_prepared,
+    start_rindexer_prepared, IndexerNoCodeDetails, IndexingDetails, PreparedProject, StartDetails,
     StartNoCodeDetails,
 };
 pub use tokio::main as rindexer_main;

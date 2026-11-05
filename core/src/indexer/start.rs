@@ -12,7 +12,6 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::abi::ABIItem;
 use crate::database::clickhouse::client::{ClickhouseClient, ClickhouseConnectionError};
 use crate::database::generate::{
     generate_event_table_full_name, generate_indexer_contract_schema_name,
@@ -26,6 +25,7 @@ use crate::indexer::reorg::{
     reorg_safe_distance_for_chain, DerivedTableInfo, DerivedTableRollbackPlan, EventTableInfo,
     ReorgBlockHashPersistence, ReorgContext, ReorgCoordinator,
 };
+use crate::indexer::schema::PreparedSchema;
 use crate::indexer::Indexer;
 use crate::manifest::network::ReorgHandlingConfig;
 use crate::{
@@ -38,8 +38,7 @@ use crate::{
         dependency::ContractEventsDependenciesConfig,
         last_synced::{get_last_synced_block_number, SyncConfig},
         native_transfer::{
-            native_block_channel, native_transfer_block_fetch, NATIVE_TRANSFER_ABI,
-            NATIVE_TRANSFER_CONTRACT_NAME,
+            native_block_channel, native_transfer_block_fetch, NATIVE_TRANSFER_CONTRACT_NAME,
         },
         process::{
             process_contracts_events_with_dependencies, process_non_blocking_event,
@@ -453,68 +452,21 @@ fn collect_streams_clients_for_network(
     out
 }
 
-/// Resolve the manifest contract behind a registry event's contract name.
-///
-/// Chain-wide `filter:` contracts are renamed with a `Filter` suffix when the event
-/// registry is built (`identify_and_modify_filter`), and a filter contract that declares
-/// `tables:` is renamed once more before that by `resolve_table_column_types`, so the
-/// registry may know a contract as `FPMMFilter` or `FPMMFilterFilter` while the manifest
-/// copies returned by `all_contracts()` carry the name with fewer suffixes. Match the exact
-/// name first; otherwise compare filter contracts with every trailing `Filter` removed on
-/// both sides, and refuse an ambiguous match rather than guess.
-fn find_manifest_contract(
-    manifest: &Manifest,
-    contract_name: &str,
-) -> anyhow::Result<Option<crate::manifest::contract::Contract>> {
-    let contracts = manifest.all_contracts();
-    if let Some(contract) = contracts.iter().find(|contract| contract.name == contract_name) {
-        return Ok(Some(contract.clone()));
-    }
-    let wanted = strip_filter_suffixes(contract_name);
-    let candidates: Vec<&crate::manifest::contract::Contract> = contracts
-        .iter()
-        .filter(|contract| contract.is_filter() && strip_filter_suffixes(&contract.name) == wanted)
-        .collect();
-    anyhow::ensure!(
-        candidates.len() <= 1,
-        "ambiguous filter contract for '{}': {:?}",
-        contract_name,
-        candidates.iter().map(|c| c.name.as_str()).collect::<Vec<_>>()
-    );
-    Ok(candidates.first().map(|contract| (*contract).clone()))
-}
-
-/// `FPMMFilterFilter` -> `FPMM`; names without the suffix are returned unchanged.
-fn strip_filter_suffixes(name: &str) -> &str {
-    let mut stripped = name;
-    while let Some(base) = stripped.strip_suffix("Filter") {
-        if base.is_empty() {
-            break;
-        }
-        stripped = base;
-    }
-    stripped
-}
-
 fn event_rollback_source(
-    manifest: &Manifest,
-    project_path: &Path,
+    schema: &PreparedSchema,
     contract_name: &str,
     event_name: &str,
 ) -> anyhow::Result<RollbackEventSource> {
-    let abi_items: Vec<ABIItem> = if contract_name == NATIVE_TRANSFER_CONTRACT_NAME {
-        serde_json::from_str(NATIVE_TRANSFER_ABI)?
-    } else {
-        let contract = find_manifest_contract(manifest, contract_name)?
-            .ok_or_else(|| anyhow::anyhow!("contract '{}' not found in manifest", contract_name))?;
-        ABIItem::read_abi_items(project_path, &contract)?
-    };
+    let contract = schema.contract(contract_name).map_err(anyhow::Error::msg)?;
     let event =
-        abi_items.iter().find(|item| item.type_ == "event" && item.name == event_name).ok_or_else(
-            || anyhow::anyhow!("event '{}::{}' not found in ABI", contract_name, event_name),
-        )?;
-
-    RollbackEventSource::new(&event.name, &event.inputs)
+        contract.events.iter().find(|event| event.info.name == event_name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "event '{}::{}' not found in prepared schema",
+                contract_name,
+                event_name
+            )
+        })?;
+    Ok(event.source.clone())
 }
 
 /// Build derived-table rollback + journal entries for an event's tables and merge
@@ -553,6 +505,15 @@ pub(super) fn build_derived_tables_for_event(
     Ok(())
 }
 
+type ContractEventStartup = (
+    Vec<JoinHandle<Result<(), ProcessEventError>>>,
+    Vec<ProcessedNetworkContract>,
+    Vec<(String, Arc<EventProcessingConfig>)>,
+    Vec<ContractEventsDependenciesConfig>,
+    HashMap<String, Arc<Mutex<ReorgCoordinator>>>,
+);
+
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn start_indexing_contract_events(
     manifest: &Manifest,
@@ -566,16 +527,39 @@ pub(super) async fn start_indexing_contract_events(
     no_live_indexing_forced: bool,
     cancel_token: CancellationToken,
     progress: Arc<IndexingEventsProgressState>,
-) -> Result<
-    (
-        Vec<JoinHandle<Result<(), ProcessEventError>>>,
-        Vec<ProcessedNetworkContract>,
-        Vec<(String, Arc<EventProcessingConfig>)>,
-        Vec<ContractEventsDependenciesConfig>,
-        HashMap<String, Arc<Mutex<ReorgCoordinator>>>,
-    ),
-    StartIndexingError,
-> {
+) -> Result<ContractEventStartup, StartIndexingError> {
+    let schema = PreparedSchema::try_new(project_path, indexer)
+        .map_err(|error| StartIndexingError::ConfigError(error.into()))?;
+    start_indexing_contract_events_prepared(
+        manifest,
+        project_path,
+        postgres,
+        clickhouse,
+        &schema,
+        registry,
+        trace_registry,
+        dependencies,
+        no_live_indexing_forced,
+        cancel_token,
+        progress,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn start_indexing_contract_events_prepared(
+    manifest: &Manifest,
+    project_path: &Path,
+    postgres: Option<Arc<PostgresClient>>,
+    clickhouse: Option<Arc<ClickhouseClient>>,
+    schema: &PreparedSchema,
+    registry: Arc<EventCallbackRegistry>,
+    trace_registry: Arc<TraceCallbackRegistry>,
+    dependencies: &[ContractEventDependencies],
+    no_live_indexing_forced: bool,
+    cancel_token: CancellationToken,
+    progress: Arc<IndexingEventsProgressState>,
+) -> Result<ContractEventStartup, StartIndexingError> {
     let mut apply_cross_contract_dependency_events_config_after_processing = Vec::new();
     let mut non_blocking_process_events = Vec::new();
     let mut processed_network_contracts: Vec<ProcessedNetworkContract> = Vec::new();
@@ -592,11 +576,12 @@ pub(super) async fn start_indexing_contract_events(
     }
 
     for event in registry.events.iter() {
-        let stream_details = indexer
-            .contracts
-            .iter()
-            .find(|c| c.name == event.contract.name)
-            .and_then(|c| c.streams.as_ref());
+        let contract = schema
+            .contract(&event.contract.name)
+            .map_err(|error| StartIndexingError::ConfigError(anyhow::anyhow!(error)))?;
+        let stream_details = contract.declaration.streams.as_ref();
+        let contract_csv_enabled =
+            manifest.storage.csv_enabled() && contract.declaration.generate_csv.unwrap_or(true);
 
         for network_contract in event.contract.details.iter() {
             let event = event.clone();
@@ -615,7 +600,7 @@ pub(super) async fn start_indexing_contract_events(
                     postgres: &postgres,
                     clickhouse: &clickhouse,
                     csv_details: &manifest_csv_details,
-                    contract_csv_enabled: manifest.contract_csv_enabled(&event.contract.name),
+                    contract_csv_enabled,
                     stream_details: &stream_details,
                     indexer_name: &event.indexer_name,
                     contract_name: &event.contract.name,
@@ -687,7 +672,7 @@ pub(super) async fn start_indexing_contract_events(
         let source_column_types = if event.tables.is_empty() {
             RollbackEventSource::default()
         } else {
-            event_rollback_source(manifest, project_path, &event.contract.name, &event.event_name)?
+            event_rollback_source(schema, &event.contract.name, &event.event_name)?
         };
         // Query details share raw history and derived effects. Register rollback
         // once per source event/network, while rewinding every subscription cursor.
@@ -761,12 +746,7 @@ pub(super) async fn start_indexing_contract_events(
             let source_column_types = if trace_event.tables.is_empty() {
                 RollbackEventSource::default()
             } else {
-                event_rollback_source(
-                    manifest,
-                    project_path,
-                    &trace_event.contract_name,
-                    &trace_event.event_name,
-                )?
+                event_rollback_source(schema, &trace_event.contract_name, &trace_event.event_name)?
             };
             for network_detail in trace_event.trace_information.details.iter() {
                 if !reorg_configs.contains_key(&network_detail.network) {
@@ -1099,6 +1079,33 @@ pub async fn start_historical_indexing(
     cancel_token: CancellationToken,
     progress: Arc<IndexingEventsProgressState>,
 ) -> Result<Vec<ProcessedNetworkContract>, StartIndexingError> {
+    let schema = PreparedSchema::try_new(project_path, &manifest.to_indexer())
+        .map_err(|error| StartIndexingError::ConfigError(error.into()))?;
+    start_historical_indexing_prepared(
+        manifest,
+        project_path,
+        &schema,
+        dependencies,
+        registry,
+        trace_registry,
+        cancel_token,
+        progress,
+    )
+    .await
+}
+
+/// Start historical indexing without re-reading or resolving the admitted schema.
+#[allow(clippy::too_many_arguments)]
+pub async fn start_historical_indexing_prepared(
+    manifest: &Manifest,
+    project_path: &Path,
+    schema: &PreparedSchema,
+    dependencies: &[ContractEventDependencies],
+    registry: Arc<EventCallbackRegistry>,
+    trace_registry: Arc<TraceCallbackRegistry>,
+    cancel_token: CancellationToken,
+    progress: Arc<IndexingEventsProgressState>,
+) -> Result<Vec<ProcessedNetworkContract>, StartIndexingError> {
     info!("Historical indexing started");
 
     let start = Instant::now();
@@ -1106,6 +1113,7 @@ pub async fn start_historical_indexing(
     let result = start_indexing(
         manifest,
         project_path,
+        schema,
         dependencies,
         true,
         registry,
@@ -1131,11 +1139,39 @@ pub async fn start_live_indexing(
     cancel_token: CancellationToken,
     progress: Arc<IndexingEventsProgressState>,
 ) -> Result<Vec<ProcessedNetworkContract>, StartIndexingError> {
+    let schema = PreparedSchema::try_new(project_path, &manifest.to_indexer())
+        .map_err(|error| StartIndexingError::ConfigError(error.into()))?;
+    start_live_indexing_prepared(
+        manifest,
+        project_path,
+        &schema,
+        dependencies,
+        registry,
+        trace_registry,
+        cancel_token,
+        progress,
+    )
+    .await
+}
+
+/// Retain the historical run's schema when setting up live callbacks and recovery.
+#[allow(clippy::too_many_arguments)]
+pub async fn start_live_indexing_prepared(
+    manifest: &Manifest,
+    project_path: &Path,
+    schema: &PreparedSchema,
+    dependencies: &[ContractEventDependencies],
+    registry: Arc<EventCallbackRegistry>,
+    trace_registry: Arc<TraceCallbackRegistry>,
+    cancel_token: CancellationToken,
+    progress: Arc<IndexingEventsProgressState>,
+) -> Result<Vec<ProcessedNetworkContract>, StartIndexingError> {
     info!("Live indexing started");
 
     start_indexing(
         manifest,
         project_path,
+        schema,
         dependencies,
         false,
         registry,
@@ -1150,6 +1186,7 @@ pub async fn start_live_indexing(
 async fn start_indexing(
     manifest: &Manifest,
     project_path: &Path,
+    schema: &PreparedSchema,
     dependencies: &[ContractEventDependencies],
     no_live_indexing_forced: bool,
     registry: Arc<EventCallbackRegistry>,
@@ -1163,18 +1200,18 @@ async fn start_indexing(
     // any events which are non-blocking and can be fired in parallel
     let mut non_blocking_process_events = Vec::new();
 
-    let indexer = manifest.to_indexer();
+    let indexer = schema.indexer();
 
     // Contract events must complete their setup first so the per-network reorg
     // coordinators exist before native-transfer tasks look them up. The returned
     // `network_coordinators` map is shared (each entry is Arc<Mutex<_>>), so
     // both pipelines observe the same coordinator for any given network.
-    let contract_events_indexer = start_indexing_contract_events(
+    let contract_events_indexer = start_indexing_contract_events_prepared(
         manifest,
         project_path,
         database.clone(),
         clickhouse.clone(),
-        &indexer,
+        schema,
         registry.clone(),
         trace_registry.clone(),
         dependencies,
@@ -1207,7 +1244,7 @@ async fn start_indexing(
         project_path,
         database.clone(),
         clickhouse.clone(),
-        &indexer,
+        indexer,
         trace_registry.clone(),
         cancel_token.clone(),
         progress.clone(),
@@ -1391,121 +1428,59 @@ mod tests {
     use crate::provider::mock::MockChainProvider;
     use std::path::Path;
 
-    const FILTER_TABLES_MANIFEST: &str = r#"
-name: filter_tables
-project_type: no-code
-networks:
-  - name: polygon
-    chain_id: 137
-    rpc: https://polygon.rpc.example.com
-    reorg_handling:
-      enabled: true
-storage:
-  postgres:
-    enabled: true
-contracts:
-  - name: FPMM
-    details:
-      - network: polygon
-        start_block: "4023693"
-        end_block: "87106452"
-        filter:
-          - event_name: FPMMBuy
-    abi: ./abis/fpmm_v1.json
-    include_events:
-      - FPMMBuy
-  - name: Plain
-    details:
-      - network: polygon
-        address: "0x4d97dcd97ec945f40cf65f87097ace5ea0476045"
-        start_block: "4023686"
-    abi: ./abis/conditional_tokens_v1.json
-"#;
-
-    fn filter_tables_manifest() -> Manifest {
-        serde_yaml::from_str(FILTER_TABLES_MANIFEST).expect("test manifest parses")
+    fn prepared_filter_fixture() -> (tempfile::TempDir, Manifest) {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("event.json"),
+            serde_json::json!([{
+                "type":"event", "name":"FPMMBuy", "anonymous":false,
+                "inputs":[{"name":"key16", "type":"uint16", "indexed":false}]
+            }])
+            .to_string(),
+        )
+        .unwrap();
+        let manifest = serde_json::from_value(serde_json::json!({
+            "name":"FilterTables", "project_type":"no-code", "networks":[],
+            "contracts":[{"name":"FPMM", "abi":"event.json",
+                "details":[{"network":"polygon", "filter":[{"event_name":"FPMMBuy"}]}],
+                "include_events":["FPMMBuy"]}]
+        }))
+        .unwrap();
+        (directory, manifest)
     }
 
     #[test]
-    fn find_manifest_contract_matches_exact_names() {
-        let manifest = filter_tables_manifest();
-        assert_eq!(
-            find_manifest_contract(&manifest, "Plain").unwrap().map(|c| c.name),
-            Some("Plain".to_string())
-        );
-        assert_eq!(
-            find_manifest_contract(&manifest, "FPMM").unwrap().map(|c| c.name),
-            Some("FPMM".to_string())
-        );
-        assert!(find_manifest_contract(&manifest, "Missing").unwrap().is_none());
+    fn prepared_filter_lookup_uses_one_canonical_name() {
+        let (directory, manifest) = prepared_filter_fixture();
+        let schema = PreparedSchema::try_new(directory.path(), &manifest.to_indexer()).unwrap();
+        let logical = schema.contract("FPMM").unwrap();
+        let runtime = schema.contract("FPMMFilter").unwrap();
+        assert!(std::ptr::eq(logical, runtime));
+        assert_eq!(runtime.name, "FPMMFilter");
+        assert!(schema.contract("FPMMFilterFilter").is_err());
+        assert!(schema.contract("Missing").is_err());
+        assert_eq!(manifest.contracts[0].name, "FPMM");
     }
 
     #[test]
-    fn find_manifest_contract_matches_filter_registry_name() {
-        // A filter contract without tables is renamed once when the event registry is
-        // built: the registry knows it as `FPMMFilter` while the manifest still says `FPMM`.
-        let manifest = filter_tables_manifest();
-        let found = find_manifest_contract(&manifest, "FPMMFilter")
-            .unwrap()
-            .expect("filter contract resolves");
-        assert_eq!(found.name, "FPMM");
-        assert!(
-            find_manifest_contract(&manifest, "PlainFilter").unwrap().is_none(),
-            "plain contracts never match a filter-derived name"
-        );
+    fn prepared_filter_lookup_rejects_runtime_name_collisions() {
+        let (directory, mut manifest) = prepared_filter_fixture();
+        let mut other = manifest.contracts[0].clone();
+        other.name = "FPMMFilter".to_string();
+        manifest.contracts.push(other);
+        let error = PreparedSchema::try_new(directory.path(), &manifest.to_indexer()).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("FPMM") && message.contains("FPMMFilter"), "{message}");
     }
 
     #[test]
-    fn find_manifest_contract_matches_twice_renamed_name_against_unrenamed_manifest() {
-        // The manifest handed to the reorg setup may still carry the original name while
-        // the registry already carries two suffixes.
-        let manifest = filter_tables_manifest();
-        let found =
-            find_manifest_contract(&manifest, "FPMMFilterFilter").unwrap().expect("resolves");
-        assert_eq!(found.name, "FPMM");
-        assert!(find_manifest_contract(&manifest, "PlainFilterFilter").unwrap().is_none());
-    }
-
-    #[test]
-    fn find_manifest_contract_refuses_ambiguous_filter_names() {
-        // `Foo` and `FooFilter` as two filter contracts both strip to `Foo`; guessing could
-        // pick the wrong ABI, so the resolver must error instead.
-        let mut manifest = filter_tables_manifest();
-        let mut twin = manifest.contracts[0].clone();
-        twin.name = "FPMMFilter".to_string();
-        manifest.contracts.push(twin);
-        let err = find_manifest_contract(&manifest, "FPMMFilterFilter").unwrap_err();
-        assert!(err.to_string().contains("ambiguous filter contract"), "{err}");
-        // exact matches still win over the fallback
-        assert_eq!(
-            find_manifest_contract(&manifest, "FPMMFilter").unwrap().map(|c| c.name),
-            Some("FPMMFilter".to_string())
-        );
-    }
-
-    #[test]
-    fn strip_filter_suffixes_removes_every_trailing_suffix() {
-        assert_eq!(strip_filter_suffixes("FPMMFilterFilter"), "FPMM");
-        assert_eq!(strip_filter_suffixes("FPMMFilter"), "FPMM");
-        assert_eq!(strip_filter_suffixes("FPMM"), "FPMM");
-        assert_eq!(strip_filter_suffixes("Filter"), "Filter");
-        assert_eq!(strip_filter_suffixes("FilterFilter"), "Filter");
-    }
-
-    #[test]
-    fn find_manifest_contract_matches_twice_renamed_filter_with_tables() {
-        // A filter contract WITH tables is renamed by resolve_table_column_types before the
-        // registry renames it again: manifest `FPMMFilter`, registry `FPMMFilterFilter`
-        // (the production schema polymarket_indexer_fpmm_filter_filter is that name).
-        let mut manifest = filter_tables_manifest();
-        assert!(manifest.contracts[0].identify_and_modify_filter());
-        assert_eq!(manifest.contracts[0].name, "FPMMFilter");
-        let found = find_manifest_contract(&manifest, "FPMMFilterFilter")
-            .unwrap()
-            .expect("twice-renamed filter contract resolves");
-        assert_eq!(found.name, "FPMMFilter");
-        // the fallback only applies to filter contracts
-        assert!(find_manifest_contract(&manifest, "PlainFilterFilter").unwrap().is_none());
+    fn rollback_source_retains_admitted_abi_after_file_removal() {
+        let (directory, manifest) = prepared_filter_fixture();
+        let schema = PreparedSchema::try_new(directory.path(), &manifest.to_indexer()).unwrap();
+        std::fs::remove_file(directory.path().join("event.json")).unwrap();
+        event_rollback_source(&schema, "FPMMFilter", "FPMMBuy").unwrap();
+        let error = event_rollback_source(&schema, "FPMMFilter", "Missing").unwrap_err();
+        assert!(error.to_string().contains("FPMMFilter::Missing"), "{error}");
     }
 
     fn empty_sync_config() -> SyncConfig<'static> {

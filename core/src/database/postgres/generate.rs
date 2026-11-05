@@ -12,6 +12,7 @@ fn generate_columns(inputs: &[ABIInput], property_type: &GenerateAbiPropertiesTy
         .collect()
 }
 
+#[cfg(test)]
 pub fn generate_columns_with_data_types(inputs: &[ABIInput]) -> Vec<String> {
     generate_columns(inputs, &GenerateAbiPropertiesType::PostgresWithDataTypes)
 }

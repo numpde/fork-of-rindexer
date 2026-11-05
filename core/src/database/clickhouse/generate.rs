@@ -1,11 +1,14 @@
+#[cfg(test)]
+use crate::abi::{ABIInput, GenerateAbiPropertiesType};
 use crate::helpers::solidity_type_parts;
+#[cfg(test)]
 use std::path::Path;
-use tracing::{error, info};
+use tracing::info;
 
 use crate::{
-    abi::{ABIInput, ABIItem, EventInfo, GenerateAbiPropertiesType},
+    abi::EventInfo,
     helpers::camel_to_snake,
-    indexer::Indexer,
+    indexer::{schema::PreparedSchema, tables::TableRuntime, Indexer},
     types::code::Code,
 };
 
@@ -16,7 +19,7 @@ use crate::database::generate::{
 use crate::database::postgres::generate::{
     generate_internal_event_table_name_no_shorten, GenerateInternalFactoryEventTableNameParams,
 };
-use crate::manifest::contract::{injected_columns, FactoryDetailsYaml, Table};
+use crate::manifest::contract::{injected_columns, FactoryDetailsYaml};
 
 pub fn generate_reorg_block_hashes_table_clickhouse_sql() -> String {
     r#"CREATE TABLE IF NOT EXISTS rindexer_internal.reorg_block_hashes (
@@ -44,68 +47,62 @@ pub fn generate_derived_op_log_table_clickhouse_sql() -> String {
         .to_string()
 }
 
+#[cfg(test)]
 pub fn generate_tables_for_indexer_clickhouse(
     project_path: &Path,
     indexer: &Indexer,
     disable_event_tables: bool,
 ) -> Result<Code, GenerateTablesForIndexerSqlError> {
+    let schema = PreparedSchema::try_new(project_path, indexer)?;
+    generate_prepared_tables_clickhouse(&schema, disable_event_tables)
+}
+
+/// Generate ClickHouse tables from the same prepared columns used by runtime.
+pub fn generate_prepared_tables_clickhouse(
+    schema: &PreparedSchema,
+    disable_event_tables: bool,
+) -> Result<Code, GenerateTablesForIndexerSqlError> {
+    let indexer = schema.indexer();
     let mut sql = "CREATE DATABASE IF NOT EXISTS rindexer_internal;".to_string();
     sql.push_str(&generate_reorg_block_hashes_table_clickhouse_sql());
     sql.push_str(&generate_derived_op_log_table_clickhouse_sql());
 
-    for contract in &indexer.contracts {
-        let contract_name = contract.before_modify_name_if_filter_readonly();
-        let abi_items = ABIItem::read_abi_items(project_path, contract)?;
-        let event_names = ABIItem::extract_event_names_and_signatures_from_abi(abi_items)?;
-        let schema_name = generate_indexer_contract_schema_name(&indexer.name, &contract_name);
+    for prepared in schema.contracts().iter().chain(schema.native()) {
+        let contract = &prepared.declaration;
+        let schema_name = generate_indexer_contract_schema_name(&indexer.name, &prepared.name);
         let networks: Vec<&str> = contract.details.iter().map(|d| d.network.as_str()).collect();
         let factories = contract.details.iter().flat_map(|d| d.factory.clone()).collect::<Vec<_>>();
-
         if !disable_event_tables {
-            sql.push_str(format!("CREATE DATABASE IF NOT EXISTS {};", schema_name).as_str());
-            info!("Creating database if not exists: {}", schema_name);
-
-            // Create raw event tables for every event whose raw events the
-            // runtime stores (include_events plus table-driving events)
-            let raw_events: Vec<_> = event_names
-                .iter()
-                .filter(|e| contract.stores_raw_events(&e.name))
-                .cloned()
-                .collect();
-
-            if !raw_events.is_empty() {
-                sql.push_str(&generate_event_table_clickhouse(&raw_events, &schema_name));
-            }
-
-            // Generate custom tables if defined
-            if let Some(tables) = &contract.tables {
-                sql.push_str(&generate_tables_clickhouse(tables, &schema_name)?);
-            }
+            sql.push_str(&format!("CREATE DATABASE IF NOT EXISTS {schema_name};"));
+            sql.push_str(&generate_event_table_clickhouse(
+                prepared
+                    .events
+                    .iter()
+                    .filter(|event| contract.stores_raw_events(&event.info.name))
+                    .map(|event| (&event.info, event.columns.clickhouse_definitions())),
+                &schema_name,
+            ));
+            sql.push_str(&generate_tables_clickhouse(&prepared.tables, &schema_name)?);
         }
-
-        sql.push_str(&generate_internal_event_table_clickhouse(
-            &event_names,
-            &schema_name,
-            networks,
-        ));
-
+        let events: Vec<_> = prepared.events.iter().map(|event| event.info.clone()).collect();
+        sql.push_str(&generate_internal_event_table_clickhouse(&events, &schema_name, networks));
         sql.push_str(&generate_internal_factory_event_table_sql(&indexer.name, &factories));
     }
 
     Ok(Code::new(sql))
 }
 
-fn generate_event_table_clickhouse(abi_inputs: &[EventInfo], schema_name: &str) -> String {
-    abi_inputs
-        .iter()
-        .map(|event_info| {
+fn generate_event_table_clickhouse<'a>(
+    events: impl IntoIterator<Item = (&'a EventInfo, &'a [String])>,
+    schema_name: &str,
+) -> String {
+    events
+        .into_iter()
+        .map(|(event_info, columns)| {
             let table_name = format!("{}.{}", schema_name, camel_to_snake(&event_info.name));
             info!("Creating table if not exists: {}", table_name);
-            let event_columns = if event_info.inputs.is_empty() {
-                "".to_string()
-            } else {
-                generate_columns_with_data_types(&event_info.inputs).join(", ") + ","
-            };
+            let event_columns =
+                if columns.is_empty() { "".to_string() } else { columns.join(", ") + "," };
 
             let create_table_sql = format!(
                 r#"CREATE TABLE IF NOT EXISTS {} (
@@ -137,16 +134,13 @@ fn generate_event_table_clickhouse(abi_inputs: &[EventInfo], schema_name: &str) 
 
 /// Generate ClickHouse SQL for custom tables
 fn generate_tables_clickhouse(
-    tables: &[Table],
+    tables: &[TableRuntime],
     schema_name: &str,
 ) -> Result<String, GenerateTablesForIndexerSqlError> {
     let statements = tables
         .iter()
-        .map(|declaration| {
-            let resolved = declaration
-                .try_resolve_storage_columns()
-                .map_err(GenerateTablesForIndexerSqlError::InvalidCustomTableSchema)?;
-            let table = resolved.definition();
+        .map(|runtime| {
+            let table = runtime.table.definition();
             let effective_db = table.database.as_deref().unwrap_or(schema_name);
             let table_name = format!("{}.{}", effective_db, camel_to_snake(&table.name));
 
@@ -329,6 +323,7 @@ fn generate_internal_factory_event_table_sql(
         .join("\n")
 }
 
+#[cfg(test)]
 fn generate_columns(inputs: &[ABIInput], property_type: &GenerateAbiPropertiesType) -> Vec<String> {
     ABIInput::generate_abi_name_properties(inputs, property_type, None)
         .into_iter()
@@ -336,35 +331,40 @@ fn generate_columns(inputs: &[ABIInput], property_type: &GenerateAbiPropertiesTy
         .collect()
 }
 
+#[cfg(test)]
 pub fn generate_columns_with_data_types(inputs: &[ABIInput]) -> Vec<String> {
     generate_columns(inputs, &GenerateAbiPropertiesType::ClickhouseWithDataTypes)
 }
 
-pub fn drop_tables_for_indexer_clickhouse(project_path: &Path, indexer: &Indexer) -> Code {
+pub(crate) fn drop_prepared_tables_clickhouse(schema: &PreparedSchema) -> Code {
+    drop_tables_from_events(
+        schema.indexer(),
+        schema.contracts().iter().chain(schema.native()).map(|contract| {
+            (
+                &contract.declaration,
+                contract.name.clone(),
+                contract.events.iter().map(|event| event.info.name.clone()).collect(),
+            )
+        }),
+    )
+}
+
+fn drop_tables_from_events<'a>(
+    indexer: &Indexer,
+    contracts: impl IntoIterator<Item = (&'a crate::manifest::contract::Contract, String, Vec<String>)>,
+) -> Code {
     let mut sql = String::new();
 
     sql.push_str("DROP TABLE IF EXISTS rindexer_internal.latest_block;");
 
-    for contract in &indexer.contracts {
-        let contract_name = contract.before_modify_name_if_filter_readonly();
+    for (contract, contract_name, events) in contracts {
         let schema_name = generate_indexer_contract_schema_name(&indexer.name, &contract_name);
         sql.push_str(format!("DROP DATABASE IF EXISTS {schema_name};").as_str());
 
         // drop last synced blocks for contracts
-        let abi_items = ABIItem::read_abi_items(project_path, contract);
-        if let Ok(abi_items) = abi_items {
-            for abi_item in abi_items.iter() {
-                let table_name =
-                    generate_internal_event_table_name_no_shorten(&schema_name, &abi_item.name);
-                sql.push_str(
-                    format!("DROP TABLE IF EXISTS rindexer_internal.{table_name};").as_str(),
-                );
-            }
-        } else {
-            error!(
-                "Could not read ABI items for contract moving on clearing the other data up: {}",
-                contract.name
-            );
+        for event in events {
+            let table_name = generate_internal_event_table_name_no_shorten(&schema_name, &event);
+            sql.push_str(&format!("DROP TABLE IF EXISTS rindexer_internal.{table_name};"));
         }
 
         // drop factory indexing tables

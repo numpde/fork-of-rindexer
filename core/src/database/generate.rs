@@ -1,12 +1,15 @@
 use crate::abi::{EventInfo, ParamTypeError, ReadAbiError};
 use crate::database::postgres::client::PostgresError;
+#[cfg(test)]
+use crate::database::postgres::generate::generate_columns_with_data_types;
 use crate::database::postgres::generate::{
-    generate_columns_with_data_types, generate_derived_op_log_table_sql,
-    generate_internal_cron_table_name, generate_internal_event_table_name,
-    generate_reorg_block_hashes_table_sql, GenerateInternalFactoryEventTableNameParams,
+    generate_derived_op_log_table_sql, generate_internal_cron_table_name,
+    generate_internal_event_table_name, generate_reorg_block_hashes_table_sql,
+    GenerateInternalFactoryEventTableNameParams,
 };
 use crate::helpers::{camel_to_snake, snake_to_camel};
-use crate::indexer::native_transfer::{NATIVE_TRANSFER_ABI, NATIVE_TRANSFER_CONTRACT_NAME};
+use crate::indexer::schema::PreparedSchema;
+use crate::indexer::tables::TableRuntime;
 use crate::indexer::Indexer;
 use crate::manifest::contract::{
     injected_columns, Contract, FactoryDetailsYaml, ResolvedTable, Table,
@@ -32,22 +35,34 @@ pub(crate) const RAW_EVENT_METADATA_COLUMNS: [&str; 8] = [
 /// PostgreSQL generates this key; it is reserved but not supplied by raw writers.
 pub(crate) const RAW_EVENT_ID_COLUMN: &str = "rindexer_id";
 
+#[cfg(test)]
 fn generate_event_table_sql_with_comments(
     abi_inputs: &[EventInfo],
     contract_name: &str,
     schema_name: &str,
     apply_full_name_comment_for_events: Vec<String>,
 ) -> String {
-    abi_inputs
-        .iter()
-        .map(|event_info| {
+    generate_event_table_sql(
+        abi_inputs.iter().map(|event| (event, generate_columns_with_data_types(&event.inputs))),
+        contract_name,
+        schema_name,
+        apply_full_name_comment_for_events,
+    )
+}
+
+fn generate_event_table_sql<'a>(
+    events: impl IntoIterator<Item = (&'a EventInfo, Vec<String>)>,
+    contract_name: &str,
+    schema_name: &str,
+    apply_full_name_comment_for_events: Vec<String>,
+) -> String {
+    events
+        .into_iter()
+        .map(|(event_info, columns)| {
             let table_name = format!("{}.{}", schema_name, camel_to_snake(&event_info.name));
             info!("Creating table if not exists: {}", table_name);
-            let event_columns = if event_info.inputs.is_empty() {
-                "".to_string()
-            } else {
-                generate_columns_with_data_types(&event_info.inputs).join(", ") + ","
-            };
+            let event_columns =
+                if columns.is_empty() { "".to_string() } else { columns.join(", ") + "," };
 
             let create_table_sql = format!(
                 "CREATE TABLE IF NOT EXISTS {table_name} (\
@@ -211,20 +226,39 @@ pub enum GenerateTablesForIndexerSqlError {
 
     #[error("Cannot generate custom-table DDL: {0}")]
     InvalidCustomTableSchema(String),
+
+    #[error("Cannot prepare storage schema: {0}")]
+    InvalidPreparedSchema(String),
 }
 
 /// Generate SQL for custom tables
+#[cfg(test)]
 fn generate_tables_sql(
     tables: &[Table],
     contract_name: &str,
     schema_name: &str,
     clashing_table_names: &[String],
 ) -> Result<String, GenerateTablesForIndexerSqlError> {
+    let runtimes = tables
+        .iter()
+        .map(|table| {
+            TableRuntime::try_new(table, "", contract_name)
+                .map_err(GenerateTablesForIndexerSqlError::InvalidCustomTableSchema)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    generate_resolved_tables_sql(&runtimes, contract_name, schema_name, clashing_table_names)
+}
+
+fn generate_resolved_tables_sql(
+    tables: &[TableRuntime],
+    contract_name: &str,
+    schema_name: &str,
+    clashing_table_names: &[String],
+) -> Result<String, GenerateTablesForIndexerSqlError> {
     Ok(tables
         .iter()
-        .map(|declaration| {
-            let resolved = declaration.try_resolve_storage_columns().map_err(GenerateTablesForIndexerSqlError::InvalidCustomTableSchema)?;
-            let table = resolved.definition();
+        .map(|runtime| {
+            let table = runtime.table.definition();
             let schema_name = table.database.as_deref().unwrap_or(schema_name);
             if table.database.is_some() {
                 crate::indexer::reorg::validate_sql_identifier(schema_name, "custom table schema")
@@ -383,35 +417,22 @@ pub fn generate_table_full_name(
     format!("{}.{}", schema_name, camel_to_snake(table_name))
 }
 
-/// If any event names match the whole table name should be exposed differently on graphql
-/// to avoid clashing of graphql namings
-pub fn find_clashing_event_names(
-    project_path: &Path,
-    current_contract_name: &str,
-    other_contracts: &[Contract],
-    current_event_names: &[EventInfo],
-) -> Result<Vec<String>, GenerateTablesForIndexerSqlError> {
-    let mut clashing_events = Vec::new();
-
-    for other_contract in other_contracts {
-        if other_contract.name == current_contract_name {
-            continue;
-        }
-
-        let other_abi_items = ABIItem::read_abi_items(project_path, other_contract)?;
-        let other_event_names =
-            ABIItem::extract_event_names_and_signatures_from_abi(other_abi_items)?;
-
-        for event_name in current_event_names {
-            if other_event_names.iter().any(|e| e.name == event_name.name)
-                && !clashing_events.contains(&event_name.name)
-            {
-                clashing_events.push(event_name.name.clone());
-            }
-        }
-    }
-
-    Ok(clashing_events)
+/// Find event names already present in another prepared contract.
+fn find_clashing_event_names(
+    schema: &PreparedSchema,
+    contract_name: &str,
+    events: &[EventInfo],
+) -> Vec<String> {
+    events
+        .iter()
+        .filter(|event| {
+            schema.contracts().iter().any(|other| {
+                other.name != contract_name
+                    && other.events.iter().any(|candidate| candidate.info.name == event.name)
+            })
+        })
+        .map(|event| event.name.clone())
+        .collect()
 }
 
 /// Find custom table names that clash across different contracts
@@ -442,104 +463,71 @@ pub fn find_clashing_table_names(
     clashing_tables
 }
 
+#[cfg(test)]
 pub fn generate_tables_for_indexer_sql(
     project_path: &Path,
     indexer: &Indexer,
     disable_event_tables: bool,
 ) -> Result<Code, GenerateTablesForIndexerSqlError> {
+    let schema = PreparedSchema::try_new(project_path, indexer)?;
+    generate_prepared_tables_sql(&schema, disable_event_tables)
+}
+
+/// Generate all PostgreSQL tables from the already validated startup schema.
+pub fn generate_prepared_tables_sql(
+    schema: &PreparedSchema,
+    disable_event_tables: bool,
+) -> Result<Code, GenerateTablesForIndexerSqlError> {
+    let indexer = schema.indexer();
     let mut sql = "CREATE SCHEMA IF NOT EXISTS rindexer_internal;".to_string();
     sql.push_str(&generate_reorg_block_hashes_table_sql());
     sql.push_str(&generate_derived_op_log_table_sql());
     sql.push_str(crate::database::postgres::event_applications::schema_sql());
     sql.push_str(crate::database::postgres::stream_outbox::SCHEMA_SQL);
 
-    for contract in &indexer.contracts {
-        let contract_name = contract.before_modify_name_if_filter_readonly();
-        let abi_items = ABIItem::read_abi_items(project_path, contract)?;
-        let events = ABIItem::extract_event_names_and_signatures_from_abi(abi_items)?;
-        let schema_name = generate_indexer_contract_schema_name(&indexer.name, &contract_name);
+    for prepared in schema.contracts().iter().chain(schema.native()) {
+        let contract = &prepared.declaration;
+        let contract_name = &prepared.name;
+        let events: Vec<_> = prepared.events.iter().map(|event| event.info.clone()).collect();
+        let schema_name = generate_indexer_contract_schema_name(&indexer.name, contract_name);
         let networks: Vec<&str> = contract.details.iter().map(|d| d.network.as_str()).collect();
         let factories = contract.details.iter().flat_map(|d| d.factory.clone()).collect::<Vec<_>>();
 
         if !disable_event_tables {
-            sql.push_str(format!("CREATE SCHEMA IF NOT EXISTS {schema_name};").as_str());
-            info!("Creating schema if not exists: {}", schema_name);
-
-            // Create raw event tables for every event whose raw events the
-            // runtime stores (include_events plus table-driving events)
-            let raw_events: Vec<_> =
-                events.iter().filter(|e| contract.stores_raw_events(&e.name)).cloned().collect();
-
-            if !raw_events.is_empty() {
-                let event_matching_name_on_other = find_clashing_event_names(
-                    project_path,
-                    &contract_name,
-                    &indexer.contracts,
-                    &raw_events,
-                )?;
-
-                sql.push_str(&generate_event_table_sql_with_comments(
-                    &raw_events,
-                    &contract.name,
-                    &schema_name,
-                    event_matching_name_on_other,
-                ));
-            }
-
-            // Generate custom tables if defined
-            if let Some(tables) = &contract.tables {
-                let clashing_table_names =
-                    find_clashing_table_names(&contract_name, tables, &indexer.contracts);
-                sql.push_str(&generate_tables_sql(
-                    tables,
-                    &contract.name,
-                    &schema_name,
-                    &clashing_table_names,
-                )?);
-            }
+            sql.push_str(&format!("CREATE SCHEMA IF NOT EXISTS {schema_name};"));
+            let raw_events: Vec<_> = prepared
+                .events
+                .iter()
+                .filter(|event| contract.stores_raw_events(&event.info.name))
+                .collect();
+            let raw_infos: Vec<_> = raw_events.iter().map(|event| event.info.clone()).collect();
+            let clashing_events = find_clashing_event_names(schema, contract_name, &raw_infos);
+            sql.push_str(&generate_event_table_sql(
+                raw_events
+                    .iter()
+                    .map(|event| (&event.info, event.columns.postgres_definitions().to_vec())),
+                contract_name,
+                &schema_name,
+                clashing_events,
+            ));
+            let clashing_tables = find_clashing_table_names(
+                &contract.name,
+                contract.tables.as_deref().unwrap_or_default(),
+                &indexer.contracts,
+            );
+            sql.push_str(&generate_resolved_tables_sql(
+                &prepared.tables,
+                contract_name,
+                &schema_name,
+                &clashing_tables,
+            )?);
         }
 
-        // we still need to create the internal tables for the contract
         sql.push_str(&generate_internal_event_table_sql(&events, &schema_name, networks.clone()));
-
-        // generate internal tables for contract factories indexing
         sql.push_str(&generate_internal_factory_event_table_sql(&indexer.name, &factories));
-
-        // generate internal tables for cron sync state tracking
         if let Some(tables) = &contract.tables {
             sql.push_str(&generate_internal_cron_table_sql(tables, &schema_name, networks));
         }
-    }
-
-    if indexer.native_transfers.enabled {
-        let contract_name = NATIVE_TRANSFER_CONTRACT_NAME.to_string();
-        let abi_str = NATIVE_TRANSFER_ABI;
-        let abi_items: Vec<ABIItem> =
-            serde_json::from_str(abi_str).expect("JSON was not well-formatted");
-        let event_names = ABIItem::extract_event_names_and_signatures_from_abi(abi_items)?;
-        let schema_name = generate_indexer_contract_schema_name(&indexer.name, &contract_name);
-        let networks = indexer.clone().native_transfers.networks.unwrap();
-        let networks: Vec<&str> = networks.iter().map(|d| d.network.as_str()).collect();
-
-        if !disable_event_tables {
-            sql.push_str(format!("CREATE SCHEMA IF NOT EXISTS {schema_name};").as_str());
-            info!("Creating schema if not exists: {}", schema_name);
-
-            let event_matching_name_on_other = find_clashing_event_names(
-                project_path,
-                &contract_name,
-                &indexer.contracts,
-                &event_names,
-            )?;
-
-            sql.push_str(&generate_event_table_sql_with_comments(
-                &event_names,
-                &contract_name,
-                &schema_name,
-                event_matching_name_on_other,
-            ));
-        }
-        sql.push_str(&generate_internal_event_table_sql(&event_names, &schema_name, networks));
     }
 
     sql.push_str(&format!(
@@ -637,6 +625,38 @@ pub fn compact_table_name_if_needed(table_name: String) -> String {
 }
 
 pub fn drop_tables_for_indexer_sql(project_path: &Path, indexer: &Indexer) -> Code {
+    let contracts = indexer.contracts.iter().map(|contract| {
+        let events = ABIItem::read_abi_items(project_path, contract)
+            .map(|items| items.into_iter().map(|item| item.name).collect())
+            .unwrap_or_else(|error| {
+                error!(
+                    "Could not read ABI for {} while preparing table reset: {error}",
+                    contract.name
+                );
+                Vec::new()
+            });
+        (contract, contract.before_modify_name_if_filter_readonly().into_owned(), events)
+    });
+    drop_tables_from_events(indexer, contracts)
+}
+
+pub(crate) fn drop_prepared_tables_sql(schema: &PreparedSchema) -> Code {
+    drop_tables_from_events(
+        schema.indexer(),
+        schema.contracts().iter().chain(schema.native()).map(|contract| {
+            (
+                &contract.declaration,
+                contract.name.clone(),
+                contract.events.iter().map(|event| event.info.name.clone()).collect(),
+            )
+        }),
+    )
+}
+
+fn drop_tables_from_events<'a>(
+    indexer: &Indexer,
+    contracts: impl IntoIterator<Item = (&'a crate::manifest::contract::Contract, String, Vec<String>)>,
+) -> Code {
     // Receipt metadata can be absent on databases created before replay-safe
     // writes. Initialize the internal schema before this explicit destructive
     // reset so namespace cleanup is valid for both old and new databases.
@@ -655,8 +675,7 @@ pub fn drop_tables_for_indexer_sql(project_path: &Path, indexer: &Indexer) -> Co
 
     sql.push_str("DROP TABLE IF EXISTS rindexer_internal.latest_block;");
 
-    for contract in &indexer.contracts {
-        let contract_name = contract.before_modify_name_if_filter_readonly();
+    for (contract, contract_name, events) in contracts {
         let schema_name = generate_indexer_contract_schema_name(&indexer.name, &contract_name);
         sql.push_str(format!("DROP SCHEMA IF EXISTS {schema_name} CASCADE;").as_str());
         // Keep the ownership mapping because compact cursor namespaces cannot
@@ -665,20 +684,9 @@ pub fn drop_tables_for_indexer_sql(project_path: &Path, indexer: &Indexer) -> Co
         sql.push_str(&format!("DELETE FROM rindexer_internal.event_application_streams WHERE split_part(raw_table, '.', 1) = '{receipt_schema}';"));
 
         // drop last synced blocks for contracts
-        let abi_items = ABIItem::read_abi_items(project_path, contract);
-        if let Ok(abi_items) = abi_items {
-            for abi_item in abi_items.iter() {
-                let table_name = generate_internal_event_table_name(&schema_name, &abi_item.name);
-                sql.push_str(
-                    format!("DROP TABLE IF EXISTS rindexer_internal.{table_name} CASCADE;")
-                        .as_str(),
-                );
-            }
-        } else {
-            error!(
-                "Could not read ABI items for contract moving on clearing the other data up: {}",
-                contract.name
-            );
+        for event in events {
+            let table_name = generate_internal_event_table_name(&schema_name, &event);
+            sql.push_str(&format!("DROP TABLE IF EXISTS rindexer_internal.{table_name} CASCADE;"));
         }
 
         // drop factory indexing tables

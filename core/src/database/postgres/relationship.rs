@@ -1,13 +1,12 @@
-use std::path::Path;
-
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use crate::{
-    abi::{get_abi_item_with_db_map, ABIInput, ABIItem, GetAbiItemWithDbMapError, ReadAbiError},
+    abi::{ABIInput, GetAbiItemWithDbMapError, ReadAbiError},
     database::postgres::client::{PostgresClient, PostgresConnectionError, PostgresError},
     helpers::camel_to_snake,
-    manifest::{contract::Contract, storage::ForeignKeys},
+    indexer::schema::PreparedSchema,
+    manifest::storage::ForeignKeys,
     types::code::Code,
 };
 
@@ -354,54 +353,31 @@ pub async fn drop_last_known_relationships(
 }
 
 pub async fn create_relationships(
-    project_path: &Path,
-    manifest_name: &str,
-    contracts: &[Contract],
+    schema: &PreparedSchema,
     foreign_keys: &[ForeignKeys],
 ) -> Result<Vec<Relationship>, CreateRelationshipError> {
+    let manifest_name = &schema.indexer().name;
     let mut relationships = vec![];
     let mut dropping_sql: Vec<Code> = vec![];
     for foreign_key in foreign_keys {
-        let contract = contracts.iter().find(|c| c.name == foreign_key.contract_name);
+        let contract = schema.contract(&foreign_key.contract_name);
 
         match contract {
-            None => {
+            Err(_) => {
                 return Err(CreateRelationshipError::ContractMissing(format!(
                     "Contract {} not found in `contracts` make sure it is defined",
                     foreign_key.contract_name
                 )));
             }
-            Some(contract) => {
-                let abi_items = ABIItem::read_abi_items(project_path, contract)?;
-
+            Ok(contract) => {
                 for linked_key in &foreign_key.foreign_keys {
-                    let parameter_mapping =
-                        foreign_key.event_input_name.split('.').collect::<Vec<&str>>();
-                    let abi_parameter = get_abi_item_with_db_map(
-                        &abi_items,
-                        &foreign_key.event_name,
-                        &parameter_mapping,
-                    )?;
-
-                    let linked_key_contract = contracts
-                        .iter()
-                        .find(|c| c.name == linked_key.contract_name)
-                        .ok_or_else(|| {
-                            CreateRelationshipError::ContractMissing(format!(
-                                "Contract {} not found in `contracts` and linked in relationships. Make sure it is defined.",
-                                linked_key.contract_name
-                            ))
-                        })?;
-
-                    let linked_abi_items =
-                        ABIItem::read_abi_items(project_path, linked_key_contract)?;
-                    let linked_parameter_mapping =
-                        linked_key.event_input_name.split('.').collect::<Vec<&str>>();
-                    let linked_abi_parameter = get_abi_item_with_db_map(
-                        &linked_abi_items,
-                        &linked_key.event_name,
-                        &linked_parameter_mapping,
-                    )?;
+                    let abi_parameter = contract
+                        .storage_column(&foreign_key.event_name, &foreign_key.event_input_name)?;
+                    let linked_key_contract = schema
+                        .contract(&linked_key.contract_name)
+                        .map_err(CreateRelationshipError::ContractMissing)?;
+                    let linked_abi_parameter = linked_key_contract
+                        .storage_column(&linked_key.event_name, &linked_key.event_input_name)?;
 
                     if abi_parameter.abi_item.type_ != linked_abi_parameter.abi_item.type_ {
                         return Err(CreateRelationshipError::TypeMismatch(format!(

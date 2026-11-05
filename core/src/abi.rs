@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     path::Path,
+    sync::OnceLock,
 };
 
 use alloy::{
@@ -128,6 +129,102 @@ pub(crate) struct RawAbiColumn<'a> {
     pub(crate) logical_path: String,
     object_name: String,
     parent_path: Option<Vec<AbiNamePropertiesPath>>,
+}
+
+/// An owned leaf in a prepared raw-event layout. The original ABI input is
+/// retained for callers such as relationship and index generation.
+#[derive(Clone, Debug)]
+pub(crate) struct RawEventColumn {
+    pub(crate) input: ABIInput,
+    pub(crate) storage_name: String,
+    pub(crate) logical_path: String,
+}
+
+/// One immutable projection of ABI paths into column names. Stored events
+/// validate this as a SQL layout; nonstored events retain the projection without
+/// requiring distinct SQL identifiers. Definitions exclude rindexer's metadata;
+/// row column names include metadata in the writers' exact order.
+#[derive(Clone, Debug)]
+pub(crate) struct RawEventColumns {
+    leaves: Vec<RawEventColumn>,
+    column_names: Vec<String>,
+    postgres_definitions: Vec<String>,
+    clickhouse_definitions: OnceLock<Vec<String>>,
+}
+
+impl RawEventColumns {
+    pub(crate) fn try_new(event_name: &str, inputs: &[ABIInput]) -> Result<Self, String> {
+        Ok(Self::from_columns(validated_raw_event_columns(event_name, inputs)?, true))
+    }
+
+    /// Events without raw storage can still feed CSV or streams. Their ABI
+    /// identities need not form a valid SQL schema because no such table exists.
+    pub(crate) fn for_unstored_event(inputs: &[ABIInput]) -> Self {
+        Self::from_columns(raw_columns(inputs, None), false)
+    }
+
+    fn from_columns(columns: Vec<RawAbiColumn<'_>>, stored: bool) -> Self {
+        use crate::database::generate::RAW_EVENT_METADATA_COLUMNS;
+        let mut leaves = Vec::with_capacity(columns.len());
+        let mut column_names = vec![RAW_EVENT_METADATA_COLUMNS[0].to_string()];
+        let mut postgres_definitions = Vec::with_capacity(columns.len());
+        for column in columns {
+            if stored {
+                postgres_definitions.push(format!(
+                    "\"{}\" {}",
+                    column.storage_name,
+                    solidity_type_to_db_type(column.input.storage_type())
+                ));
+            }
+            column_names.push(column.storage_name.clone());
+            leaves.push(RawEventColumn {
+                input: column.input.clone(),
+                storage_name: column.storage_name,
+                logical_path: column.logical_path,
+            });
+        }
+        column_names.extend(RAW_EVENT_METADATA_COLUMNS[1..].iter().map(|name| name.to_string()));
+        let clickhouse_definitions =
+            if stored { OnceLock::new() } else { OnceLock::from(Vec::new()) };
+        Self { leaves, column_names, postgres_definitions, clickhouse_definitions }
+    }
+
+    pub(crate) fn leaves(&self) -> &[RawEventColumn] {
+        &self.leaves
+    }
+
+    pub(crate) fn column_names(&self) -> &[String] {
+        &self.column_names
+    }
+
+    pub(crate) fn postgres_definitions(&self) -> &[String] {
+        &self.postgres_definitions
+    }
+
+    pub(crate) fn clickhouse_definitions(&self) -> &[String] {
+        // PostgreSQL supports tuple arrays that the ClickHouse backend cannot
+        // render. Resolve its definitions only when that backend is selected;
+        // the physical names and owned input types are already frozen above.
+        self.clickhouse_definitions.get_or_init(|| {
+            self.leaves
+                .iter()
+                .map(|column| {
+                    format!(
+                        "\"{}\" {}",
+                        column.storage_name,
+                        solidity_type_to_clickhouse_type(column.input.storage_type())
+                    )
+                })
+                .collect()
+        })
+    }
+
+    pub(crate) fn storage_column(&self, logical_path: &str) -> Option<(&ABIInput, &str)> {
+        self.leaves
+            .iter()
+            .find(|column| column.logical_path == logical_path)
+            .map(|column| (&column.input, column.storage_name.as_str()))
+    }
 }
 
 fn raw_columns<'a>(
@@ -378,32 +475,42 @@ impl ABIItem {
             })?;
         }
 
-        // Get events from include_events
-        let include_event_names: Vec<String> = contract
-            .include_events
-            .as_ref()
-            .map(|events| events.iter().map(|a| a.name.clone()).collect())
-            .unwrap_or_default();
+        Ok(Self::select_contract_items(abi_items, contract, false))
+    }
 
-        // Get events from tables
-        let table_event_names = contract.get_table_event_names();
-
-        // If both are empty, return all events (backward compatible behavior)
-        if include_event_names.is_empty() && table_event_names.is_empty() {
-            return Ok(abi_items);
-        }
-
-        // Combine both sets of event names
-        let all_needed_events: HashSet<String> =
-            include_event_names.into_iter().chain(table_event_names).collect();
-
-        // Filter to only include needed events (keep all non-event items)
-        let filtered_abi_items = abi_items
+    /// Select logical event declarations without re-reading or projecting ABI
+    /// storage names. PreparedSchema performs the single physical projection.
+    pub(crate) fn select_contract_items(
+        abi_items: Vec<ABIItem>,
+        contract: &Contract,
+        is_filter: bool,
+    ) -> Vec<ABIItem> {
+        let include_event_names =
+            contract.include_events.iter().flatten().map(|event| event.name.clone());
+        let needed: HashSet<String> =
+            include_event_names.chain(contract.get_table_event_names()).collect();
+        let filters: HashSet<String> = if is_filter {
+            contract
+                .details
+                .iter()
+                .filter_map(|detail| detail.filter.as_ref())
+                .flat_map(|events| match events {
+                    ValueOrArray::Value(event) => vec![event.event_name.clone()],
+                    ValueOrArray::Array(events) => {
+                        events.iter().map(|event| event.event_name.clone()).collect()
+                    }
+                })
+                .collect()
+        } else {
+            HashSet::new()
+        };
+        abi_items
             .into_iter()
-            .filter(|item| item.type_ != "event" || all_needed_events.contains(&item.name))
-            .collect();
-
-        Ok(filtered_abi_items)
+            .filter(|item| {
+                (needed.is_empty() || item.type_ != "event" || needed.contains(&item.name))
+                    && (!is_filter || item.type_ == "event" && filters.contains(&item.name))
+            })
+            .collect()
     }
 
     pub fn get_abi_items(
@@ -411,29 +518,8 @@ impl ABIItem {
         contract: &Contract,
         is_filter: bool,
     ) -> Result<Vec<ABIItem>, ReadAbiError> {
-        let mut abi_items = ABIItem::read_abi_items(project_path, contract)?;
-
-        if is_filter {
-            let filter_event_names: HashSet<String> = contract
-                .details
-                .iter()
-                .filter_map(|detail| detail.filter.clone())
-                .flat_map(|events| match events {
-                    ValueOrArray::Value(event) => vec![event.event_name],
-                    ValueOrArray::Array(event_array) => {
-                        event_array.into_iter().map(|e| e.event_name).collect()
-                    }
-                })
-                .collect();
-
-            abi_items = abi_items
-                .iter()
-                .filter(|item| item.type_ == "event" && filter_event_names.contains(&item.name))
-                .cloned()
-                .collect();
-        }
-
-        Ok(abi_items)
+        let abi_items = ABIItem::read_abi_items(project_path, contract)?;
+        Ok(Self::select_contract_items(abi_items, contract, is_filter))
     }
 }
 
@@ -544,6 +630,7 @@ pub enum GetAbiItemWithDbMapError {
     InvalidRawColumns(String),
 }
 
+#[cfg(test)]
 pub fn get_abi_item_with_db_map(
     abi_items: &[ABIItem],
     event_name: &str,

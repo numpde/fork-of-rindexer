@@ -1,11 +1,12 @@
+use crate::indexer::schema::PreparedSchema;
 use std::path::Path;
 
 use tracing::{debug, info};
 
 use crate::database::generate::{
-    drop_tables_for_indexer_sql, generate_tables_for_indexer_sql, GenerateTablesForIndexerSqlError,
+    drop_prepared_tables_sql, generate_prepared_tables_sql, GenerateTablesForIndexerSqlError,
 };
-use crate::database::postgres::migrations::execute_migrations_for_indexer_sql;
+use crate::database::postgres::migrations::execute_prepared_migrations;
 use crate::{
     database::postgres::client::{PostgresClient, PostgresConnectionError, PostgresError},
     manifest::core::Manifest,
@@ -27,6 +28,16 @@ pub async fn setup_postgres(
     project_path: &Path,
     manifest: &Manifest,
 ) -> Result<PostgresClient, SetupPostgresError> {
+    let schema = PreparedSchema::try_new(project_path, &manifest.to_indexer())?;
+    setup_postgres_prepared(project_path, manifest, &schema).await
+}
+
+/// Create storage from a checked startup schema before starting any writer.
+pub async fn setup_postgres_prepared(
+    _project_path: &Path,
+    manifest: &Manifest,
+    schema: &PreparedSchema,
+) -> Result<PostgresClient, SetupPostgresError> {
     info!("Setting up postgres");
 
     let client = PostgresClient::new().await?;
@@ -37,7 +48,7 @@ pub async fn setup_postgres(
             "`drop_each_run` enabled so dropping all data for {} before starting",
             &manifest.name
         );
-        let sql = drop_tables_for_indexer_sql(project_path, &manifest.to_indexer());
+        let sql = drop_prepared_tables_sql(schema);
         client.batch_execute(sql.as_str()).await?;
         info!("Dropped all data for {}", manifest.name);
     }
@@ -48,11 +59,7 @@ pub async fn setup_postgres(
         info!("Creating tables for {}", manifest.name);
     }
 
-    let sql = generate_tables_for_indexer_sql(
-        project_path,
-        &manifest.to_indexer(),
-        disable_event_tables,
-    )?;
+    let sql = generate_prepared_tables_sql(schema, disable_event_tables)?;
 
     debug!("{}", sql);
     if let Err(e) = client.batch_execute(sql.as_str()).await {
@@ -67,13 +74,8 @@ pub async fn setup_postgres(
         info!("Created internal rindexer tables for {}", manifest.name);
     }
 
-    let version_applied = execute_migrations_for_indexer_sql(
-        &client,
-        project_path,
-        &manifest.to_indexer(),
-        disable_event_tables,
-    )
-    .await?;
+    let version_applied =
+        execute_prepared_migrations(&client, schema, disable_event_tables).await?;
 
     for version in version_applied {
         info!("Applied migration V{} for {}", version.as_u32(), manifest.name);

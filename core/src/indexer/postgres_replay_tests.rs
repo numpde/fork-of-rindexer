@@ -221,18 +221,34 @@ impl Fixture {
     }
 
     async fn new_trace() -> Self {
+        use crate::indexer::native_transfer::{NATIVE_TRANSFER_ABI, NATIVE_TRANSFER_CONTRACT_NAME};
+
         let mut definitions: Vec<serde_json::Value> =
-            serde_json::from_str(crate::indexer::native_transfer::NATIVE_TRANSFER_ABI).unwrap();
-        let mut fixture = Self::with_event(definitions.remove(0), "EvmTraces").await;
+            serde_json::from_str(NATIVE_TRANSFER_ABI).unwrap();
+        let definition = definitions.remove(0);
+        let manifest = serde_json::from_value(json!({
+            "name":"Replay","project_type":"no-code","networks":[],"contracts":[],
+            "native_transfers":{"enabled":true,"networks":[{"network":"ethereum"}],
+                "tables":[Self::totals_table(definition["name"].as_str().unwrap())]}
+        }))
+        .unwrap();
+        let mut fixture =
+            Self::with_manifest(definition, NATIVE_TRANSFER_CONTRACT_NAME, manifest).await;
+        fixture.params.store_raw_events = true;
         fixture.params.atomic_safe_concurrency = false;
         fixture
     }
 
+    fn totals_table(event_name: &str) -> serde_json::Value {
+        json!({"name":"totals","global":true,
+            "columns":[{"name":"amount","type":"uint256","default":"0"}],
+            "events":[{"event":event_name,"operations":[{"type":"upsert",
+                "set":[{"column":"amount","action":"add","value":"$value"}]}]}]})
+    }
+
     async fn with_event(definition: serde_json::Value, contract: &str) -> Self {
-        Self::with_table(definition.clone(), contract, json!({"name": "totals", "global": true,
-            "columns": [{"name": "amount", "type": "uint256", "default": "0"}],
-            "events": [{"event": definition["name"], "operations": [{"type": "upsert", "set": [{"column": "amount", "action": "add", "value": "$value"}]}]}]
-        })).await
+        let table = Self::totals_table(definition["name"].as_str().unwrap());
+        Self::with_table(definition, contract, table).await
     }
 
     async fn with_table(
@@ -248,6 +264,20 @@ impl Fixture {
         contract: &str,
         table: serde_json::Value,
         networks: &[&str],
+    ) -> Self {
+        let manifest = serde_json::from_value(json!({
+            "name":"Replay","project_type":"no-code","networks":[],
+            "contracts":[{"name":contract,"abi":"abi.json","include_events":[definition["name"]],
+                "details":networks.iter().map(|network| json!({"network":network,"address":"0x0000000000000000000000000000000000000000"})).collect::<Vec<_>>(),
+                "tables":[table]}]
+        })).unwrap();
+        Self::with_manifest(definition, contract, manifest).await
+    }
+
+    async fn with_manifest(
+        definition: serde_json::Value,
+        contract: &str,
+        manifest: crate::manifest::core::Manifest,
     ) -> Self {
         let (admin, container) = postgres_client().await;
         let mut url: url::Url = match container.as_ref() {
@@ -276,16 +306,13 @@ impl Fixture {
                 &params.event_info.inputs,
             );
         params.contract_name = contract.to_string();
-        let abi = definition;
-        std::fs::write(directory.path().join("abi.json"), serde_json::to_vec(&vec![abi]).unwrap())
+        if !manifest.contracts.is_empty() {
+            std::fs::write(
+                directory.path().join("abi.json"),
+                serde_json::to_vec(&vec![definition]).unwrap(),
+            )
             .unwrap();
-        let manifest: crate::manifest::core::Manifest = serde_json::from_value(json!({
-            "name": "Replay", "project_type": "no-code", "networks": [],
-            "contracts": [{"name": contract, "abi": "abi.json", "include_events": [params.event_info.name],
-                "details": networks.iter().map(|network| json!({"network":network,"address":"0x0000000000000000000000000000000000000000"})).collect::<Vec<_>>(),
-                "tables": [table]
-            }]
-        })).unwrap();
+        }
         let indexer = manifest.to_indexer();
         let ddl = generate_tables_for_indexer_sql(directory.path(), &indexer, false).unwrap();
         client.batch_execute(ddl.as_str()).await.unwrap();
@@ -295,10 +322,7 @@ impl Fixture {
         params.sql_event_table_name =
             format!("{schema}.{}", crate::helpers::camel_to_snake(&params.event_info.name));
         params.tables = Arc::new(
-            manifest.contracts[0]
-                .tables
-                .as_ref()
-                .unwrap()
+            Self::source_tables(&indexer, contract)
                 .iter()
                 .map(|table| {
                     TableRuntime::try_new(table, &params.indexer_name, &params.contract_name)
@@ -319,12 +343,29 @@ impl Fixture {
         }
     }
 
+    fn source_tables<'a>(
+        indexer: &'a crate::indexer::Indexer,
+        contract: &str,
+    ) -> &'a [crate::manifest::contract::Table] {
+        let tables = if contract == crate::indexer::native_transfer::NATIVE_TRANSFER_CONTRACT_NAME {
+            indexer.native_transfers.tables.as_deref()
+        } else {
+            indexer
+                .contracts
+                .iter()
+                .find(|declaration| declaration.name == contract)
+                .and_then(|declaration| declaration.tables.as_deref())
+        };
+        tables.expect("fixture source declares its custom tables")
+    }
+
     /// Vary the logical declaration and run it through the production constructor.
     fn runtime_tables_with(
         &self,
         edit: impl FnOnce(&mut crate::manifest::contract::Table),
     ) -> Arc<Vec<TableRuntime>> {
-        let mut declaration = self.indexer.contracts[0].tables.as_ref().unwrap()[0].clone();
+        let mut declaration =
+            Self::source_tables(&self.indexer, &self.params.contract_name)[0].clone();
         edit(&mut declaration);
         Arc::new(vec![TableRuntime::try_new(
             &declaration,

@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::{
-    abi::{validated_raw_event_columns, ABIInput, ABIItem},
+    abi::{ABIInput, ABIItem, RawEventColumns},
     database::generate::generate_event_table_full_name,
     indexer::tables::TableRuntime,
     manifest::contract::Table,
@@ -18,20 +18,25 @@ pub(crate) struct RollbackEventSource {
 
 impl RollbackEventSource {
     pub(crate) fn new(name: &str, inputs: &[ABIInput]) -> anyhow::Result<Self> {
+        let columns = RawEventColumns::try_new(name, inputs).map_err(anyhow::Error::msg)?;
+        Ok(Self::from_columns(&columns))
+    }
+
+    pub(crate) fn from_columns(columns: &RawEventColumns) -> Self {
         let mut types = HashMap::new();
         let mut names = HashMap::new();
-        for leaf in validated_raw_event_columns(name, inputs).map_err(anyhow::Error::msg)? {
+        for leaf in columns.leaves() {
             let storage = leaf.input.storage_type();
-            names.insert(leaf.logical_path, leaf.storage_name.clone());
+            names.insert(leaf.logical_path.clone(), leaf.storage_name.clone());
             if storage.starts_with("tuple[") {
                 if let Some(components) = &leaf.input.components {
                     collect_json_types(components, &leaf.storage_name, &mut types);
                 }
             } else if let Some(kind) = ColumnType::from_solidity_type(storage) {
-                types.insert(leaf.storage_name, kind);
+                types.insert(leaf.storage_name.clone(), kind);
             }
         }
-        Ok(Self { types: Arc::new(types), names: Arc::new(names) })
+        Self { types: Arc::new(types), names: Arc::new(names) }
     }
 }
 

@@ -49,8 +49,11 @@ scalar operands for SQL UPSERT guards; nested operand access is rejected.
 Decoded event paths,
 tuple-array JSON keys, iterator aliases and quoted literals keep their spelling.
 
-PostgreSQL and ClickHouse apply one destination projection to DDL, keys, writes
-and schema comparison. Custom column names must resolve to distinct ASCII SQL
+Startup prepares one immutable schema before connecting to storage or applying
+schema changes. PostgreSQL and ClickHouse schema creation and comparison, raw
+and custom writes, indexes, relationships, cron, and recovery consume its checked
+columns and types. Changing an ABI file after preparation does not change the
+running schema; a new startup prepares the changed declarations. Custom column names must resolve to distinct ASCII SQL
 identifiers of at most 63 bytes. Generated metadata, PostgreSQL system columns
 and internal guard-input names are reserved. Raw ABI columns use the
 [raw naming rules](/docs/migrations/raw-event-column-names); ambiguous stored
@@ -70,6 +73,13 @@ construction is also fallible (`CronScheduler::try_new`). Lower-level SQL
 writers take a `ResolvedTable`, which cannot be passed back as a logical
 declaration. To inspect a declared destination's physical
 name, call `resolved.storage_column("key16")`.
+
+Custom Rust startup code can retain a `PreparedProject` from
+`PreparedProject::read(&manifest_path)?`, use `prepared.schema()` with the
+prepared schema-comparison and setup entry points, then pass the same project
+to `start_rindexer_no_code_prepared` or `start_rindexer_prepared`. The normal
+CLI does this automatically. Standalone helpers that accept logical declarations
+prepare their own snapshot for that call.
 
 ## Typed arithmetic inputs and recovery keys
 
@@ -157,8 +167,9 @@ plan.try_add_table_event(&mut tables, "Indexer", "Contract", &event, &table)?;
 For a table with multiple event mappings, call `try_add_table_events` once
 with all contributing ABI events. The planner can then infer types across the
 whole table and rejects incomplete or conflicting declarations before adding
-anything to the plan. `try_add_operation` remains a low-level entry point for callers that
-already own a fully specified storage plan. Untyped `ReorgTask::execute` still
+anything to the plan. The former public `try_add_operation` metadata-map API is
+now internal: replace it with one of these declaration-based constructors.
+Untyped `ReorgTask::execute` still
 supports raw, insert-only and journal-only recovery. Incomplete arithmetic plans
 fail before changing durable state.
 

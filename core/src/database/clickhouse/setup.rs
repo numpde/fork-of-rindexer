@@ -2,9 +2,10 @@ use crate::database::clickhouse::client::{
     ClickhouseClient, ClickhouseConnectionError, ClickhouseError,
 };
 use crate::database::clickhouse::generate::{
-    drop_tables_for_indexer_clickhouse, generate_tables_for_indexer_clickhouse,
+    drop_prepared_tables_clickhouse, generate_prepared_tables_clickhouse,
 };
 use crate::database::generate::GenerateTablesForIndexerSqlError;
+use crate::indexer::schema::PreparedSchema;
 use crate::manifest::core::Manifest;
 use std::path::Path;
 use tracing::info;
@@ -24,6 +25,16 @@ pub async fn setup_clickhouse(
     project_path: &Path,
     manifest: &Manifest,
 ) -> Result<ClickhouseClient, SetupClickhouseError> {
+    let schema = PreparedSchema::try_new(project_path, &manifest.to_indexer())?;
+    setup_clickhouse_prepared(project_path, manifest, &schema).await
+}
+
+/// Create storage from a checked startup schema before starting any writer.
+pub async fn setup_clickhouse_prepared(
+    _project_path: &Path,
+    manifest: &Manifest,
+    schema: &PreparedSchema,
+) -> Result<ClickhouseClient, SetupClickhouseError> {
     info!("Setting up clickhouse");
 
     let client =
@@ -35,7 +46,7 @@ pub async fn setup_clickhouse(
             "`drop_each_run` enabled so dropping all data for {} before starting",
             &manifest.name
         );
-        let sql = drop_tables_for_indexer_clickhouse(project_path, &manifest.to_indexer());
+        let sql = drop_prepared_tables_clickhouse(schema);
         client.execute_batch(sql.as_str()).await?;
         info!("Dropped all data for {}", manifest.name);
     }
@@ -46,12 +57,8 @@ pub async fn setup_clickhouse(
         info!("Creating tables for {}", manifest.name);
     }
 
-    let sql = generate_tables_for_indexer_clickhouse(
-        project_path,
-        &manifest.to_indexer(),
-        disable_event_tables,
-    )
-    .map_err(SetupClickhouseError::ClickhouseTableGenerationError)?;
+    let sql = generate_prepared_tables_clickhouse(schema, disable_event_tables)
+        .map_err(SetupClickhouseError::ClickhouseTableGenerationError)?;
 
     client.execute_batch(sql.as_str()).await?;
 

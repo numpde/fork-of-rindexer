@@ -183,10 +183,9 @@ pub(crate) struct RollbackIterateBinding {
 }
 
 impl DerivedTableRollbackPlan {
-    /// Register low-level metadata for an existing, manually constructed operation.
-    /// Prefer [`Self::try_add_table_event`] for table and ABI declarations: it resolves
-    /// logical field paths, storage names and operation indexes together. Here source
-    /// types must be keyed by raw storage name and targets by stored custom column name.
+    /// Register internal metadata for an already resolved operation. Public callers
+    /// use [`Self::try_add_table_event`] or [`Self::try_add_table_events`] so names,
+    /// types and operation indexes are derived together from declarations.
     /// Tuple-array element types use dotted keys such as `accounts.owner`;
     /// their raw PostgreSQL column is represented as JSONB. Conditional arithmetic
     /// recovery requires the source types of every referenced event scalar; ABI
@@ -196,7 +195,8 @@ impl DerivedTableRollbackPlan {
     ///
     /// Returns an error when the table name or iterate bindings are invalid,
     /// or when metadata was already registered for the same operation index.
-    pub fn try_add_operation(
+    #[cfg(test)]
+    pub(crate) fn try_add_operation(
         &mut self,
         derived_table: String,
         operation_index: usize,
