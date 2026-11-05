@@ -1661,6 +1661,9 @@ mod journal_recovery_tests;
 #[path = "table_condition_tests.rs"]
 mod table_condition_tests;
 
+#[path = "upsert_guard_column_tests.rs"]
+mod upsert_guard_column_tests;
+
 #[path = "subscription_cursor_tests.rs"]
 mod subscription_cursor_tests;
 

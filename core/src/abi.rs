@@ -535,3 +535,7 @@ pub fn get_abi_item_with_db_map(
         ))),
     }
 }
+
+#[cfg(test)]
+#[path = "abi_column_identity_tests.rs"]
+mod storage_column_identity_tests;

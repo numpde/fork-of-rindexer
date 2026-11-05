@@ -753,3 +753,47 @@ async fn postgres_arithmetic_bytes32_array_keys_preserve_the_custom_encoder() {
         fixture.finish().await;
     }
 }
+
+#[tokio::test]
+async fn postgres_column_identity_survives_forward_writes_and_rollback() {
+    let fixture = fixture(
+        json!([{"name":"key16","type":"uint256","indexed":false}]),
+        json!({"name":"totals","columns":[{"name":"key16","type":"uint256"},
+            {"name":"amount32","type":"uint256","default":"0"}],
+            "events":[{"event":"Value","operations":[{"type":"upsert",
+                "where":{"key16":"$key16"},
+                "set":[{"column":"amount32","action":"add","value":"$value"}]}]}]}),
+    )
+    .await;
+    let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+    for (block, value) in [(99, 10), (100, 20)] {
+        callback(vec![input(&fixture, block, U256::from(value), vec![uint(42)])]).await.unwrap();
+    }
+    let state = format!(
+        "SELECT e.key_16::text, to_jsonb(t)->>'key_16', to_jsonb(t)->>'amount_32', \
+         t.rindexer_block_number::bigint FROM {} t JOIN {} e ON e.block_number=t.rindexer_block_number",
+        fixture.params.tables[0].full_table_name, fixture.params.sql_event_table_name
+    );
+    let value = |r: tokio_postgres::Row| {
+        (
+            r.get::<_, String>(0),
+            r.get::<_, Option<String>>(1),
+            r.get::<_, Option<String>>(2),
+            r.get::<_, i64>(3),
+        )
+    };
+    assert_eq!(
+        value(fixture.client.query_one(&state, &[]).await.unwrap()),
+        ("42".into(), Some("42".into()), Some("30".into()), 100),
+        "one naming rule must reach both stored tables without changing ABI lookup"
+    );
+    super::recovery_boundary_tests::rollback(&fixture, 100, 100).await.unwrap();
+    assert_eq!(
+        value(fixture.client.query_one(&state, &[]).await.unwrap()),
+        ("42".into(), Some("42".into()), Some("10".into()), 99),
+        "rollback must restore the canonical amount, key and block written through those names"
+    );
+    assert_receipts(&fixture, 1).await;
+    drop(callback);
+    fixture.finish().await;
+}

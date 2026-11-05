@@ -2273,6 +2273,55 @@ contracts:
     }
 
     #[test]
+    fn rollback_plan_uses_declared_abi_paths_and_stored_custom_columns() {
+        use crate::indexer::tables::TableRuntime;
+        use serde_json::json;
+
+        let inputs: Vec<ABIInput> = serde_json::from_value(json!([
+            {"name":"blockNumber","type":"uint16"},
+            {"name":"entries","type":"tuple[]","components":[
+                {"name":"tokenAmount32","type":"uint32"}
+            ]}
+        ]))
+        .unwrap();
+        let table = serde_json::from_value(json!({
+            "name":"balances",
+            "columns":[{"name":"key16","type":"uint16"},{"name":"totalAmount32","type":"uint32"}],
+            "events":[{"event":"Transfer","iterate":["$entries as entry"],"operations":[{
+                "type":"upsert","where":{"key16":"$blockNumber"},
+                "set":[{"column":"totalAmount32","action":"add","value":"$entry.tokenAmount32"}]
+            }]}]
+        }))
+        .unwrap();
+        let mut source_types = HashMap::new();
+        collect_source_column_types(&inputs, None, &mut source_types);
+        let runtime = TableRuntime::new(table, "chain", "Token");
+        let mut tables = HashMap::new();
+        let mut plans = HashMap::new();
+        build_derived_tables_for_event(
+            "Transfer",
+            "chain",
+            "Token",
+            "anvil",
+            &source_types,
+            &[runtime],
+            &mut tables,
+            &mut plans,
+        )
+        .unwrap();
+
+        let table = &tables["anvil"][0];
+        let operation = &table.rollback_ops[0];
+        assert_eq!(operation.where_columns, [("key_16".into(), "blockNumber".into())]);
+        assert_eq!(operation.columns[0].derived_column, "total_amount_32");
+        assert_eq!(operation.columns[0].event_column, "entry.tokenAmount32");
+        let metadata = plans["anvil"].operation(&table.full_table_name, 0).unwrap();
+        assert_eq!(metadata.source_column_types["rindexer_abi_block_number"], ColumnType::Uint16);
+        assert_eq!(metadata.source_column_types["entry.tokenAmount32"], ColumnType::Uint32);
+        assert_eq!(metadata.derived_column_types["total_amount_32"], ColumnType::Uint32);
+    }
+
+    #[test]
     fn build_derived_tables_for_native_transfer_populates_accumulator() {
         use crate::indexer::tables::TableRuntime;
         use crate::manifest::contract::{

@@ -1865,3 +1865,25 @@ mod cron_parsing_tests {
         assert_eq!(next, at(2027, 1, 1, 0, 0, 0));
     }
 }
+
+#[cfg(test)]
+mod column_name_tests {
+    use super::*;
+
+    #[test]
+    fn cron_column_identity_binds_tasks_to_the_stored_destination() {
+        let manifest: Manifest = serde_json::from_value(serde_json::json!({
+            "name":"Example","project_type":"no-code","networks":[],
+            "contracts":[{"name":"Token","abi":"unused.json","details":[],
+                "tables":[{"name":"stats","global":true,"columns":[{"name":"total32","type":"uint256"}],
+                    "cron":[{"interval":"1h","network":"test","operations":[
+                        {"type":"upsert","set":[{"column":"total32","action":"set","value":"1"}]}
+                    ]}]}]}]
+        })).unwrap();
+        let scheduler = CronScheduler::new(&manifest, None, None, Arc::new(HashMap::new()));
+        assert_eq!(scheduler.tasks.len(), 1);
+        let task = &scheduler.tasks[0];
+        assert_eq!(task.table.columns[0].name, "total_32");
+        assert_eq!(task.cron_entry.operations[0].set[0].column, "total_32");
+    }
+}

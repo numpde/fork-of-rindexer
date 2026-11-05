@@ -2743,3 +2743,7 @@ mod array_type_roundtrip_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "destination_column_resolution_tests.rs"]
+mod destination_column_resolution_tests;

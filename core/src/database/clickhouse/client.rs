@@ -347,3 +347,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "column_identity_tests.rs"]
+mod column_identity_tests;

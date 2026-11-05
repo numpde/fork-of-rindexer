@@ -427,3 +427,31 @@ async fn postgres_custom_table_reorg_preserves_unsigned_keys_and_remaining_amoun
     fixture.finish().await;
     result.expect("custom-table rollback must preserve unsigned keys and amounts");
 }
+
+#[tokio::test]
+async fn postgres_column_identity_schema_sync_refuses_to_drop_legacy_data() {
+    let fixture = TestDatabase::new().await;
+    fixture
+        .postgres
+        .batch_execute(&format!(
+            "CREATE SCHEMA {SCHEMA}; CREATE TABLE {SCHEMA}.balances (value16 INTEGER); \
+         INSERT INTO {SCHEMA}.balances VALUES (65535)"
+        ))
+        .await
+        .unwrap();
+    let manifest: Manifest = serde_json::from_value(json!({
+        "name":"integers","project_type":"no-code","networks":[],
+        "contracts":[{"name":"Values","details":[],"abi":"unused.json","tables":[table("balances","upsert")]}]
+    })).unwrap();
+    let result = detect_schema_changes(&fixture.postgres, &manifest).await;
+    let remaining: i32 = fixture
+        .postgres
+        .query_one(&format!("SELECT value16 FROM {SCHEMA}.balances"), &[])
+        .await
+        .unwrap()
+        .get(0);
+    fixture.finish().await;
+    let error = result.expect_err("schema sync must not offer add/drop as a column rename");
+    assert!(error.contains("value16") && error.contains("value_16"), "{error}");
+    assert_eq!(remaining, 65535);
+}
