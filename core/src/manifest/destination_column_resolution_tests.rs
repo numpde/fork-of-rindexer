@@ -42,8 +42,7 @@ fn admit(tables: &[Value], native: bool) -> Result<Manifest, Box<ReadManifestErr
 
 fn refused(table: Value, native: bool, names: &[&str]) {
     let error = admit(&[table], native)
-        .err()
-        .expect("startup accepted an ambiguous or unavailable physical destination")
+        .expect_err("startup accepted an ambiguous or unavailable physical destination")
         .to_string();
     for name in names {
         assert!(error.contains(name), "error must identify {name:?}: {error}");
@@ -118,8 +117,8 @@ fn runtime_projects_destination_references_once_without_rewriting_inputs_or_lite
             "filter":"@totalAmount < 20", "set":[{"column":"totalAmount","action":"set","value":"$call($contract, \"totalAmount()\")"}]}]}]
     })).unwrap();
     let logical = serde_json::to_value(&table).unwrap();
-    let runtime = TableRuntime::new(table.clone(), "NameAdmission", "Contract");
-    let physical = &runtime.table;
+    let runtime = TableRuntime::try_new(&table, "NameAdmission", "Contract").unwrap();
+    let physical = runtime.table.definition();
     assert_eq!(
         physical.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
         ["token_id", "total_amount", "u256"]

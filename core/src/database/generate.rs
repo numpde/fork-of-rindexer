@@ -8,7 +8,9 @@ use crate::database::postgres::generate::{
 use crate::helpers::{camel_to_snake, snake_to_camel};
 use crate::indexer::native_transfer::{NATIVE_TRANSFER_ABI, NATIVE_TRANSFER_CONTRACT_NAME};
 use crate::indexer::Indexer;
-use crate::manifest::contract::{injected_columns, Contract, FactoryDetailsYaml, Table};
+use crate::manifest::contract::{
+    injected_columns, Contract, FactoryDetailsYaml, ResolvedTable, Table,
+};
 use crate::types::code::Code;
 use crate::ABIItem;
 use alloy::primitives::keccak256;
@@ -220,7 +222,9 @@ fn generate_tables_sql(
 ) -> Result<String, GenerateTablesForIndexerSqlError> {
     Ok(tables
         .iter()
-        .map(|table| {
+        .map(|declaration| {
+            let resolved = declaration.try_resolve_storage_columns().map_err(GenerateTablesForIndexerSqlError::InvalidCustomTableSchema)?;
+            let table = resolved.definition();
             let schema_name = table.database.as_deref().unwrap_or(schema_name);
             if table.database.is_some() {
                 crate::indexer::reorg::validate_sql_identifier(schema_name, "custom table schema")
@@ -336,6 +340,33 @@ fn generate_tables_sql(
         })
         .collect::<Result<Vec<_>, GenerateTablesForIndexerSqlError>>()?
         .join("\n"))
+}
+
+/// A previous release used verbatim manifest column names. Never offer
+/// ADD + DROP for that case: even accepting both operations loses the data.
+pub(crate) fn check_legacy_column_names(
+    declaration: &Table,
+    resolved: &ResolvedTable,
+    existing: &std::collections::HashSet<String>,
+    legacy_catalog_name: fn(&str) -> &str,
+) -> Result<(), String> {
+    for column in &declaration.columns {
+        let name = &column.name;
+        let stored = resolved.storage_column(name).expect("declared column was resolved");
+        // Old PostgreSQL DDL quoted the logical name, but the server could
+        // already have shortened it. ClickHouse retained the complete spelling.
+        let legacy = legacy_catalog_name(name);
+        if legacy != stored
+            && existing.contains(legacy)
+            // Another logical declaration may now claim this literal as its
+            // physical column (U256 -> u256, while u256 -> u_256). It is safe
+            // to recognize that layout only once this column's destination exists.
+            && (!existing.contains(stored) || !resolved.columns().iter().any(|c| c.name == legacy))
+        {
+            return Err(format!("Table '{}': existing column '{legacy}' for declaration '{name}' now resolves to '{stored}'. Rename or rebuild the column and reconcile its recovery history before schema sync; adding and dropping columns would lose data.", declaration.name));
+        }
+    }
+    Ok(())
 }
 
 /// Generate table name for a custom table

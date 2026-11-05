@@ -12,17 +12,19 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::abi::{ABIInput, ABIItem};
+use crate::abi::ABIItem;
 use crate::database::clickhouse::client::{ClickhouseClient, ClickhouseConnectionError};
-use crate::database::generate::generate_indexer_contract_schema_name;
+use crate::database::generate::{
+    generate_event_table_full_name, generate_indexer_contract_schema_name,
+};
 use crate::database::postgres::generate::generate_internal_event_table_name;
 use crate::event::config::{ContractEventProcessingConfig, FactoryEventProcessingConfig};
 use crate::helpers::{camel_to_snake, format_duration};
 use crate::indexer::native_transfer::native_transfer_block_processor;
+use crate::indexer::reorg::task::RollbackEventSource;
 use crate::indexer::reorg::{
-    reorg_safe_distance_for_chain, DerivedColumnJournal, DerivedColumnRollback, DerivedTableInfo,
-    DerivedTableRollbackOp, DerivedTableRollbackPlan, EventTableInfo, ReorgBlockHashPersistence,
-    ReorgContext, ReorgCoordinator,
+    reorg_safe_distance_for_chain, DerivedTableInfo, DerivedTableRollbackPlan, EventTableInfo,
+    ReorgBlockHashPersistence, ReorgContext, ReorgCoordinator,
 };
 use crate::indexer::Indexer;
 use crate::manifest::network::ReorgHandlingConfig;
@@ -46,10 +48,7 @@ use crate::{
         progress::IndexingEventsProgressState,
         ContractEventDependencies,
     },
-    manifest::{
-        contract::{ColumnType, ReorgSafeDistance},
-        core::Manifest,
-    },
+    manifest::{contract::ReorgSafeDistance, core::Manifest},
     provider::{ChainProvider, ProviderError},
     PostgresClient,
 };
@@ -454,58 +453,6 @@ fn collect_streams_clients_for_network(
     out
 }
 
-pub(super) fn collect_source_column_types(
-    inputs: &[ABIInput],
-    prefix: Option<&str>,
-    source_column_types: &mut HashMap<String, ColumnType>,
-) {
-    for input in inputs {
-        let name = camel_to_snake(&input.name);
-        let column = match prefix {
-            Some(prefix) => format!("{}_{}", prefix, name),
-            None => name,
-        };
-
-        if input.storage_type() == "bytes32" && input.indexed == Some(true) {
-            source_column_types
-                .insert(crate::abi::raw_event_abi_column_name(&column), ColumnType::Bytes32);
-            continue;
-        }
-        if let Some(components) = &input.components {
-            if input.type_.starts_with("tuple[") {
-                collect_jsonb_tuple_element_types(
-                    components,
-                    &crate::abi::raw_event_abi_column_name(&column),
-                    source_column_types,
-                );
-            } else {
-                collect_source_column_types(components, Some(&column), source_column_types);
-            }
-            continue;
-        }
-
-        if let Some(column_type) = ColumnType::from_solidity_type(&input.type_) {
-            source_column_types.insert(crate::abi::raw_event_abi_column_name(&column), column_type);
-        }
-    }
-}
-
-fn collect_jsonb_tuple_element_types(
-    components: &[ABIInput],
-    prefix: &str,
-    source_column_types: &mut HashMap<String, ColumnType>,
-) {
-    for component in components {
-        // JSONB tuple objects retain ABI component names verbatim.
-        let field = format!("{}.{}", prefix, component.name);
-        if let Some(nested) = &component.components {
-            collect_jsonb_tuple_element_types(nested, &field, source_column_types);
-        } else if let Some(column_type) = ColumnType::from_solidity_type(&component.type_) {
-            source_column_types.insert(field, column_type);
-        }
-    }
-}
-
 /// Resolve the manifest contract behind a registry event's contract name.
 ///
 /// Chain-wide `filter:` contracts are renamed with a `Filter` suffix when the event
@@ -549,12 +496,12 @@ fn strip_filter_suffixes(name: &str) -> &str {
     stripped
 }
 
-fn event_source_column_types(
+fn event_rollback_source(
     manifest: &Manifest,
     project_path: &Path,
     contract_name: &str,
     event_name: &str,
-) -> anyhow::Result<HashMap<String, ColumnType>> {
+) -> anyhow::Result<RollbackEventSource> {
     let abi_items: Vec<ABIItem> = if contract_name == NATIVE_TRANSFER_CONTRACT_NAME {
         serde_json::from_str(NATIVE_TRANSFER_ABI)?
     } else {
@@ -567,22 +514,7 @@ fn event_source_column_types(
             || anyhow::anyhow!("event '{}::{}' not found in ABI", contract_name, event_name),
         )?;
 
-    let mut source_column_types = HashMap::new();
-    collect_source_column_types(&event.inputs, None, &mut source_column_types);
-    for (field, column) in [
-        ("rindexer_block_number", "block_number"),
-        ("rindexer_block_timestamp", "block_timestamp"),
-        ("rindexer_tx_hash", "tx_hash"),
-        ("rindexer_block_hash", "block_hash"),
-        ("rindexer_contract_address", "contract_address"),
-        ("rindexer_log_index", "log_index"),
-        ("rindexer_tx_index", "tx_index"),
-    ] {
-        if let Some(column_type) = ColumnType::from_tx_metadata_field(field) {
-            source_column_types.insert(column.to_string(), column_type);
-        }
-    }
-    Ok(source_column_types)
+    RollbackEventSource::new(&event.name, &event.inputs)
 }
 
 /// Build derived-table rollback + journal entries for an event's tables and merge
@@ -595,151 +527,27 @@ pub(super) fn build_derived_tables_for_event(
     indexer_name: &str,
     contract_name: &str,
     network: &str,
-    source_column_types: &HashMap<String, ColumnType>,
+    source_column_types: &RollbackEventSource,
     tables: &[crate::indexer::tables::TableRuntime],
     derived_tables: &mut HashMap<String, Vec<DerivedTableInfo>>,
     rollback_plans: &mut HashMap<String, DerivedTableRollbackPlan>,
 ) -> anyhow::Result<()> {
     // Validate the complete input before changing either accumulated plan map.
     for runtime in tables {
-        runtime.table.validate_event_mappings().map_err(anyhow::Error::msg)?;
+        runtime.table.definition().validate_event_mappings().map_err(anyhow::Error::msg)?;
     }
 
-    let schema = generate_indexer_contract_schema_name(indexer_name, contract_name);
-    let event_table_full = format!("{}.{}", schema, camel_to_snake(event_name));
+    let event_table_full = generate_event_table_full_name(indexer_name, contract_name, event_name);
 
     for tr in tables.iter() {
         let derived = derived_tables.entry(network.to_string()).or_default();
-        let derived_column_types = tr
-            .table
-            .columns
-            .iter()
-            .filter_map(|column| {
-                column.column_type.clone().map(|column_type| (column.name.clone(), column_type))
-            })
-            .collect::<HashMap<_, _>>();
-
-        let event_table_name = event_table_full.clone();
-        let mut rollback_ops: Vec<DerivedTableRollbackOp> = Vec::new();
-        let mut rollback_metadata = Vec::new();
-        let mut journal_columns: Vec<DerivedColumnJournal> = Vec::new();
-
-        for table_event in &tr.table.events {
-            if table_event.event != event_name {
-                continue;
-            }
-            for operation in &table_event.operations {
-                use crate::manifest::contract::OperationType;
-                if !matches!(
-                    operation.operation_type,
-                    OperationType::Upsert | OperationType::Update
-                ) {
-                    continue;
-                }
-
-                let mut where_columns: Vec<(String, String)> = operation
-                    .where_clause
-                    .iter()
-                    .filter_map(|(col, val)| {
-                        val.strip_prefix('$').map(|field| (col.clone(), field.to_string()))
-                    })
-                    .collect();
-                where_columns.sort_by(|a, b| a.0.cmp(&b.0));
-
-                let mut where_col_names =
-                    operation.where_clause.keys().cloned().collect::<Vec<_>>();
-                where_col_names.sort();
-
-                let columns: Vec<DerivedColumnRollback> = operation
-                    .set
-                    .iter()
-                    .filter(|set_col| set_col.action.reverse().is_some())
-                    .map(|set_col| {
-                        let event_field = set_col
-                            .reorg_event_field()
-                            .map_err(anyhow::Error::msg)?
-                            .unwrap_or("rindexer_block_number")
-                            .to_string();
-                        DerivedColumnRollback::try_new(
-                            set_col.column.clone(),
-                            event_field,
-                            set_col.action.clone(),
-                        )
-                    })
-                    .collect::<anyhow::Result<Vec<_>>>()?;
-
-                // Collect non-reversible columns for journal-based recalculation
-                for set_col in &operation.set {
-                    if set_col.action.reverse().is_some() {
-                        continue; // handled by rollback_ops
-                    }
-                    if !journal_columns.iter().any(|jc| jc.derived_column == set_col.column) {
-                        journal_columns.push(DerivedColumnJournal::try_new(
-                            set_col.column.clone(),
-                            set_col.action.clone(),
-                            where_col_names.clone(),
-                        )?);
-                    }
-                }
-
-                if !columns.is_empty() {
-                    anyhow::ensure!(
-                        where_columns.len() == operation.where_clause.len(),
-                        "reorg rollback for {} requires every WHERE value to be a single event-field reference",
-                        tr.full_table_name,
-                    );
-                    rollback_ops.push(DerivedTableRollbackOp::try_new(
-                        event_table_name.clone(),
-                        where_columns,
-                        columns,
-                        operation.condition().map(String::from),
-                    )?);
-                    rollback_metadata.push((
-                        table_event.iterate.clone(),
-                        source_column_types.clone(),
-                        derived_column_types.clone(),
-                    ));
-                }
-            }
-        }
-
-        // Merge into existing entry or create a new one
-        let (derived_index, operation_offset) = if let Some(index) =
-            derived.iter().position(|d| d.full_table_name == tr.full_table_name)
-        {
-            let existing = &mut derived[index];
-            let operation_offset = existing.rollback_ops.len();
-            existing.rollback_ops.extend(rollback_ops);
-            for jc in journal_columns {
-                if !existing.journal_columns.iter().any(|e| e.derived_column == jc.derived_column) {
-                    existing.journal_columns.push(jc);
-                }
-            }
-            (index, operation_offset)
-        } else {
-            let index = derived.len();
-            derived.push(DerivedTableInfo::try_new(
-                tr.full_table_name.clone(),
-                tr.table.cross_chain,
-                rollback_ops,
-                journal_columns,
-            )?);
-            (index, 0)
-        };
-
-        let rollback_plan = rollback_plans.entry(network.to_string()).or_default();
-        for (operation_index, (iterate, source_types, derived_types)) in
-            rollback_metadata.into_iter().enumerate()
-        {
-            rollback_plan.try_add_operation(
-                tr.full_table_name.clone(),
-                operation_offset + operation_index,
-                iterate,
-                source_types,
-                derived_types,
-            )?;
-        }
-        rollback_plan.validate_operations(&derived[derived_index])?;
+        rollback_plans.entry(network.to_string()).or_default().add_resolved_table_event(
+            derived,
+            event_name,
+            &event_table_full,
+            source_column_types,
+            tr,
+        )?;
     }
 
     Ok(())
@@ -877,14 +685,9 @@ pub(super) async fn start_indexing_contract_events(
     let mut network_rollback_plans: HashMap<String, DerivedTableRollbackPlan> = HashMap::new();
     for event in registry.events.iter() {
         let source_column_types = if event.tables.is_empty() {
-            HashMap::new()
+            RollbackEventSource::default()
         } else {
-            event_source_column_types(
-                manifest,
-                project_path,
-                &event.contract.name,
-                &event.event_name,
-            )?
+            event_rollback_source(manifest, project_path, &event.contract.name, &event.event_name)?
         };
         // Query details share raw history and derived effects. Register rollback
         // once per source event/network, while rewinding every subscription cursor.
@@ -956,9 +759,9 @@ pub(super) async fn start_indexing_contract_events(
         // trace event contributes rollback ops for each configured network.
         for trace_event in trace_registry.events.iter() {
             let source_column_types = if trace_event.tables.is_empty() {
-                HashMap::new()
+                RollbackEventSource::default()
             } else {
-                event_source_column_types(
+                event_rollback_source(
                     manifest,
                     project_path,
                     &trace_event.contract_name,
@@ -1581,7 +1384,9 @@ pub fn calculate_safe_block_number(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::abi::ABIInput;
     use crate::indexer::last_synced::SyncConfig;
+    use crate::manifest::contract::ColumnType;
     use crate::manifest::contract::ReorgSafeDistance;
     use crate::provider::mock::MockChainProvider;
     use std::path::Path;
@@ -2234,8 +2039,7 @@ contracts:
             }
         ]))
         .expect("valid ABI inputs");
-        let mut source_column_types = HashMap::new();
-        collect_source_column_types(&inputs, None, &mut source_column_types);
+        let source_column_types = RollbackEventSource::new("Value", &inputs).unwrap().types;
 
         assert_eq!(source_column_types["ids"], ColumnType::Array(Box::new(ColumnType::Uint256)));
         assert_eq!(source_column_types["data_amount"], ColumnType::Uint256);
@@ -2253,8 +2057,7 @@ contracts:
             {"name":"tx","type":"tuple","components":[{"name":"hash","type":"uint256"}]}
         ]))
         .unwrap();
-        let mut types = HashMap::new();
-        collect_source_column_types(&inputs, None, &mut types);
+        let types = RollbackEventSource::new("Value", &inputs).unwrap().types;
         assert_eq!(
             types["rindexer_abi_block_number"],
             ColumnType::Array(Box::new(ColumnType::Uint256))
@@ -2293,9 +2096,8 @@ contracts:
             }]}]
         }))
         .unwrap();
-        let mut source_types = HashMap::new();
-        collect_source_column_types(&inputs, None, &mut source_types);
-        let runtime = TableRuntime::new(table, "chain", "Token");
+        let source_types = RollbackEventSource::new("Transfer", &inputs).unwrap();
+        let runtime = TableRuntime::try_new(&table, "chain", "Token").unwrap();
         let mut tables = HashMap::new();
         let mut plans = HashMap::new();
         build_derived_tables_for_event(
@@ -2317,7 +2119,7 @@ contracts:
         assert_eq!(operation.columns[0].event_column, "entry.tokenAmount32");
         let metadata = plans["anvil"].operation(&table.full_table_name, 0).unwrap();
         assert_eq!(metadata.source_column_types["rindexer_abi_block_number"], ColumnType::Uint16);
-        assert_eq!(metadata.source_column_types["entry.tokenAmount32"], ColumnType::Uint32);
+        assert_eq!(metadata.source_column_types["entries.tokenAmount32"], ColumnType::Uint32);
         assert_eq!(metadata.derived_column_types["total_amount_32"], ColumnType::Uint32);
     }
 
@@ -2373,12 +2175,10 @@ contracts:
             database: None,
         };
 
-        let runtime = TableRuntime::new(table, "test_indexer", NATIVE_TRANSFER_CONTRACT_NAME);
+        let runtime =
+            TableRuntime::try_new(&table, "test_indexer", NATIVE_TRANSFER_CONTRACT_NAME).unwrap();
         let tables = vec![runtime];
-        let source_column_types = HashMap::from([
-            ("from".to_string(), ColumnType::Address),
-            ("value".to_string(), ColumnType::Uint256),
-        ]);
+        let source_column_types = RollbackEventSource::new("event", &serde_json::from_value::<Vec<_>>(serde_json::json!([{"name":"from","type":"address"},{"name":"value","type":"uint256"}])).unwrap()).unwrap();
 
         let mut accumulator: HashMap<String, Vec<DerivedTableInfo>> = HashMap::new();
         let mut rollback_plans = HashMap::new();
@@ -2451,14 +2251,10 @@ events:
         let table: Table =
             serde_yaml::from_str(table_yaml).expect("TransferBatch table YAML should parse");
 
-        let runtime = TableRuntime::new(table, "test_indexer", "ConditionalTokens");
+        let runtime = TableRuntime::try_new(&table, "test_indexer", "ConditionalTokens").unwrap();
         let mut accumulator = HashMap::new();
         let mut rollback_plans = HashMap::new();
-        let source_column_types = HashMap::from([
-            ("to".to_string(), ColumnType::Address),
-            ("ids".to_string(), ColumnType::Array(Box::new(ColumnType::Uint256))),
-            ("values".to_string(), ColumnType::Array(Box::new(ColumnType::Uint256))),
-        ]);
+        let source_column_types = RollbackEventSource::new("event", &serde_json::from_value::<Vec<_>>(serde_json::json!([{"name":"to","type":"address"},{"name":"ids","type":"uint256[]"},{"name":"values","type":"uint256[]"}])).unwrap()).unwrap();
         let error = build_derived_tables_for_event(
             "TransferBatch",
             "test_indexer",
@@ -2479,7 +2275,7 @@ events:
             &table_yaml.replace("$to != 0x0000000000000000000000000000000000000000", "$amount > 0"),
         )
         .unwrap();
-        let runtime = TableRuntime::new(table, "test_indexer", "ConditionalTokens");
+        let runtime = TableRuntime::try_new(&table, "test_indexer", "ConditionalTokens").unwrap();
         let mut accumulator = HashMap::new();
         let mut rollback_plans = HashMap::new();
         build_derived_tables_for_event(
@@ -2505,8 +2301,14 @@ events:
         assert_eq!(rollback_metadata.iterate[0].alias, "token_id");
         assert_eq!(rollback_metadata.iterate[1].array_field, "values");
         assert_eq!(rollback_metadata.iterate[1].alias, "amount");
-        assert_eq!(rollback_metadata.source_column_types["token_id"], ColumnType::Uint256);
-        assert_eq!(rollback_metadata.source_column_types["amount"], ColumnType::Uint256);
+        assert_eq!(
+            rollback_metadata.source_column_types["ids"],
+            ColumnType::Array(Box::new(ColumnType::Uint256))
+        );
+        assert_eq!(
+            rollback_metadata.source_column_types["values"],
+            ColumnType::Array(Box::new(ColumnType::Uint256))
+        );
         assert_eq!(rollback_metadata.derived_column_types["token_id"], ColumnType::Uint256);
         assert_eq!(rollback_metadata.derived_column_types["balance"], ColumnType::Uint256);
     }
@@ -2541,12 +2343,8 @@ events:
         )
         .expect("accessor table YAML should parse");
 
-        let runtime = TableRuntime::new(table, "test_indexer", "ComplexTokens");
-        let source_column_types = HashMap::from([
-            ("data_owner".to_string(), ColumnType::Address),
-            ("ids".to_string(), ColumnType::Array(Box::new(ColumnType::Uint256))),
-            ("values".to_string(), ColumnType::Array(Box::new(ColumnType::Uint256))),
-        ]);
+        let runtime = TableRuntime::try_new(&table, "test_indexer", "ComplexTokens").unwrap();
+        let source_column_types = RollbackEventSource::new("event", &serde_json::from_value::<Vec<_>>(serde_json::json!([{"name":"data","type":"tuple","components":[{"name":"owner","type":"address"}]},{"name":"ids","type":"uint256[]"},{"name":"values","type":"uint256[]"}])).unwrap()).unwrap();
         let mut accumulator = HashMap::new();
         let mut rollback_plans = HashMap::new();
 
@@ -2596,7 +2394,7 @@ events:
         )
         .expect("global counter table YAML should parse");
 
-        let runtime = TableRuntime::new(table, "test_indexer", "Token");
+        let runtime = TableRuntime::try_new(&table, "test_indexer", "Token").unwrap();
         let mut accumulator = HashMap::new();
         let mut rollback_plans = HashMap::new();
         build_derived_tables_for_event(
@@ -2604,7 +2402,7 @@ events:
             "test_indexer",
             "Token",
             "polygon",
-            &HashMap::new(),
+            &RollbackEventSource::default(),
             &[runtime],
             &mut accumulator,
             &mut rollback_plans,
@@ -2631,8 +2429,9 @@ events:
                 "test_indexer",
                 "Token",
                 "ethereum",
-                &HashMap::new(),
-                &[crate::indexer::tables::TableRuntime::new(table, "test_indexer", "Token")],
+                &RollbackEventSource::default(),
+                &[crate::indexer::tables::TableRuntime::try_new(&table, "test_indexer", "Token")
+                    .unwrap()],
                 &mut HashMap::new(),
                 &mut HashMap::new(),
             );

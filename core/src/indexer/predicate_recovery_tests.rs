@@ -159,12 +159,11 @@ async fn postgres_string_predicates_require_equivalent_recovery_or_startup_refus
             json!([]),
         )
         .await;
-        let mut source_types = std::collections::HashMap::new();
-        crate::indexer::start::collect_source_column_types(
+        let source_types = crate::indexer::reorg::task::RollbackEventSource::new(
+            "Value",
             &fixture.params.event_info.inputs,
-            None,
-            &mut source_types,
-        );
+        )
+        .unwrap();
         let mut derived = std::collections::HashMap::new();
         let mut plans = std::collections::HashMap::new();
         let admitted = crate::indexer::start::build_derived_tables_for_event(
@@ -316,11 +315,14 @@ async fn postgres_legacy_string_or_untyped_predicates_fail_without_changing_hist
         };
         let mut source_types = std::collections::HashMap::new();
         if typed {
-            crate::indexer::start::collect_source_column_types(
+            source_types = crate::indexer::reorg::task::RollbackEventSource::new(
+                "Value",
                 &fixture.params.event_info.inputs,
-                None,
-                &mut source_types,
-            );
+            )
+            .unwrap()
+            .types
+            .as_ref()
+            .clone();
         }
         let mut plan = DerivedTableRollbackPlan::default();
         plan.try_add_operation(

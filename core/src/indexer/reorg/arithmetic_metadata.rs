@@ -53,6 +53,7 @@ impl ReorgTask {
                 let source = ReversalSource {
                     dialect: SqlDialect::Postgres,
                     iterate: metadata.map_or(&[], |metadata| metadata.iterate.as_slice()),
+                    storage_names: metadata.and_then(|m| m.storage_names.as_deref()),
                     source_column_types: metadata
                         .map_or(&empty_types, |metadata| &metadata.source_column_types),
                 };

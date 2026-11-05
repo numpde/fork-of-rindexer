@@ -12,12 +12,11 @@ pub(super) async fn rollback(fixture: &Fixture, fork: u64, detection: u64) -> an
     let schema = generate_indexer_contract_schema_name(&fixture.params.indexer_name, "Contract");
     let mut derived = std::collections::HashMap::new();
     let mut plans = std::collections::HashMap::new();
-    let mut source_types = std::collections::HashMap::new();
-    crate::indexer::start::collect_source_column_types(
+    let source_types = crate::indexer::reorg::task::RollbackEventSource::new(
+        "Value",
         &fixture.params.event_info.inputs,
-        None,
-        &mut source_types,
-    );
+    )
+    .unwrap();
     crate::indexer::start::build_derived_tables_for_event(
         "Value",
         &fixture.params.indexer_name,
@@ -177,7 +176,7 @@ async fn postgres_partial_assignment_recovery_requires_complete_versions() {
     ).await;
     // A clear admission error is safe until the journal has whole-row versions.
     // If this shape is ever admitted again, it must satisfy the recovery law below.
-    if let Err(error) = fixture.params.tables[0].table.validate_reorg_operations() {
+    if let Err(error) = fixture.params.tables[0].table.definition().validate_reorg_operations() {
         assert!(
             error.contains("partial") && error.contains("set") && error.contains("totals"),
             "{error}"

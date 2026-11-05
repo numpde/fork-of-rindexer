@@ -24,7 +24,7 @@ use crate::indexer::last_synced::{
     get_last_synced_cron_block, update_last_synced_cron_block, CronSyncConfig,
 };
 use crate::is_running;
-use crate::manifest::contract::{parse_interval, ColumnType, Table, TableCronMapping};
+use crate::manifest::contract::{parse_interval, ColumnType, ResolvedTable, TableCronMapping};
 use crate::manifest::core::Manifest;
 use crate::provider::ChainProvider;
 use alloy::primitives::U64;
@@ -224,7 +224,7 @@ pub struct FactoryCronConfig {
 #[derive(Debug, Clone)]
 pub struct CronTask {
     pub contract_name: String,
-    pub table: Table,
+    pub table: ResolvedTable,
     pub full_table_name: String,
     pub cron_entry: TableCronMapping,
     pub cron_index: usize,
@@ -252,12 +252,12 @@ impl CronScheduler {
     ///
     /// This scans all contracts and tables for cron configurations and
     /// builds a list of tasks to execute.
-    pub fn new(
+    pub fn try_new(
         manifest: &Manifest,
         postgres: Option<Arc<PostgresClient>>,
         clickhouse: Option<Arc<ClickhouseClient>>,
         providers: Arc<HashMap<String, Arc<dyn ChainProvider>>>,
-    ) -> Self {
+    ) -> Result<Self, String> {
         let mut tasks = Vec::new();
 
         for contract in &manifest.contracts {
@@ -265,10 +265,9 @@ impl CronScheduler {
                 continue;
             };
 
-            for table in tables {
-                let Some(cron_entries) = &table.cron else {
-                    continue;
-                };
+            for declaration in tables.iter().filter(|table| table.has_cron()) {
+                let table = declaration.try_resolve_storage_columns()?;
+                let cron_entries = table.cron_mappings();
 
                 for (cron_index, cron_entry) in cron_entries.iter().enumerate() {
                     // Determine which networks to run on
@@ -292,7 +291,9 @@ impl CronScheduler {
                             Err(e) => {
                                 error!(
                                     "Invalid interval '{}' for table '{}': {}",
-                                    interval_str, table.name, e
+                                    interval_str,
+                                    table.name(),
+                                    e
                                 );
                                 continue;
                             }
@@ -303,7 +304,9 @@ impl CronScheduler {
                             Err(e) => {
                                 error!(
                                     "Invalid cron expression '{}' for table '{}': {}",
-                                    cron_expr, table.name, e
+                                    cron_expr,
+                                    table.name(),
+                                    e
                                 );
                                 continue;
                             }
@@ -311,7 +314,7 @@ impl CronScheduler {
                     } else {
                         error!(
                             "Cron entry for table '{}' has neither interval nor schedule",
-                            table.name
+                            table.name()
                         );
                         continue;
                     };
@@ -347,14 +350,15 @@ impl CronScheduler {
                         let full_table_name = crate::database::generate::generate_table_full_name(
                             &manifest.name,
                             &contract.name,
-                            &table.name,
-                            table.database.as_deref(),
+                            table.name(),
+                            table.definition().database.as_deref(),
                         );
 
                         if factory_config.is_some() {
                             info!(
                                 "Cron task for table '{}' on network '{}' uses factory indexing",
-                                table.name, network
+                                table.name(),
+                                network
                             );
                         }
 
@@ -377,7 +381,7 @@ impl CronScheduler {
 
         info!("Cron scheduler initialized with {} tasks", tasks.len());
 
-        Self { tasks, postgres, clickhouse, providers, indexer_name: manifest.name.clone() }
+        Ok(Self { tasks, postgres, clickhouse, providers, indexer_name: manifest.name.clone() })
     }
 
     /// Check if there are any cron tasks to run.
@@ -597,7 +601,7 @@ async fn run_cron_task(
 
     info!(
         "Starting cron task for table '{}' on network '{}' with schedule {:?}{}",
-        task.table.name,
+        task.table.name(),
         task.network,
         task.cron_entry.interval.as_ref().or(task.cron_entry.schedule.as_ref()),
         if is_factory { " (factory-indexed)" } else { "" }
@@ -613,7 +617,9 @@ async fn run_cron_task(
             {
                 error!(
                     "Failed waiting for factory sync for table '{}' on network '{}': {}",
-                    task.table.name, task.network, e
+                    task.table.name(),
+                    task.network,
+                    e
                 );
                 return;
             }
@@ -631,7 +637,8 @@ async fn run_cron_task(
         if !historical_completed {
             debug!(
                 "Historical sync for table '{}' on network '{}' interrupted by shutdown",
-                task.table.name, task.network
+                task.table.name(),
+                task.network
             );
             return;
         }
@@ -640,14 +647,14 @@ async fn run_cron_task(
         if task.cron_entry.end_block.is_some() {
             info!(
                 "Historical cron sync completed for table '{}' on network '{}' - end_block reached, stopping",
-                task.table.name, task.network
+                task.table.name(), task.network
             );
             return;
         }
 
         info!(
             "Historical cron sync completed for table '{}' on network '{}' - switching to live mode",
-            task.table.name, task.network
+            task.table.name(), task.network
         );
     }
 
@@ -677,7 +684,9 @@ async fn run_historical_sync(
             Err(e) => {
                 error!(
                     "Failed to get contract addresses for table '{}' on network '{}': {}",
-                    task.table.name, task.network, e
+                    task.table.name(),
+                    task.network,
+                    e
                 );
                 return false;
             }
@@ -686,7 +695,8 @@ async fn run_historical_sync(
     if addresses_with_blocks.is_empty() {
         warn!(
             "No contract addresses for table '{}' on network '{}', skipping historical sync",
-            task.table.name, task.network
+            task.table.name(),
+            task.network
         );
         return true; // Not a failure, just nothing to do yet
     }
@@ -715,7 +725,7 @@ async fn run_historical_sync(
         clickhouse: &clickhouse,
         indexer_name: &task.indexer_name,
         contract_name: &task.contract_name,
-        table_name: &task.table.name,
+        table_name: task.table.name(),
         cron_index: task.cron_index,
         network: &task.network,
     };
@@ -730,7 +740,7 @@ async fn run_historical_sync(
             if next > end_block {
                 info!(
                     "Historical cron sync for table '{}' on network '{}' already complete (last synced: {}, end: {})",
-                    task.table.name, task.network, last, end_block
+                    task.table.name(), task.network, last, end_block
                 );
                 return true;
             }
@@ -741,7 +751,7 @@ async fn run_historical_sync(
 
     info!(
         "Starting historical cron sync for table '{}' on network '{}' from block {} to {} (interval: {})",
-        task.table.name, task.network, current_block, end_block, block_interval
+        task.table.name(), task.network, current_block, end_block, block_interval
     );
 
     let start_time = std::time::Instant::now();
@@ -801,14 +811,14 @@ async fn run_historical_sync(
                     };
                     info!(
                         "Cron batch complete: table='{}', blocks {}-{} ({} ops{}), concurrency={}, batch_size={}, {:.1}s, saved at block {}",
-                        task.table.name, batch_start, batch_end, batch_blocks.len(), addr_info, concurrency, batch_sz, batch_duration.as_secs_f64(), b
+                        task.table.name(), batch_start, batch_end, batch_blocks.len(), addr_info, concurrency, batch_sz, batch_duration.as_secs_f64(), b
                     );
                     update_last_synced_cron_block(
                         &postgres,
                         &clickhouse,
                         &task.indexer_name,
                         &task.contract_name,
-                        &task.table.name,
+                        task.table.name(),
                         task.cron_index,
                         &task.network,
                         U64::from(b),
@@ -819,7 +829,11 @@ async fn run_historical_sync(
             Err(e) => {
                 error!(
                     "Historical cron batch failed for table '{}' on network '{}' blocks {}-{}: {}",
-                    task.table.name, task.network, batch_start, batch_end, e
+                    task.table.name(),
+                    task.network,
+                    batch_start,
+                    batch_end,
+                    e
                 );
             }
         }
@@ -837,7 +851,9 @@ async fn run_historical_sync(
     let elapsed = start_time.elapsed();
     info!(
         "Historical cron sync completed for table '{}' on network '{}' in {:?}",
-        task.table.name, task.network, elapsed
+        task.table.name(),
+        task.network,
+        elapsed
     );
 
     true
@@ -877,7 +893,7 @@ async fn execute_cron_operations_batch(
     for operation in &task.cron_entry.operations {
         for (column_name, value_ref) in &operation.where_clause {
             if value_ref.starts_with("$call(") {
-                if let Some(col) = task.table.columns.iter().find(|c| &c.name == column_name) {
+                if let Some(col) = task.table.columns().iter().find(|c| &c.name == column_name) {
                     call_patterns.push((
                         value_ref.clone(),
                         column_name.clone(),
@@ -889,7 +905,7 @@ async fn execute_cron_operations_batch(
         for set_col in &operation.set {
             let val = set_col.effective_value();
             if val.starts_with("$call(") {
-                if let Some(col) = task.table.columns.iter().find(|c| c.name == set_col.column) {
+                if let Some(col) = task.table.columns().iter().find(|c| c.name == set_col.column) {
                     call_patterns.push((
                         val.to_string(),
                         set_col.column.clone(),
@@ -1067,7 +1083,8 @@ async fn execute_cron_operations_batch(
                         }
                     } else {
                         // Handle non-$call values
-                        let column_def = task.table.columns.iter().find(|c| &c.name == column_name);
+                        let column_def =
+                            task.table.columns().iter().find(|c| &c.name == column_name);
                         if let Some(column_def) = column_def {
                             if let Some(value) = extract_cron_value_sync(
                                 value_ref,
@@ -1094,7 +1111,7 @@ async fn execute_cron_operations_batch(
                     } else {
                         // Handle non-$call values
                         let column_def =
-                            task.table.columns.iter().find(|c| c.name == set_col.column);
+                            task.table.columns().iter().find(|c| c.name == set_col.column);
                         if let Some(column_def) = column_def {
                             if let Some(value) = extract_cron_value_sync(
                                 val,
@@ -1149,7 +1166,7 @@ async fn execute_cron_operations_batch(
                     EthereumSqlTypeWrapper::U64BigInt(block_number),
                 );
 
-                if task.table.timestamp {
+                if task.table.definition().timestamp {
                     if let Some(ts) = tx_metadata.block_timestamp {
                         if let Some(dt) = DateTime::from_timestamp(ts.to::<i64>(), 0) {
                             columns.insert(
@@ -1190,7 +1207,12 @@ async fn execute_cron_operations_batch(
     // Step 4: Write all rows to database in batch
     let operation = &task.cron_entry.operations[0];
 
-    info!("Tables::{} - {:?} - {} rows", task.table.name, operation.operation_type, all_rows.len());
+    info!(
+        "Tables::{} - {:?} - {} rows",
+        task.table.name(),
+        operation.operation_type,
+        all_rows.len()
+    );
 
     if let Some(postgres) = &postgres {
         super::tables::execute_postgres_operation_internal(
@@ -1231,7 +1253,7 @@ async fn run_live_cron_loop(
 ) {
     loop {
         if !is_running() {
-            debug!("Cron task for table '{}' stopping due to shutdown", task.table.name);
+            debug!("Cron task for table '{}' stopping due to shutdown", task.table.name());
             break;
         }
 
@@ -1249,7 +1271,7 @@ async fn run_live_cron_loop(
                     Err(e) => {
                         warn!(
                             "Could not find next cron occurrence for table '{}': {}, using 60s default",
-                            task.table.name, e
+                            task.table.name(), e
                         );
                         Duration::from_secs(60)
                     }
@@ -1259,7 +1281,8 @@ async fn run_live_cron_loop(
 
         debug!(
             "Cron task for table '{}' waiting {:?} until next execution",
-            task.table.name, wait_duration
+            task.table.name(),
+            wait_duration
         );
 
         // Sleep in chunks to check for shutdown
@@ -1268,7 +1291,7 @@ async fn run_live_cron_loop(
 
         while remaining > Duration::ZERO {
             if !is_running() {
-                debug!("Cron task for table '{}' stopping due to shutdown", task.table.name);
+                debug!("Cron task for table '{}' stopping due to shutdown", task.table.name());
                 return;
             }
 
@@ -1289,7 +1312,9 @@ async fn run_live_cron_loop(
                 Err(e) => {
                     error!(
                         "Failed to get contract addresses for table '{}' on network '{}': {}",
-                        task.table.name, task.network, e
+                        task.table.name(),
+                        task.network,
+                        e
                     );
                     continue; // Skip this tick, try again next time
                 }
@@ -1299,7 +1324,8 @@ async fn run_live_cron_loop(
         if addresses.is_empty() {
             debug!(
                 "No contract addresses for table '{}' on network '{}', skipping this tick",
-                task.table.name, task.network
+                task.table.name(),
+                task.network
             );
             continue;
         }
@@ -1327,7 +1353,8 @@ async fn run_live_cron_loop(
                     if retry_count > 0 {
                         info!(
                             "Cron task for table '{}' succeeded after {} retry attempt(s)",
-                            task.table.name, retry_count
+                            task.table.name(),
+                            retry_count
                         );
                     }
                     break;
@@ -1343,7 +1370,7 @@ async fn run_live_cron_loop(
 
                         warn!(
                             "Cron task failed for table '{}' on network '{}': {}. Retrying in {:?} (attempt {}/{})",
-                            task.table.name, task.network, e, backoff, retry_count, MAX_RETRIES
+                            task.table.name(), task.network, e, backoff, retry_count, MAX_RETRIES
                         );
 
                         // Sleep with shutdown check
@@ -1366,7 +1393,10 @@ async fn run_live_cron_loop(
             if let Some(e) = last_error {
                 error!(
                     "Cron task failed for table '{}' on network '{}' after {} retries: {}",
-                    task.table.name, task.network, MAX_RETRIES, e
+                    task.table.name(),
+                    task.network,
+                    MAX_RETRIES,
+                    e
                 );
             }
         }
@@ -1389,7 +1419,8 @@ async fn execute_cron_operations(
     } else {
         warn!(
             "No provider found for network '{}' in cron task for table '{}'",
-            task.network, task.table.name
+            task.network,
+            task.table.name()
         );
         0
     };
@@ -1400,7 +1431,7 @@ async fn execute_cron_operations(
     if is_factory {
         debug!(
             "Executing cron operations for table '{}' on network '{}' at block {} for {} addresses",
-            task.table.name,
+            task.table.name(),
             task.network,
             latest_block,
             addresses.len()
@@ -1408,7 +1439,9 @@ async fn execute_cron_operations(
     } else {
         debug!(
             "Executing cron operations for table '{}' on network '{}' at block {}",
-            task.table.name, task.network, latest_block
+            task.table.name(),
+            task.network,
+            latest_block
         );
     }
 
@@ -1436,7 +1469,7 @@ async fn execute_cron_operations(
 
             // Add where clause columns
             for (column_name, value_ref) in &operation.where_clause {
-                let column_def = task.table.columns.iter().find(|c| &c.name == column_name);
+                let column_def = task.table.columns().iter().find(|c| &c.name == column_name);
 
                 if let Some(column_def) = column_def {
                     if let Some(value) = extract_cron_value(
@@ -1456,7 +1489,7 @@ async fn execute_cron_operations(
 
             // Add set columns with their values
             for set_col in &operation.set {
-                let column_def = task.table.columns.iter().find(|c| c.name == set_col.column);
+                let column_def = task.table.columns().iter().find(|c| c.name == set_col.column);
 
                 if let Some(column_def) = column_def {
                     if let Some(value) = extract_cron_value(
@@ -1477,7 +1510,8 @@ async fn execute_cron_operations(
             if columns.is_empty() {
                 debug!(
                     "No columns extracted for cron operation on table '{}' address {}, skipping",
-                    task.table.name, contract_address
+                    task.table.name(),
+                    contract_address
                 );
                 continue;
             }
@@ -1486,7 +1520,7 @@ async fn execute_cron_operations(
             // For cron with multiple addresses, include addr_idx to ensure unique sequence_id
             let sequence_id = crate::manifest::contract::compute_sequence_id(
                 latest_block,
-                u32::try_from(addr_idx).map_err(|_| format!("Cannot order cron operations for table {:?}: address index {addr_idx} exceeds {}", task.table.name, u32::MAX))?,
+                u32::try_from(addr_idx).map_err(|_| format!("Cannot order cron operations for table {:?}: address index {addr_idx} exceeds {}", task.table.name(), u32::MAX))?,
                 0,
             );
 
@@ -1499,7 +1533,7 @@ async fn execute_cron_operations(
                 EthereumSqlTypeWrapper::U64BigInt(latest_block),
             );
             // Only add timestamp if table has timestamp: true
-            if task.table.timestamp {
+            if task.table.definition().timestamp {
                 columns.insert(
                     crate::manifest::contract::injected_columns::BLOCK_TIMESTAMP.to_string(),
                     EthereumSqlTypeWrapper::DateTime(now),
@@ -1522,7 +1556,10 @@ async fn execute_cron_operations(
         }
 
         if all_rows.is_empty() {
-            debug!("No rows extracted for cron operation on table '{}', skipping", task.table.name);
+            debug!(
+                "No rows extracted for cron operation on table '{}', skipping",
+                task.table.name()
+            );
             continue;
         }
 
@@ -1558,7 +1595,10 @@ async fn execute_cron_operations(
     };
     info!(
         "Cron operations completed for table '{}' on network '{}' at block {}{}",
-        task.table.name, task.network, latest_block, addr_info
+        task.table.name(),
+        task.network,
+        latest_block,
+        addr_info
     );
 
     Ok(())
@@ -1880,10 +1920,11 @@ mod column_name_tests {
                         {"type":"upsert","set":[{"column":"total32","action":"set","value":"1"}]}
                     ]}]}]}]
         })).unwrap();
-        let scheduler = CronScheduler::new(&manifest, None, None, Arc::new(HashMap::new()));
+        let scheduler =
+            CronScheduler::try_new(&manifest, None, None, Arc::new(HashMap::new())).unwrap();
         assert_eq!(scheduler.tasks.len(), 1);
         let task = &scheduler.tasks[0];
-        assert_eq!(task.table.columns[0].name, "total_32");
+        assert_eq!(task.table.columns()[0].name, "total_32");
         assert_eq!(task.cron_entry.operations[0].set[0].column, "total_32");
     }
 }

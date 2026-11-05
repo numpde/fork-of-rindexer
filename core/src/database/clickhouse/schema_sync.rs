@@ -9,7 +9,7 @@ use clickhouse::Row;
 use serde::Deserialize;
 
 use crate::database::clickhouse::client::ClickhouseClient;
-use crate::database::generate::generate_indexer_contract_schema_name;
+use crate::database::generate::{check_legacy_column_names, generate_indexer_contract_schema_name};
 use crate::helpers::camel_to_snake;
 use crate::manifest::contract::{injected_columns, Table};
 use crate::manifest::core::Manifest;
@@ -236,27 +236,31 @@ pub async fn detect_schema_changes(
 ) -> Result<Vec<SchemaChange>, String> {
     let mut changes: Vec<SchemaChange> = vec![];
 
-    for contract in &manifest.contracts {
-        let Some(tables) = &contract.tables else {
-            continue;
-        };
+    for (owner, tables) in manifest.custom_table_groups() {
+        let default_database = generate_indexer_contract_schema_name(&manifest.name, owner);
 
-        let database = generate_indexer_contract_schema_name(&manifest.name, &contract.name);
-
-        for table in tables {
+        for declaration in tables {
+            let resolved = declaration.try_resolve_storage_columns()?;
+            let table = resolved.definition();
+            let database = table.database.as_deref().unwrap_or(&default_database);
+            if table.database.is_some() {
+                crate::indexer::reorg::validate_sql_identifier(database, "custom table database")
+                    .map_err(|error| error.to_string())?;
+            }
             let table_name = camel_to_snake(&table.name);
             let table_full_name = format!("{}.{}", database, table_name);
 
             // Check if table exists
-            if !table_exists(client, &database, &table_name).await? {
+            if !table_exists(client, database, &table_name).await? {
                 // Table doesn't exist yet, will be created normally
                 continue;
             }
 
             // Get existing columns
-            let existing_columns = get_existing_columns(client, &database, &table_name).await?;
+            let existing_columns = get_existing_columns(client, database, &table_name).await?;
             let existing_col_names: HashSet<String> =
                 existing_columns.iter().map(|c| c.name.clone()).collect();
+            check_legacy_column_names(declaration, &resolved, &existing_col_names, |name| name)?;
             let existing_col_types: HashMap<String, String> =
                 existing_columns.iter().map(|c| (c.name.clone(), c.data_type.clone())).collect();
 
@@ -311,7 +315,7 @@ pub async fn detect_schema_changes(
 
             // Check for ORDER BY changes
             if let Some(current_order_by) =
-                get_order_by_columns(client, &database, &table_name).await?
+                get_order_by_columns(client, database, &table_name).await?
             {
                 let expected_order_by = get_expected_order_by_columns(table);
 

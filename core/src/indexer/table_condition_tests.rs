@@ -30,20 +30,20 @@ async fn guarded_operation(kind: &str) {
                     .as_ref()
                     .unwrap()
                     .iter()
-                    .cloned()
-                    .map(|table| TableRuntime::new(table, "Replay", "Contract"))
+                    .map(|table| TableRuntime::try_new(table, "Replay", "Contract").unwrap())
                     .collect(),
             );
             let mut seed = fixture.params.clone();
-            let mut tables = seed.tables.as_ref().clone();
-            let operation = &mut tables[0].table.events[0].operations[0];
+            let mut declaration = validated.contracts[0].tables.as_ref().unwrap()[0].clone();
+            let operation = &mut declaration.events[0].operations[0];
             operation.operation_type = OperationType::Upsert;
             operation.if_condition = None;
             operation.set = serde_json::from_value(
                 json!([{"column":"balance","action":"set","value":"$balance"}]),
             )
             .unwrap();
-            seed.tables = Arc::new(tables);
+            seed.tables =
+                Arc::new(vec![TableRuntime::try_new(&declaration, "Replay", "Contract").unwrap()]);
             let seed_callback = no_code_callback(Arc::new(seed)).event_callback;
             let original = if guard_true && table_reference { 0 } else { 100 };
             seed_callback(vec![at(&fixture, "ethereum", 99, B256::repeat_byte(99), original)])

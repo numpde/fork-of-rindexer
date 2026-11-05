@@ -39,27 +39,10 @@ fn register<'a>(
         return Err(invalid("expected one schema.table destination; database must name a single schema, without database qualification".into()));
     }
     if declaration.recovery_enabled {
-        for part in &parts {
-            crate::indexer::reorg::validate_sql_identifier(part, "recovered table identifier")
-                .map_err(|error| invalid(error.to_string()))?;
-        }
-        if target != target.to_ascii_lowercase() {
-            return Err(invalid("use lowercase identifiers, including the database schema override, so quoted forward writes and bare recovery SQL address the same table".into()));
-        }
+        crate::indexer::reorg::validate_recovered_table_name(&target)
+            .map_err(|error| invalid(error.to_string()))?;
     }
-    let identity = parts
-        .iter()
-        .map(|part| {
-            let identifier = part.trim_matches('"');
-            let mut end = identifier.len().min(63);
-            // PostgreSQL drops a character crossing its byte limit entirely.
-            while !identifier.is_char_boundary(end) {
-                end -= 1;
-            }
-            &identifier[..end]
-        })
-        .collect::<Vec<_>>()
-        .join(".");
+    let identity = crate::indexer::reorg::recovery_table_identity(&target);
     targets.entry(identity).or_default().push(declaration);
     Ok(())
 }

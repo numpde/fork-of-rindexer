@@ -300,8 +300,10 @@ impl Fixture {
                 .as_ref()
                 .unwrap()
                 .iter()
-                .cloned()
-                .map(|table| TableRuntime::new(table, &params.indexer_name, &params.contract_name))
+                .map(|table| {
+                    TableRuntime::try_new(table, &params.indexer_name, &params.contract_name)
+                        .unwrap()
+                })
                 .collect(),
         );
         params.postgres = Some(client.clone());
@@ -315,6 +317,21 @@ impl Fixture {
             _directory: directory,
             _container: container,
         }
+    }
+
+    /// Vary the logical declaration and run it through the production constructor.
+    fn runtime_tables_with(
+        &self,
+        edit: impl FnOnce(&mut crate::manifest::contract::Table),
+    ) -> Arc<Vec<TableRuntime>> {
+        let mut declaration = self.indexer.contracts[0].tables.as_ref().unwrap()[0].clone();
+        edit(&mut declaration);
+        Arc::new(vec![TableRuntime::try_new(
+            &declaration,
+            &self.params.indexer_name,
+            &self.params.contract_name,
+        )
+        .unwrap()])
     }
 
     fn events(&self, values: &[u64]) -> Vec<EventResult> {
@@ -567,25 +584,28 @@ async fn postgres_derived_constant_nul_stops_once_without_effects_and_allows_cor
 
     let fixture = Fixture::new().await;
     let mut params = fixture.params.clone();
-    let mut tables = params.tables.as_ref().clone();
-    tables[0].table.columns.push(
-        serde_json::from_value(json!({
-            "name": "note", "type": "string", "nullable": true
-        }))
-        .unwrap(),
-    );
-    tables[0].table.events[0].operations[0].set.push(
-        serde_json::from_value(json!({
-            "column": "note", "action": "set", "value": "$constant(private_note)"
-        }))
-        .unwrap(),
-    );
     fixture
         .client
-        .batch_execute(&format!("ALTER TABLE {} ADD COLUMN note TEXT", tables[0].full_table_name))
+        .batch_execute(&format!(
+            "ALTER TABLE {} ADD COLUMN note TEXT",
+            params.tables[0].full_table_name
+        ))
         .await
         .unwrap();
-    params.tables = Arc::new(tables);
+    params.tables = fixture.runtime_tables_with(|table| {
+        table.columns.push(
+            serde_json::from_value(json!({
+                "name": "note", "type": "string", "nullable": true
+            }))
+            .unwrap(),
+        );
+        table.events[0].operations[0].set.push(
+            serde_json::from_value(json!({
+                "column": "note", "action": "set", "value": "$constant(private_note)"
+            }))
+            .unwrap(),
+        );
+    });
     params.constants = Arc::new(
         [("private_note".to_string(), ConstantValue::Simple("private\0payload".to_string()))]
             .into(),
@@ -1585,10 +1605,10 @@ async fn postgres_sequence_positions_choose_the_later_block_in_combined_and_sepa
     for tx_index in [1000, 1001] {
         for separate in [false, true] {
             let mut fixture = Fixture::new().await;
-            let mut tables = fixture.params.tables.as_ref().clone();
-            tables[0].table.events[0].operations[0].set[0].action =
-                crate::manifest::contract::SetAction::Set;
-            fixture.params.tables = Arc::new(tables);
+            fixture.params.tables = fixture.runtime_tables_with(|table| {
+                table.events[0].operations[0].set[0].action =
+                    crate::manifest::contract::SetAction::Set;
+            });
             let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
             let mut events = fixture.events(&[11, 22]);
             for (event, (block, tx)) in events.iter_mut().zip([(100, tx_index), (101, 0)]) {

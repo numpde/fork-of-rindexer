@@ -27,6 +27,7 @@ fn string(out: &mut Vec<u8>, s: &str) {
 
 async fn catalogue(
     legacy: bool,
+    reconciled_overlap: bool,
 ) -> (ClickhouseClient, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -60,6 +61,10 @@ async fn catalogue(
                         string(&mut out, name);
                         string(&mut out, kind);
                     }
+                    if reconciled_overlap {
+                        string(&mut out, "u_256");
+                        string(&mut out, "UInt256");
+                    }
                 } else if sql.contains("SELECT sorting_key") {
                     string(&mut out, "network, key_16");
                 } else {
@@ -82,7 +87,7 @@ async fn catalogue(
 
 #[tokio::test]
 async fn clickhouse_custom_column_identity_catalog_matches_ddl_without_reprojecting() {
-    let (client, seen, server) = catalogue(false).await;
+    let (client, seen, server) = catalogue(false, false).await;
     let changes = detect_schema_changes(&client, &manifest()).await.unwrap();
     server.abort();
     let queries = seen.lock().unwrap();
@@ -95,10 +100,55 @@ async fn clickhouse_custom_column_identity_catalog_matches_ddl_without_reproject
 
 #[tokio::test]
 async fn clickhouse_custom_column_identity_catalog_refuses_legacy_rename() {
-    let (client, _, server) = catalogue(true).await;
+    let (client, _, server) = catalogue(true, false).await;
     let result = detect_schema_changes(&client, &manifest()).await;
     server.abort();
     let error = result
         .expect_err("a legacy physical key needs reviewed migration; never propose dropping it");
     assert!(error.contains("key16") && error.contains("key_16"), "{error}");
+}
+
+#[tokio::test]
+async fn clickhouse_custom_column_identity_refuses_partial_legacy_overlap() {
+    // A previous `u256` literal can be mistaken for the newly declared `U256`'s
+    // destination. Adding the missing `u_256` would reassign the existing data.
+    let mut manifest = manifest();
+    manifest.contracts[0].tables.as_mut().unwrap()[0]
+        .columns
+        .push(serde_json::from_value(json!({"name":"u256","type":"uint256"})).unwrap());
+    for reconciled in [false, true] {
+        let (client, _, server) = catalogue(false, reconciled).await;
+        let result = detect_schema_changes(&client, &manifest).await;
+        server.abort();
+        if reconciled {
+            assert!(result.expect("both reconciled physical columns are present").is_empty());
+        } else {
+            let error = result
+                .expect_err("do not repurpose an existing literal as a different logical column");
+            assert!(error.contains("u256") && error.contains("u_256"), "{error}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn clickhouse_custom_column_identity_native_sync_checks_override_only_when_enabled() {
+    let mut manifest = manifest();
+    let mut tables = manifest.contracts.pop().unwrap().tables.unwrap();
+    tables[0].events[0].event = "NativeTransfer".to_owned();
+    manifest.native_transfers.tables = Some(tables);
+    manifest.native_transfers.enabled = false;
+    let (client, seen, server) = catalogue(true, false).await;
+    assert!(detect_schema_changes(&client, &manifest).await.unwrap().is_empty());
+    assert!(seen.lock().unwrap().is_empty(), "disabled native tables must not be probed");
+    manifest.native_transfers.enabled = true;
+    let result = detect_schema_changes(&client, &manifest).await;
+    server.abort();
+    let error =
+        result.expect_err("native-only legacy ClickHouse table must refuse automatic migration");
+    assert!(error.contains("key16") && error.contains("key_16"), "{error}");
+    let queries = seen.lock().unwrap();
+    assert!(
+        !queries.is_empty() && queries.iter().all(|q| q.contains("database = 'shared_state'")),
+        "native override must identify the real catalog table: {queries:?}"
+    );
 }

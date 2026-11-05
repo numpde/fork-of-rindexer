@@ -1,4 +1,8 @@
-use std::{collections::HashSet, fs, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::Path,
+};
 
 use alloy::{
     primitives::{keccak256, B256},
@@ -99,6 +103,7 @@ pub(crate) fn raw_event_abi_column_name(name: &str) -> String {
     const PREFIX: &str = "rindexer_abi_";
     if name != RAW_EVENT_ID_COLUMN
         && !RAW_EVENT_METADATA_COLUMNS.contains(&name)
+        && !crate::helpers::POSTGRES_SYSTEM_COLUMNS.contains(&name)
         && !name.starts_with(PREFIX)
     {
         return name.to_string();
@@ -112,6 +117,116 @@ pub(crate) fn raw_event_abi_column_name(name: &str) -> String {
     let mut bounded = format!("{PREFIX}{:x}", keccak256(name.as_bytes()));
     bounded.truncate(63);
     bounded
+}
+
+/// One physical raw column and its original ABI source. Non-indexed scalar tuples
+/// flatten; tuple arrays and indexed complex values each remain a single leaf.
+#[derive(Debug)]
+pub(crate) struct RawAbiColumn<'a> {
+    pub(crate) input: &'a ABIInput,
+    pub(crate) storage_name: String,
+    pub(crate) logical_path: String,
+    object_name: String,
+    parent_path: Option<Vec<AbiNamePropertiesPath>>,
+}
+
+fn raw_columns<'a>(
+    inputs: &'a [ABIInput],
+    path: Option<Vec<AbiNamePropertiesPath>>,
+) -> Vec<RawAbiColumn<'a>> {
+    fn visit<'a>(
+        inputs: &'a [ABIInput],
+        path: Option<Vec<AbiNamePropertiesPath>>,
+        out: &mut Vec<RawAbiColumn<'a>>,
+    ) {
+        for input in inputs {
+            if input.storage_type() == "tuple" {
+                if let Some(components) = &input.components {
+                    let mut next = path.clone().unwrap_or_default();
+                    next.push(AbiNamePropertiesPath::new(&input.name, &input.type_));
+                    visit(components, Some(next), out);
+                    continue;
+                }
+            }
+            let name = camel_to_snake(&input.name);
+            let (normalized, object_name) = match &path {
+                Some(parents) => {
+                    let prefix = parents
+                        .iter()
+                        .map(|p| camel_to_snake(&p.abi_name))
+                        .collect::<Vec<_>>()
+                        .join("_");
+                    (format!("{prefix}_{name}"), format!("{prefix}.{name}"))
+                }
+                None => (name.clone(), name),
+            };
+            let logical_path = path
+                .iter()
+                .flatten()
+                .map(|p| p.abi_name.as_str())
+                .chain(std::iter::once(input.name.as_str()))
+                .collect::<Vec<_>>()
+                .join(".");
+            out.push(RawAbiColumn {
+                input,
+                storage_name: raw_event_abi_column_name(&normalized),
+                logical_path,
+                object_name,
+                parent_path: path.clone(),
+            });
+        }
+    }
+    let mut out = Vec::new();
+    visit(inputs, path, &mut out);
+    out
+}
+
+/// Keep source/object identities separate from physical column identities. JSON
+/// object keys retain their exact ABI spelling; hash leaves expose no components.
+fn validate_abi_siblings(
+    event_name: &str,
+    inputs: &[ABIInput],
+    parent: &str,
+) -> Result<(), String> {
+    let mut names = HashMap::new();
+    for (index, input) in inputs.iter().enumerate() {
+        let path =
+            if parent.is_empty() { input.name.clone() } else { format!("{parent}.{}", input.name) };
+        if let Some(previous) = names.insert(&input.name, index) {
+            return Err(format!("Event {event_name:?} has duplicate ABI source path {path:?} at positions {previous} and {index}; give each input in this scope a unique name"));
+        }
+        if input.storage_type().split('[').next() == Some("tuple") {
+            if let Some(components) = &input.components {
+                validate_abi_siblings(event_name, components, &path)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate before collecting source types into a map: insertion there would
+/// already have lost one side of a flattened or catalog-truncated collision.
+pub(crate) fn validated_raw_event_columns<'a>(
+    event_name: &str,
+    inputs: &'a [ABIInput],
+) -> Result<Vec<RawAbiColumn<'a>>, String> {
+    validate_abi_siblings(event_name, inputs, "")?;
+    let columns = raw_columns(inputs, None);
+    let mut sources = HashMap::new();
+    for column in &columns {
+        let physical = crate::helpers::postgres_catalog_identifier(&column.storage_name);
+        if let Some(previous) = sources.insert(physical, column.logical_path.as_str()) {
+            return Err(format!("Event {event_name:?} ABI source paths {previous:?} and {:?} map to the same raw storage column {physical:?}; give the inputs distinct storage names",column.logical_path));
+        }
+    }
+    Ok(columns)
+}
+
+pub(crate) fn validate_raw_event_columns(
+    event_name: &str,
+    inputs: &[ABIInput],
+) -> Result<(), String> {
+    validated_raw_event_columns(event_name, inputs).map(drop)
 }
 
 impl ABIInput {
@@ -146,81 +261,26 @@ impl ABIInput {
         properties_type: &GenerateAbiPropertiesType,
         path: Option<Vec<AbiNamePropertiesPath>>,
     ) -> Vec<AbiProperty> {
-        inputs
-            .iter()
-            .flat_map(|input| {
-                let storage_type = input.storage_type();
-                // Only non-indexed scalar tuples flatten into component columns.
-                // Tuple arrays remain JSONB leaves; indexed complex fields are hash leaves.
-                if let Some(components) = &input.components {
-                    if storage_type == "tuple" {
-                        let new_path = path.clone().map_or_else(
-                            || vec![AbiNamePropertiesPath::new(&input.name, &input.type_)],
-                            |mut p| {
-                                p.push(AbiNamePropertiesPath::new(&input.name, &input.type_));
-                                p
-                            },
-                        );
-
-                        return ABIInput::generate_abi_name_properties(
-                            components,
-                            properties_type,
-                            Some(new_path),
-                        );
-                    }
-                }
-
-                // One stored value: a primitive, topic hash, or tuple-array JSONB.
-                {
-                    let prefix = path.as_ref().map(|p| {
-                        p.iter()
-                            .map(|pp| camel_to_snake(&pp.abi_name))
-                            .collect::<Vec<_>>()
-                            .join("_")
-                    });
-
-                    let abi_column = match prefix.as_deref() {
-                        Some(prefix) => format!("{prefix}_{}", camel_to_snake(&input.name)),
-                        None => camel_to_snake(&input.name),
-                    };
-                    let storage_column = raw_event_abi_column_name(&abi_column);
-                    match properties_type {
-                        GenerateAbiPropertiesType::PostgresWithDataTypes => {
-                            let value = format!(
-                                "\"{storage_column}\" {}",
-                                solidity_type_to_db_type(storage_type)
-                            );
-
-                            vec![AbiProperty::new(value, &input.name, storage_type, path.clone())]
-                        }
-                        GenerateAbiPropertiesType::PostgresColumnsNamesOnly
-                        | GenerateAbiPropertiesType::CsvHeaderNames => {
-                            vec![AbiProperty::new(
-                                storage_column,
-                                &input.name,
-                                storage_type,
-                                path.clone(),
-                            )]
-                        }
-                        GenerateAbiPropertiesType::Object => {
-                            let value = format!(
-                                "{}{}",
-                                prefix.map_or_else(|| "".to_string(), |p| format!("{p}.")),
-                                camel_to_snake(&input.name),
-                            );
-
-                            vec![AbiProperty::new(value, &input.name, storage_type, path.clone())]
-                        }
-                        GenerateAbiPropertiesType::ClickhouseWithDataTypes => {
-                            let value = format!(
-                                "\"{storage_column}\" {}",
-                                solidity_type_to_clickhouse_type(storage_type)
-                            );
-
-                            vec![AbiProperty::new(value, &input.name, storage_type, path.clone())]
-                        }
-                    }
-                }
+        raw_columns(inputs, path)
+            .into_iter()
+            .map(|column| {
+                let storage_type = column.input.storage_type();
+                let value = match properties_type {
+                    GenerateAbiPropertiesType::PostgresWithDataTypes => format!(
+                        "\"{}\" {}",
+                        column.storage_name,
+                        solidity_type_to_db_type(storage_type)
+                    ),
+                    GenerateAbiPropertiesType::PostgresColumnsNamesOnly
+                    | GenerateAbiPropertiesType::CsvHeaderNames => column.storage_name,
+                    GenerateAbiPropertiesType::Object => column.object_name,
+                    GenerateAbiPropertiesType::ClickhouseWithDataTypes => format!(
+                        "\"{}\" {}",
+                        column.storage_name,
+                        solidity_type_to_clickhouse_type(storage_type)
+                    ),
+                };
+                AbiProperty::new(value, &column.input.name, storage_type, column.parent_path)
             })
             .collect()
     }
@@ -306,6 +366,17 @@ impl ABIItem {
     ) -> Result<Vec<ABIItem>, ReadAbiError> {
         let abi_str = contract.parse_abi(project_path)?;
         let abi_items: Vec<ABIItem> = serde_json::from_str(&abi_str)?;
+
+        // Only stored or table-driving events need a raw layout. Unused ABI
+        // declarations and non-event functions must not block a valid contract.
+        for item in abi_items
+            .iter()
+            .filter(|item| item.type_ == "event" && contract.stores_raw_events(&item.name))
+        {
+            validate_raw_event_columns(&item.name, &item.inputs).map_err(|reason| {
+                ParseAbiError::InvalidAbiFormat(format!("{}: {reason}", contract.name))
+            })?;
+        }
 
         // Get events from include_events
         let include_event_names: Vec<String> = contract
@@ -468,6 +539,9 @@ pub struct GetAbiItemWithDbMap {
 pub enum GetAbiItemWithDbMapError {
     #[error("Parameter not found: {0}")]
     ParameterNotFound(String),
+
+    #[error("{0}")]
+    InvalidRawColumns(String),
 }
 
 pub fn get_abi_item_with_db_map(
@@ -475,65 +549,37 @@ pub fn get_abi_item_with_db_map(
     event_name: &str,
     parameter_mapping: &[&str],
 ) -> Result<GetAbiItemWithDbMap, GetAbiItemWithDbMapError> {
-    let event_item = abi_items.iter().find(|item| item.name == event_name && item.type_ == "event");
-
-    match event_item {
-        Some(item) => {
-            let mut current_inputs = &item.inputs;
-            let mut db_column_name = String::new();
-
-            for param in parameter_mapping {
-                match current_inputs.iter().find(|input| input.name == *param) {
-                    Some(input) => {
-                        if !db_column_name.is_empty() {
-                            db_column_name.push('_');
-                        }
-                        db_column_name.push_str(&camel_to_snake(&input.name));
-
-                        if param
-                            == parameter_mapping
-                                .last()
-                                .expect("Parameter mapping should have at least one element")
-                        {
-                            return Ok(GetAbiItemWithDbMap {
-                                abi_item: input.clone(),
-                                db_column_name,
-                            });
-                        } else {
-                            current_inputs = match input.type_.as_str() {
-                                "tuple" => {
-                                    if let Some(ref components) = input.components {
-                                        components
-                                    } else {
-                                        return Err(GetAbiItemWithDbMapError::ParameterNotFound(format!(
-                                            "Parameter {param} is not a nested structure in event {event_name} of contract"
-                                        )));
-                                    }
-                                },
-                                _ => return Err(GetAbiItemWithDbMapError::ParameterNotFound(format!(
-                                    "Parameter {param} is not a nested structure in event {event_name} of contract"
-                                ))),
-                            };
-                        }
-                    }
-                    None => {
-                        return Err(GetAbiItemWithDbMapError::ParameterNotFound(format!(
-                            "Parameter {param} not found in event {event_name} of contract"
-                        )));
-                    }
-                }
-            }
-
-            Err(GetAbiItemWithDbMapError::ParameterNotFound(format!(
-                "Parameter {} not found in event {} of contract",
-                parameter_mapping.join("."),
-                event_name
-            )))
-        }
-        None => Err(GetAbiItemWithDbMapError::ParameterNotFound(format!(
-            "Event {event_name} not found in contract ABI"
-        ))),
-    }
+    let event = abi_items
+        .iter()
+        .find(|item| item.type_ == "event" && item.name == event_name)
+        .ok_or_else(|| {
+            GetAbiItemWithDbMapError::ParameterNotFound(format!(
+                "Event {event_name} not found in contract ABI"
+            ))
+        })?;
+    let columns = validated_raw_event_columns(event_name, &event.inputs)
+        .map_err(GetAbiItemWithDbMapError::InvalidRawColumns)?;
+    columns
+        .into_iter()
+        .find(|column| {
+            column
+                .parent_path
+                .iter()
+                .flatten()
+                .map(|p| p.abi_name.as_str())
+                .chain(std::iter::once(column.input.name.as_str()))
+                .eq(parameter_mapping.iter().copied())
+        })
+        .map(|column| GetAbiItemWithDbMap {
+            abi_item: column.input.clone(),
+            db_column_name: column.storage_name,
+        })
+        .ok_or_else(|| {
+            GetAbiItemWithDbMapError::ParameterNotFound(format!(
+                "Parameter {} is not a stored column in event {event_name}",
+                parameter_mapping.join(".")
+            ))
+        })
 }
 
 #[cfg(test)]

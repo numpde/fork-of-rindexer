@@ -166,7 +166,7 @@ use crate::database::clickhouse::batch_operations::execute_dynamic_batch_operati
 use crate::database::clickhouse::client::ClickhouseClient;
 use crate::database::generate::generate_indexer_contract_schema_name;
 use crate::database::generate::generate_table_full_name;
-use crate::database::postgres::batch_operations::execute_dynamic_batch_operation;
+use crate::database::postgres::batch_operations::execute_dynamic_batch_operation_with_inputs;
 use crate::database::postgres::client::{pg_error_to_string, PostgresClient};
 use crate::database::postgres::generate::generate_internal_event_table_name;
 use crate::database::postgres::write_mode::PgWriteMode;
@@ -479,11 +479,11 @@ async fn prefetch_view_calls(
 
     // Scan all table operations for $call patterns
     for table_runtime in tables {
-        let event_mapping = match table_runtime.table.events.iter().find(|e| e.event == event_name)
-        {
-            Some(em) => em,
-            None => continue,
-        };
+        let event_mapping =
+            match table_runtime.table.event_mappings().iter().find(|e| e.event == event_name) {
+                Some(em) => em,
+                None => continue,
+            };
 
         for operation in &event_mapping.operations {
             // Collect value refs that might contain $call
@@ -1432,26 +1432,31 @@ pub struct TxMetadata {
 /// Runtime representation of a table with resolved table name.
 #[derive(Clone, Debug)]
 pub struct TableRuntime {
-    pub table: Table,
+    pub table: crate::manifest::contract::ResolvedTable,
     pub full_table_name: String,
     pub indexer_name: String,
     pub contract_name: String,
 }
 
 impl TableRuntime {
-    pub fn new(table: Table, indexer_name: &str, contract_name: &str) -> Self {
+    pub fn try_new(
+        declaration: &Table,
+        indexer_name: &str,
+        contract_name: &str,
+    ) -> Result<Self, String> {
+        let table = declaration.try_resolve_storage_columns()?;
         let full_table_name = generate_table_full_name(
             indexer_name,
             contract_name,
-            &table.name,
-            table.database.as_deref(),
+            table.name(),
+            table.definition().database.as_deref(),
         );
-        Self {
+        Ok(Self {
             table,
             full_table_name,
             indexer_name: indexer_name.to_string(),
             contract_name: contract_name.to_string(),
-        }
+        })
     }
 }
 
@@ -3625,7 +3630,7 @@ pub(crate) async fn prepare_table_operations<'t>(
     // Programmatic callers can bypass manifest admission. Reject ambiguous
     // mappings before any timestamp or view-call prefetch.
     for runtime in tables {
-        runtime.table.validate_event_mappings()?;
+        runtime.table.definition().validate_event_mappings()?;
     }
 
     let needs_timestamp_value = |value: &str| {
@@ -3639,9 +3644,9 @@ pub(crate) async fn prepare_table_operations<'t>(
         }
     };
     let needs_timestamps = tables.iter().any(|table| {
-        table.table.events.iter().any(|event| {
+        table.table.event_mappings().iter().any(|event| {
             event.event == event_name
-                && (table.table.timestamp
+                && (table.table.definition().timestamp
                     || event.operations.iter().any(|operation| {
                         operation.where_clause.values().any(|value| needs_timestamp_value(value))
                             || operation
@@ -3674,7 +3679,7 @@ pub(crate) async fn prepare_table_operations<'t>(
 
     // Check if any table has $call or $call_static patterns and prefetch using Multicall3
     let any_table_has_calls = tables.iter().any(|t| {
-        t.table.events.iter().any(|e| {
+        t.table.event_mappings().iter().any(|e| {
             e.event == event_name
                 && e.operations.iter().any(|op| {
                     let has_call = |v: &str| v.contains("$call(") || v.contains("$call_static(");
@@ -3721,7 +3726,8 @@ pub(crate) async fn prepare_table_operations<'t>(
         }
 
         // Find operations for this event
-        let Some(event_mapping) = table_runtime.table.events.iter().find(|e| e.event == event_name)
+        let Some(event_mapping) =
+            table_runtime.table.event_mappings().iter().find(|e| e.event == event_name)
         else {
             continue;
         };
@@ -3742,21 +3748,43 @@ pub(crate) async fn prepare_table_operations<'t>(
                 match parse_filter_expression(condition_expr) {
                     Ok(expr) => {
                         if expr.has_table_references() {
-                            let sql = match operation.operation_type {
-                                    OperationType::Update | OperationType::Delete => {
-                                        expr.visit_variables(&mut |variable| {
-                                            if variable.source() == crate::event::VariableSource::Event {
-                                                condition_inputs.insert(variable.base_name().to_string());
-                                            }
-                                        });
-                                        expr.to_sql_condition_with(&|variable| match variable.source() {
-                                            crate::event::VariableSource::Event => format!("tp.\"{}\"", condition_input_name(variable.base_name())),
-                                            crate::event::VariableSource::Table => format!("am.\"{}\"", variable.base_name()),
-                                        })
-                                    },
-                                    OperationType::Upsert => expr.to_sql_condition(&table_runtime.full_table_name),
-                                    OperationType::Insert => return Err(format!("Cannot apply table-state condition on INSERT into {}: use a guarded UPDATE or DELETE", table_runtime.full_table_name)),
-                                };
+                            if operation.operation_type == OperationType::Insert {
+                                return Err(format!("Cannot apply table-state condition on INSERT into {}: use a guarded UPDATE or DELETE", table_runtime.full_table_name));
+                            }
+                            let upsert = operation.operation_type == OperationType::Upsert;
+                            let mut unsupported = false;
+                            expr.visit_variables(&mut |variable| {
+                                if upsert && !variable.accessors().is_empty() {
+                                    unsupported = true;
+                                }
+                                if variable.source() == crate::event::VariableSource::Event {
+                                    condition_inputs.insert(variable.base_name().to_string());
+                                }
+                            });
+                            if unsupported {
+                                return Err(format!("Cannot evaluate UPSERT guard on {}: use scalar input and table columns without nested accessors", table_runtime.full_table_name));
+                            }
+                            let sql =
+                                expr.to_sql_condition_with(&|variable| match variable.source() {
+                                    crate::event::VariableSource::Event => {
+                                        let input = condition_input_name(variable.base_name());
+                                        if upsert {
+                                            // Guarded upserts execute one input per statement. The
+                                            // one-row CTE is visible inside ON CONFLICT; tp is not.
+                                            format!("(SELECT tp.\"{input}\" FROM to_process tp)")
+                                        } else {
+                                            format!("tp.\"{input}\"")
+                                        }
+                                    }
+                                    crate::event::VariableSource::Table => {
+                                        let target = if upsert {
+                                            table_runtime.full_table_name.as_str()
+                                        } else {
+                                            "am"
+                                        };
+                                        format!("{target}.\"{}\"", variable.base_name())
+                                    }
+                                });
                             (false, Some(sql))
                         } else {
                             (true, None)
@@ -3813,7 +3841,7 @@ pub(crate) async fn prepare_table_operations<'t>(
                     // Add where clause columns
                     for (column_name, value_ref) in &operation.where_clause {
                         let column_def =
-                            table_runtime.table.columns.iter().find(|c| &c.name == column_name);
+                            table_runtime.table.columns().iter().find(|c| &c.name == column_name);
 
                         if let Some(column_def) = column_def {
                             let value = if arithmetic_inputs {
@@ -3850,7 +3878,7 @@ pub(crate) async fn prepare_table_operations<'t>(
                     // Add set columns with their values
                     for set_col in &operation.set {
                         let column_def =
-                            table_runtime.table.columns.iter().find(|c| c.name == set_col.column);
+                            table_runtime.table.columns().iter().find(|c| c.name == set_col.column);
 
                         if let Some(column_def) = column_def {
                             let value = if arithmetic_inputs && set_col.action.reverse().is_some() {
@@ -3884,6 +3912,11 @@ pub(crate) async fn prepare_table_operations<'t>(
                         }
                     }
 
+                    // Query-only guard inputs must not turn an otherwise empty
+                    // upsert into an insertion of metadata and defaults.
+                    if operation.operation_type == OperationType::Upsert && columns.is_empty() {
+                        continue;
+                    }
                     // Guard inputs are separate from stored/set columns: DELETE has
                     // no SET values, and UPDATE may transform the incoming value.
                     for field in &condition_inputs {
@@ -3891,7 +3924,14 @@ pub(crate) async fn prepare_table_operations<'t>(
                             expanded_log_params.iter().find(|parameter| &parameter.name == field)
                         {
                             let kind = parameter.value.sol_type_name().as_deref().and_then(ColumnType::from_solidity_type).ok_or_else(|| format!("Cannot evaluate table guard: event field {field} has an unsupported SQL type"))?;
-                            dyn_sol_value_to_wrapper(&parameter.value, &kind)
+                            match (&parameter.value, &operation.operation_type) {
+                                // Incoming integers are ABI values. A stored uint64 BIGINT, for
+                                // example, reinterprets u64::MAX as -1; guard comparisons must not.
+                                (DynSolValue::Uint(value, _), OperationType::Upsert) => EthereumSqlTypeWrapper::U256Numeric(*value),
+                                (DynSolValue::Int(value, _), OperationType::Upsert) => EthereumSqlTypeWrapper::I256Numeric(*value),
+                                (DynSolValue::Array(_) | DynSolValue::FixedArray(_) | DynSolValue::Tuple(_), OperationType::Upsert) => return Err(format!("Cannot evaluate UPSERT guard: incoming field {field} must be scalar")),
+                                _ => dyn_sol_value_to_wrapper(&parameter.value, &kind),
+                            }
                         } else {
                             let kind = match field.as_str() {
                                 "rindexer_contract_address" => ColumnType::Address,
@@ -3903,10 +3943,12 @@ pub(crate) async fn prepare_table_operations<'t>(
                             extract_value_from_event(&format!("${field}"), expanded_log_params, tx_metadata, &kind).ok_or_else(|| format!("Cannot evaluate table guard: required incoming field {field} is unavailable"))?
                         };
                         let name = condition_input_name(field);
-                        if table_runtime.table.columns.iter().any(|column| column.name == name) {
+                        if table_runtime.table.columns().iter().any(|column| column.name == name) {
                             return Err(format!("Cannot evaluate table guard in {}: column {name} conflicts with its query input; rename that column", table_runtime.full_table_name));
                         }
-                        columns.insert(name, value);
+                        if columns.insert(name.clone(), value).is_some() {
+                            return Err(format!("Cannot evaluate table guard: distinct incoming fields map to the same query input {name}"));
+                        }
                     }
 
                     if !columns.is_empty() {
@@ -3925,7 +3967,7 @@ pub(crate) async fn prepare_table_operations<'t>(
                             EthereumSqlTypeWrapper::U64BigInt(tx_metadata.block_number),
                         );
                         // Only insert block_timestamp if table.timestamp is true
-                        if table_runtime.table.timestamp {
+                        if table_runtime.table.definition().timestamp {
                             let block_timestamp = if let Some(ts) = tx_metadata.block_timestamp {
                                 // Use timestamp from metadata if available
                                 Some(ts.to::<u64>())
@@ -4081,7 +4123,7 @@ pub(crate) async fn apply_table_operations(
             let mut connection =
                 postgres.raw_connection().await.map_err(|error| error.to_string())?;
             let tx = connection.transaction().await.map_err(|error| pg_error_to_string(&error))?;
-            if requires_individual_admission(op.operation, op.table.table.cross_chain) {
+            if requires_individual_admission(op) {
                 let mut inputs = op
                     .rows
                     .iter()
@@ -4101,7 +4143,7 @@ pub(crate) async fn apply_table_operations(
             execute_clickhouse_operation(
                 clickhouse,
                 &op.table.full_table_name,
-                &op.table.table,
+                op.table.table.definition(),
                 op.operation,
                 &op.rows,
             )
@@ -4139,10 +4181,11 @@ fn requires_recovery_journal(operation: &TableOperation) -> bool {
 
 // UPDATE's target/sequence guard applies to each event's delta before any
 // aggregation. Combining accepted and rejected inputs first changes the amount.
-fn requires_individual_admission(operation: &TableOperation, cross_chain: bool) -> bool {
-    cross_chain
-        || operation.operation_type == OperationType::Update
-        || requires_recovery_journal(operation)
+fn requires_individual_admission(op: &PreparedOperation<'_>) -> bool {
+    op.table.table.definition().cross_chain
+        || op.operation.operation_type == OperationType::Update
+        || (op.operation.operation_type == OperationType::Upsert && op.sql_condition.is_some())
+        || requires_recovery_journal(op.operation)
 }
 
 fn postgres_event_order(row: &TableRowData) -> Result<(&str, u128), String> {
@@ -4171,7 +4214,7 @@ async fn apply_postgres_rows(
     let affected = execute_postgres_operation(
         PgWriteMode::Tx(tx),
         &op.table.full_table_name,
-        &op.table.table,
+        op.table.table.definition(),
         op.operation,
         rows,
         op.sql_condition.as_deref(),
@@ -4203,10 +4246,7 @@ async fn apply_table_operations_in_tx(
 ) -> Result<(), String> {
     let ordered = (prepared.ops.len() > 1
         && prepared.ops.iter().any(|op| op.operation.operation_type != OperationType::Insert))
-        || prepared
-            .ops
-            .iter()
-            .any(|op| requires_individual_admission(op.operation, op.table.table.cross_chain));
+        || prepared.ops.iter().any(requires_individual_admission);
     let mut inputs = Vec::new();
     if ordered {
         // Event order precedes operation order: a later event must not advance
@@ -4363,7 +4403,11 @@ fn operation_type_to_batch_type(op_type: &OperationType) -> BatchOperationType {
 }
 
 fn condition_input_name(field: &str) -> String {
-    crate::database::generate::compact_table_name_if_needed(format!("rindexer_condition_{field}"))
+    // The CTE builder emits ordinary identifiers without quotes. Encode the
+    // logical bytes so PostgreSQL case folding cannot change the alias, and
+    // differently spelled ABI fields never become the same short input name.
+    let encoded = hex::encode(field.as_bytes());
+    crate::database::generate::compact_table_name_if_needed(format!("rindexer_condition_{encoded}"))
 }
 
 /// Executes a PostgreSQL operation for tables using the batch operations infrastructure.
@@ -4371,7 +4415,7 @@ fn condition_input_name(field: &str) -> String {
 /// # Arguments
 /// * `sql_where` - Optional SQL WHERE condition for upsert operations.
 ///   Used when the `if`/`filter` condition contains `@table` references.
-///   E.g., conditions like `$value > @balance` become SQL `EXCLUDED.value > table.balance`.
+///   Incoming event operands use query-only CTE columns; table operands use the current row.
 async fn execute_postgres_operation(
     mode: PgWriteMode<'_>,
     table_name: &str,
@@ -4384,6 +4428,7 @@ async fn execute_postgres_operation(
         return Ok(0);
     }
 
+    let mut query_only_inputs = std::collections::HashSet::new();
     // Build rows of DynamicColumnDefinition for the batch operation
     let mut batch_rows: Vec<Vec<DynamicColumnDefinition>> = Vec::with_capacity(rows.len());
 
@@ -4524,8 +4569,10 @@ async fn execute_postgres_operation(
             ));
         }
 
-        if matches!(operation.operation_type, OperationType::Update | OperationType::Delete)
-            && sql_where.is_some()
+        if matches!(
+            operation.operation_type,
+            OperationType::Upsert | OperationType::Update | OperationType::Delete
+        ) && sql_where.is_some()
         {
             let mut inputs = row
                 .columns
@@ -4537,6 +4584,7 @@ async fn execute_postgres_operation(
                 .collect::<Vec<_>>();
             inputs.sort_by_key(|(name, _)| *name);
             for (name, value) in inputs {
+                query_only_inputs.insert(name.clone());
                 use tokio_postgres::types::Type;
                 let kind = match value.to_type() {
                     Type::BOOL => BatchOperationSqlType::Bool,
@@ -4568,13 +4616,14 @@ async fn execute_postgres_operation(
     let short_table_name = table_name.split('.').next_back().unwrap_or(table_name);
     let event_name = format!("Tables::{}", short_table_name);
 
-    let affected = execute_dynamic_batch_operation(
+    let affected = execute_dynamic_batch_operation_with_inputs(
         mode,
         table_name,
         op_type,
         batch_rows,
         &event_name,
         sql_where,
+        &query_only_inputs,
     )
     .await?;
 
@@ -4776,7 +4825,7 @@ async fn execute_clickhouse_operation(
 pub async fn execute_postgres_operation_internal(
     postgres: &PostgresClient,
     table_name: &str,
-    table_def: &Table,
+    table_def: &crate::manifest::contract::ResolvedTable,
     operation: &TableOperation,
     rows: &[TableRowData],
     sql_where: Option<&str>,
@@ -4785,7 +4834,7 @@ pub async fn execute_postgres_operation_internal(
     execute_postgres_operation(
         PgWriteMode::Eager(postgres),
         table_name,
-        table_def,
+        table_def.definition(),
         operation,
         rows,
         sql_where,
@@ -4799,11 +4848,12 @@ pub async fn execute_postgres_operation_internal(
 pub async fn execute_clickhouse_operation_internal(
     clickhouse: &ClickhouseClient,
     table_name: &str,
-    table_def: &Table,
+    table_def: &crate::manifest::contract::ResolvedTable,
     operation: &TableOperation,
     rows: &[TableRowData],
 ) -> Result<(), String> {
-    execute_clickhouse_operation(clickhouse, table_name, table_def, operation, rows).await
+    execute_clickhouse_operation(clickhouse, table_name, table_def.definition(), operation, rows)
+        .await
 }
 
 /// Execute a view call for cron operations (no event data available).

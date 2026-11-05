@@ -418,7 +418,7 @@ pub async fn create_relationships(
                     let relationship = Relationship {
                         contract_name: foreign_key.contract_name.clone(),
                         event: foreign_key.event_name.clone(),
-                        db_table_column: camel_to_snake(&abi_parameter.db_column_name),
+                        db_table_column: abi_parameter.db_column_name.clone(),
                         db_table_name: format!(
                             "{}_{}.{}",
                             camel_to_snake(manifest_name),
@@ -429,7 +429,7 @@ pub async fn create_relationships(
                         linked_to: LinkTo {
                             contract_name: linked_key.contract_name.clone(),
                             event: linked_key.event_name.clone(),
-                            db_table_column: camel_to_snake(&linked_abi_parameter.db_column_name),
+                            db_table_column: linked_abi_parameter.db_column_name.clone(),
                             db_table_name: format!(
                                 "{}_{}.{}",
                                 camel_to_snake(manifest_name),

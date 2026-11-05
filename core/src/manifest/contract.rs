@@ -284,6 +284,10 @@ pub fn compute_sequence_id(block_number: u64, tx_index: u32, log_index: u32) -> 
     ((block_number as u128) << 64) | ((tx_index as u128) << 32) | log_index as u128
 }
 
+#[path = "storage_columns.rs"]
+mod storage_columns;
+pub use storage_columns::ResolvedTable;
+
 /// Defines a custom table for aggregated indexing.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Table {

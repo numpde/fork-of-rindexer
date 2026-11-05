@@ -17,7 +17,7 @@ use crate::{
         tables::{prepare_table_operations, PreparedTableOps, TableRuntime, TxMetadata},
     },
     manifest::{
-        contract::{ColumnType, Table},
+        contract::Table,
         core::{Constants, Manifest},
         yaml::{read_manifest, ReadManifestError},
     },
@@ -139,7 +139,7 @@ fn manifest_rejects_duplicate_event_mappings_with_different_iterate_scopes() {
 
 fn runtime(table: Value) -> TableRuntime {
     let table: Table = serde_json::from_value(table).expect("table shape remains deserializable");
-    TableRuntime::new(table, "mapping_admission", "Contract")
+    TableRuntime::try_new(&table, "mapping_admission", "Contract").unwrap()
 }
 
 async fn prepare(tables: &[TableRuntime]) -> Result<PreparedTableOps<'_>, String> {
@@ -178,7 +178,10 @@ fn plan(
         "mapping_admission",
         "Contract",
         "ethereum",
-        &HashMap::from([("value".into(), ColumnType::Uint256)]),
+        &crate::indexer::reorg::task::RollbackEventSource::new(
+            "Value",
+            &serde_json::from_value::<Vec<_>>(json!([{"name":"value","type":"uint256"}]))?,
+        )?,
         tables,
         derived,
         plans,
@@ -233,8 +236,7 @@ async fn one_event_mapping_preserves_all_operations_and_allows_other_tables() {
         .as_ref()
         .unwrap()
         .iter()
-        .cloned()
-        .map(|table| TableRuntime::new(table, "mapping_admission", "Contract"))
+        .map(|table| TableRuntime::try_new(table, "mapping_admission", "Contract").unwrap())
         .collect::<Vec<_>>();
     let prepared = prepare(&tables).await.expect("valid mappings prepare");
     assert_eq!(prepared.ops.len(), 3);

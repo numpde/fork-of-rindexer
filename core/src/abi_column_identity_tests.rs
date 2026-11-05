@@ -111,6 +111,8 @@ fn raw_abi_column_identity_preserves_reserved_fields_hashes_and_literal_json_mem
         scalar("blockNumber"),
         scalar("rindexer_abi_block_number"),
         scalar("rindexer_id"),
+        scalar("ctid"),
+        scalar("rindexer_abi_ctid"),
         hash,
         tuple("entries", "tuple[]", vec![scalar("key16"), scalar("key_16")]),
         tuple("position", "tuple", vec![scalar("tokenId")]),
@@ -131,11 +133,14 @@ fn raw_abi_column_identity_preserves_reserved_fields_hashes_and_literal_json_mem
             "rindexer_abi_block_number",
             "rindexer_abi_rindexer_abi_block_number",
             "rindexer_abi_rindexer_id",
+            "rindexer_abi_ctid",
+            "rindexer_abi_rindexer_abi_ctid",
             "digest",
             "position_token_id",
         ] {
             assert!(ddl.as_str().contains(&format!("\"{name}\" ")), "{name} missing from {ddl}");
         }
+        assert!(!ddl.as_str().contains("\"ctid\" "), "system columns retain their identities");
         assert!(!ddl.as_str().contains("digest_key"), "indexed tuples store only the hash");
         assert!(
             !ddl.as_str().contains("entries_key"),
@@ -210,4 +215,33 @@ fn raw_abi_column_identity_unicode_acronym_lookahead_uses_characters() {
     assert_eq!(camel_to_snake_advanced("税AB", true), "税_ab");
     assert_eq!(camel_to_snake("U256"), "u256");
     assert_eq!(camel_to_snake("key16"), "key_16");
+}
+
+#[test]
+fn postgres_custom_column_identity_refuses_truncated_legacy_literal() {
+    use crate::{
+        database::generate::check_legacy_column_names, helpers::postgres_catalog_identifier,
+        manifest::contract::Table,
+    };
+    let logical = format!("{}---b", "a".repeat(61));
+    let declaration: Table = serde_json::from_value(json!({"name":"Totals","global":true,
+        "columns":[{"name":logical,"type":"uint256"}],"events":[{"event":"Value","operations":[{
+            "type":"upsert","set":[{"column":logical,"action":"set","value":"$value"}]}]}]}))
+    .unwrap();
+    let resolved = declaration.try_resolve_storage_columns().unwrap();
+    let legacy = format!("{}--", "a".repeat(61));
+    let existing = std::collections::HashSet::from([legacy.clone()]);
+    let error =
+        check_legacy_column_names(&declaration, &resolved, &existing, postgres_catalog_identifier)
+            .expect_err(
+            "PostgreSQL stored a truncated literal; never offer to drop it as an unrelated column",
+        );
+    assert!(
+        error.contains(&legacy)
+            && error.contains(&logical)
+            && error.contains(resolved.storage_column(&logical).unwrap()),
+        "{error}"
+    );
+    // The truncated spelling is not the old literal in a ClickHouse catalogue.
+    check_legacy_column_names(&declaration, &resolved, &existing, |name| name).unwrap();
 }

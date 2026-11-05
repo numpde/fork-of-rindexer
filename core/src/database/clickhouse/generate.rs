@@ -79,7 +79,7 @@ pub fn generate_tables_for_indexer_clickhouse(
 
             // Generate custom tables if defined
             if let Some(tables) = &contract.tables {
-                sql.push_str(&generate_tables_clickhouse(tables, &schema_name));
+                sql.push_str(&generate_tables_clickhouse(tables, &schema_name)?);
             }
         }
 
@@ -136,16 +136,30 @@ fn generate_event_table_clickhouse(abi_inputs: &[EventInfo], schema_name: &str) 
 }
 
 /// Generate ClickHouse SQL for custom tables
-fn generate_tables_clickhouse(tables: &[Table], schema_name: &str) -> String {
-    tables
+fn generate_tables_clickhouse(
+    tables: &[Table],
+    schema_name: &str,
+) -> Result<String, GenerateTablesForIndexerSqlError> {
+    let statements = tables
         .iter()
-        .map(|table| {
+        .map(|declaration| {
+            let resolved = declaration
+                .try_resolve_storage_columns()
+                .map_err(GenerateTablesForIndexerSqlError::InvalidCustomTableSchema)?;
+            let table = resolved.definition();
             let effective_db = table.database.as_deref().unwrap_or(schema_name);
             let table_name = format!("{}.{}", effective_db, camel_to_snake(&table.name));
 
             // Create database if using a custom override (the default per-contract DB is created above)
             let mut create_db = String::new();
             if table.database.is_some() {
+                crate::indexer::reorg::validate_sql_identifier(
+                    effective_db,
+                    "custom table database",
+                )
+                .map_err(|error| {
+                    GenerateTablesForIndexerSqlError::InvalidCustomTableSchema(error.to_string())
+                })?;
                 create_db = format!("CREATE DATABASE IF NOT EXISTS {};", effective_db);
                 info!("Creating database if not exists: {} (custom table override)", effective_db);
             }
@@ -217,17 +231,17 @@ fn generate_tables_clickhouse(tables: &[Table], schema_name: &str) -> String {
                 format!("ReplacingMergeTree(`{}`)", injected_columns::RINDEXER_SEQUENCE_ID)
             };
 
-            format!(
+            Ok(format!(
                 "{}CREATE TABLE IF NOT EXISTS {} ({}) ENGINE = {} ORDER BY ({});",
                 create_db,
                 table_name,
                 columns.join(", "),
                 engine,
                 order_by.join(", ")
-            )
+            ))
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect::<Result<Vec<_>, GenerateTablesForIndexerSqlError>>()?;
+    Ok(statements.join("\n"))
 }
 
 fn generate_internal_event_table_clickhouse(

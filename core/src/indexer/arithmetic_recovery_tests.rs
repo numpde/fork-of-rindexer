@@ -5,7 +5,7 @@ use crate::{
     indexer::reorg::{
         BlockChainWindow, EventTableInfo, ReorgBlockHashPersistence, ReorgContext, ReorgCoordinator,
     },
-    manifest::contract::{ColumnType, OperationType},
+    manifest::contract::OperationType,
     provider::mock::MockChainProvider,
 };
 use alloy::primitives::{Address, U256};
@@ -56,7 +56,11 @@ async fn rollback_with_ancestor(fixture: &Fixture, branch: u8) -> anyhow::Result
         &fixture.params.indexer_name,
         "Contract",
         "ethereum",
-        &[("value".into(), ColumnType::Uint256)].into(),
+        &crate::indexer::reorg::task::RollbackEventSource::new(
+            "Value",
+            &fixture.params.event_info.inputs,
+        )
+        .unwrap(),
         &fixture.params.tables,
         &mut derived,
         &mut plans,
@@ -110,8 +114,9 @@ async fn replacement_case(update: bool) {
     seed(vec![input(&fixture, 99, 99, 10)]).await.unwrap();
     drop(seed);
     if update {
-        Arc::make_mut(&mut fixture.params.tables)[0].table.events[0].operations[0].operation_type =
-            OperationType::Update;
+        fixture.params.tables = fixture.runtime_tables_with(|table| {
+            table.events[0].operations[0].operation_type = OperationType::Update
+        });
     }
     let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
     callback(vec![input(&fixture, 100, 100, 20)]).await.unwrap();
@@ -306,6 +311,7 @@ async fn journaled_creation_baseline(action: &str, canonical_operand: u64, orpha
     })).await;
     fixture.params.tables[0]
         .table
+        .definition()
         .validate_reorg_operations()
         .expect("the explicit creation baseline must pass admission");
     let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;

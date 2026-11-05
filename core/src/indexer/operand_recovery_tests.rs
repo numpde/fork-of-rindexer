@@ -283,12 +283,11 @@ async fn postgres_arithmetic_legacy_missing_operands_abort_before_recovery_mutat
 }
 
 fn prepare_plan(fixture: &Fixture) -> anyhow::Result<()> {
-    let mut source_types = std::collections::HashMap::new();
-    crate::indexer::start::collect_source_column_types(
+    let source_types = crate::indexer::reorg::task::RollbackEventSource::new(
+        "Value",
         &fixture.params.event_info.inputs,
-        None,
-        &mut source_types,
-    );
+    )
+    .unwrap();
     crate::indexer::start::build_derived_tables_for_event(
         "Value",
         &fixture.params.indexer_name,

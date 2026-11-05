@@ -146,7 +146,7 @@ pub fn resolve_table_column_types(
 
 /// Build an `event_name -> field_name -> solidity_type` map from a list of ABI items.
 #[allow(clippy::result_large_err)]
-fn build_event_abi_types(
+pub(super) fn build_event_abi_types(
     abi_items: Vec<ABIItem>,
 ) -> Result<HashMap<String, HashMap<String, String>>, SetupNoCodeError> {
     let event_infos = ABIItem::extract_event_names_and_signatures_from_abi(abi_items)
@@ -298,12 +298,13 @@ pub async fn setup_no_code(
                         .collect(),
                 );
 
-                let scheduler = CronScheduler::new(
+                let scheduler = CronScheduler::try_new(
                     &manifest,
                     postgres.clone(),
                     clickhouse.clone(),
                     providers_map,
-                );
+                )
+                .map_err(ProcessIndexersError::TableColumnTypeResolutionError)?;
 
                 let cron_scheduler_handle = if scheduler.has_tasks() {
                     info!("Starting cron scheduler with {} tasks", scheduler.tasks.len());
@@ -1122,6 +1123,20 @@ pub async fn process_events(
     Ok(events)
 }
 
+fn resolve_runtime_tables(
+    tables: Option<&[Table]>,
+    indexer: &str,
+    contract: &str,
+) -> Result<Arc<Vec<TableRuntime>>, ProcessIndexersError> {
+    tables
+        .unwrap_or_default()
+        .iter()
+        .map(|table| TableRuntime::try_new(table, indexer, contract))
+        .collect::<Result<Vec<_>, _>>()
+        .map(Arc::new)
+        .map_err(ProcessIndexersError::TableColumnTypeResolutionError)
+}
+
 async fn process_contract(
     project_path: &Path,
     manifest: &Manifest,
@@ -1155,6 +1170,9 @@ async fn process_contract(
     let event_names = ABIItem::extract_event_names_and_signatures_from_abi(abi_items)?;
 
     let mut events: Vec<EventCallbackRegistryInformation> = vec![];
+
+    let tables_arc =
+        resolve_runtime_tables(contract.tables.as_deref(), &manifest.name, &contract.name)?;
 
     for event_info in event_names {
         let event_name = event_info.name.clone();
@@ -1218,18 +1236,6 @@ async fn process_contract(
             .as_ref()
             .is_some_and(|vec| vec.contains(&event_info.name));
 
-        // Build custom tables for this contract
-        let contract_tables: Vec<TableRuntime> = contract
-            .tables
-            .as_ref()
-            .map(|tables| {
-                tables
-                    .iter()
-                    .map(|table| TableRuntime::new(table.clone(), &manifest.name, &contract.name))
-                    .collect()
-            })
-            .unwrap_or_default();
-
         // Store raw events when this event's raw event table exists — same
         // predicate the DDL and migrations use (include_events plus events
         // that drive custom tables, the reorg recomputation source of truth)
@@ -1239,7 +1245,6 @@ async fn process_contract(
         let atomic_safe_concurrency =
             index_event_in_order || manifest.config.callback_concurrency.unwrap_or(1) <= 1;
 
-        let tables_arc = Arc::new(contract_tables);
         let streams_arc = Arc::new(streams_client);
         let event = EventCallbackRegistryInformation {
             id: generate_random_id(10),
@@ -1270,7 +1275,7 @@ async fn process_contract(
                 atomic_safe_concurrency,
             }))
             .event_callback,
-            tables: tables_arc,
+            tables: Arc::clone(&tables_arc),
             reorg_sender: None,
             streams_clients: streams_arc,
             providers: providers.clone(),
@@ -1307,6 +1312,9 @@ pub async fn process_trace_events(
     let contract = &manifest.native_transfers;
     let contract_name = NATIVE_TRANSFER_CONTRACT_NAME.to_string();
 
+    let nt_tables_arc =
+        resolve_runtime_tables(contract.tables.as_deref(), &manifest.name, &contract_name)?;
+
     for event_info in event_names {
         let event_name = event_info.name.clone();
         let event = &abi
@@ -1331,19 +1339,6 @@ pub async fn process_trace_events(
 
         let trace_information =
             TraceInformation::create(manifest.native_transfers.clone(), network_providers)?;
-
-        let nt_tables: Vec<TableRuntime> = manifest
-            .native_transfers
-            .tables
-            .as_ref()
-            .map(|tables| {
-                tables
-                    .iter()
-                    .map(|table| TableRuntime::new(table.clone(), &manifest.name, &contract_name))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let nt_tables_arc = Arc::new(nt_tables);
 
         let mut csv: Option<Arc<AsyncCsvAppender>> = None;
         if contract.generate_csv.unwrap_or(true) && manifest.storage.csv_enabled() {
@@ -1430,7 +1425,7 @@ pub async fn process_trace_events(
             contract_name: contract_name.clone(),
             trace_information: trace_information.clone(),
             callback: no_code_callback(callback_params).trace_callback,
-            tables: nt_tables_arc,
+            tables: Arc::clone(&nt_tables_arc),
             streams_clients: streams_arc,
         };
 

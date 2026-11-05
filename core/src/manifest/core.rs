@@ -9,7 +9,7 @@ use crate::helpers::to_pascal_case;
 use crate::manifest::config::Config;
 use crate::manifest::contract::{
     ContractDetails, ContractEvent, DependencyEventTreeYaml, FactoryDetailsYaml,
-    SimpleEventOrContractEvent,
+    SimpleEventOrContractEvent, Table,
 };
 use crate::{
     indexer::Indexer,
@@ -148,6 +148,23 @@ pub struct Manifest {
 }
 
 impl Manifest {
+    /// Declarations inspected by schema sync, paired with their runtime contract identity.
+    pub(crate) fn custom_table_groups(&self) -> impl Iterator<Item = (&str, &[Table])> {
+        let contracts = self.contracts.iter().filter_map(|contract| {
+            contract.tables.as_deref().map(|tables| (contract.name.as_str(), tables))
+        });
+        let native =
+            self.native_transfers.tables.as_deref().filter(|_| self.native_transfers.enabled).map(
+                |tables| (crate::indexer::native_transfer::NATIVE_TRANSFER_CONTRACT_NAME, tables),
+            );
+        contracts.chain(native)
+    }
+
+    /// Whether startup needs to check configured custom tables for schema changes.
+    pub fn has_custom_tables(&self) -> bool {
+        self.custom_table_groups().next().is_some()
+    }
+
     /// Includes both user-defined contracts and factory filter contracts
     pub fn all_contracts(&self) -> Vec<Contract> {
         self.contracts.clone().into_iter().flat_map(|contract| {

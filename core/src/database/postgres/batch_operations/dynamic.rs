@@ -103,13 +103,37 @@ fn event_admission(
 /// * `custom_where` - Optional SQL WHERE condition. UPDATE/DELETE use target `am` and input `tp` aliases.
 ///   Used to push conditions with `@table` references to SQL level.
 ///   E.g., `"EXCLUDED.value > token_balances.balance"` to only update if new value is greater.
-pub async fn execute_dynamic_batch_operation(
+#[cfg(test)]
+pub(super) async fn execute_dynamic_batch_operation(
     mode: PgWriteMode<'_>,
     table_name: &str,
     op_type: BatchOperationType,
     rows: Vec<Vec<DynamicColumnDefinition>>,
     event_name: &str,
     custom_where: Option<&str>,
+) -> Result<u64, String> {
+    execute_dynamic_batch_operation_with_inputs(
+        mode,
+        table_name,
+        op_type,
+        rows,
+        event_name,
+        custom_where,
+        &std::collections::HashSet::new(),
+    )
+    .await
+}
+
+/// Query-only columns are bound in the input CTE, never inserted into the table.
+/// Managed guarded UPSERTs read one event's operands before any aggregation.
+pub(crate) async fn execute_dynamic_batch_operation_with_inputs(
+    mode: PgWriteMode<'_>,
+    table_name: &str,
+    op_type: BatchOperationType,
+    rows: Vec<Vec<DynamicColumnDefinition>>,
+    event_name: &str,
+    custom_where: Option<&str>,
+    query_only_inputs: &std::collections::HashSet<String>,
 ) -> Result<u64, String> {
     if rows.is_empty() {
         return Ok(0);
@@ -118,12 +142,22 @@ pub async fn execute_dynamic_batch_operation(
     // PostgreSQL wire protocol limits parameters to i16::MAX (32767) per statement.
     // Cap batch size to stay under this limit based on column count.
     let num_columns = rows.first().map_or(1, |r| r.len().max(1));
-    let max_rows_per_batch = (32767 / num_columns).max(1);
+    let max_rows_per_batch =
+        if matches!(op_type, BatchOperationType::Upsert) && !query_only_inputs.is_empty() {
+            1
+        } else {
+            (32767 / num_columns).max(1)
+        };
 
     let mut affected = 0;
     for batch in rows.chunks(max_rows_per_batch) {
-        let Some(statement) = build_batch_statement(table_name, op_type, batch, custom_where)
-        else {
+        let Some(statement) = build_batch_statement_with_inputs(
+            table_name,
+            op_type,
+            batch,
+            custom_where,
+            query_only_inputs,
+        ) else {
             continue;
         };
         affected += execute_batch_statement(mode, statement).await.map_err(|e| {
@@ -206,11 +240,28 @@ fn query_failure(error: &impl std::fmt::Debug, rendered: String, sql: &str) -> S
 ///
 /// Returns `None` for an empty chunk. The same statement runs eagerly or inside a
 /// caller-owned transaction with identical SQL.
-pub fn build_batch_statement(
+#[cfg(test)]
+fn build_batch_statement(
     table_name: &str,
     op_type: BatchOperationType,
     batch: &[Vec<DynamicColumnDefinition>],
     custom_where: Option<&str>,
+) -> Option<DynamicBatchStatement> {
+    build_batch_statement_with_inputs(
+        table_name,
+        op_type,
+        batch,
+        custom_where,
+        &std::collections::HashSet::new(),
+    )
+}
+
+fn build_batch_statement_with_inputs(
+    table_name: &str,
+    op_type: BatchOperationType,
+    batch: &[Vec<DynamicColumnDefinition>],
+    custom_where: Option<&str>,
+    query_only_inputs: &std::collections::HashSet<String>,
 ) -> Option<DynamicBatchStatement> {
     let columns = batch.first()?;
 
@@ -485,7 +536,9 @@ pub fn build_batch_statement(
                             col,
                             build_arithmetic_insert_expr(col, clause_type, insert_default),
                         ));
-                        if let Some(w) = rewritten_where.as_mut() {
+                        if let Some(w) =
+                            rewritten_where.as_mut().filter(|_| query_only_inputs.is_empty())
+                        {
                             *w = rewrite_custom_where_for_arithmetic(
                                 w,
                                 col,
@@ -526,9 +579,14 @@ pub fn build_batch_statement(
                     None => admission.clone(),
                 });
             }
+            let stored_columns = column_names
+                .iter()
+                .copied()
+                .filter(|name| !query_only_inputs.contains(*name))
+                .collect::<Vec<_>>();
             query.push_str(&build_upsert_body(
                 &formatted_table_name,
-                &column_names,
+                &stored_columns,
                 &conflict_columns,
                 update_clauses,
                 if arithmetic_without_sequence_guard || admission.is_some() {

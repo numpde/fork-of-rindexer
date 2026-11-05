@@ -279,14 +279,12 @@ pub async fn detect_schema_changes(
 ) -> Result<Vec<SchemaChange>, String> {
     let mut changes: Vec<SchemaChange> = vec![];
 
-    for contract in &manifest.contracts {
-        let Some(tables) = &contract.tables else {
-            continue;
-        };
+    for (owner, tables) in manifest.custom_table_groups() {
+        let schema_name = generate_indexer_contract_schema_name(&manifest.name, owner);
 
-        let schema_name = generate_indexer_contract_schema_name(&manifest.name, &contract.name);
-
-        for table in tables {
+        for declaration in tables {
+            let resolved = declaration.try_resolve_storage_columns()?;
+            let table = resolved.definition();
             let schema_name = table.database.as_deref().unwrap_or(&schema_name);
             let table_name = camel_to_snake(&table.name);
             let table_full_name = format!("{}.{}", schema_name, table_name);
@@ -305,6 +303,12 @@ pub async fn detect_schema_changes(
                 existing_columns.iter().map(|c| (c.name.clone(), c.data_type.clone())).collect();
 
             // Get expected columns from YAML
+            super::super::generate::check_legacy_column_names(
+                declaration,
+                &resolved,
+                &existing_col_names,
+                crate::helpers::postgres_catalog_identifier,
+            )?;
             let expected_columns = get_expected_columns(table);
             let expected_col_names: HashSet<String> = expected_columns.keys().cloned().collect();
 

@@ -30,6 +30,19 @@ use rand::{distr::Alphanumeric, RngExt};
 mod duration;
 pub use duration::format_duration;
 
+/// Columns provided implicitly by PostgreSQL for every relation.
+pub(crate) const POSTGRES_SYSTEM_COLUMNS: &[&str] =
+    &["ctid", "tableoid", "xmin", "xmax", "cmin", "cmax"];
+
+/// PostgreSQL catalog identifiers stop at 63 bytes without splitting a character.
+pub(crate) fn postgres_catalog_identifier(identifier: &str) -> &str {
+    let mut end = identifier.len().min(63);
+    while !identifier.is_char_boundary(end) {
+        end -= 1;
+    }
+    &identifier[..end]
+}
+
 pub fn camel_to_snake(s: &str) -> String {
     camel_to_snake_advanced(s, false)
 }
@@ -40,13 +53,13 @@ pub fn camel_to_snake_advanced(s: &str, numbers_attach_to_last_word: bool) -> St
     let mut previous_was_digit = false;
     let mut uppercase_sequence_length = 0;
 
-    for (i, c) in s.chars().enumerate() {
+    let mut characters = s.chars().enumerate().peekable();
+    while let Some((i, c)) = characters.next() {
         if c.is_alphanumeric() || c == '_' {
             if c.is_uppercase() {
                 if i > 0
                     && (!previous_was_uppercase
-                        || (i + 1 < s.len()
-                            && s.chars().nth(i + 1).expect("Failed to get char").is_lowercase()))
+                        || characters.peek().is_some_and(|(_, next)| next.is_lowercase()))
                 {
                     snake_case.push('_');
                 }

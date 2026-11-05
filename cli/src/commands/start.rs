@@ -489,7 +489,7 @@ pub async fn start(
 
         // Schema sync for no-code projects with custom tables
         if manifest.project_type == ProjectType::NoCode {
-            let has_tables = manifest.contracts.iter().any(|c| c.tables.is_some());
+            let has_tables = manifest.has_custom_tables();
             if has_tables {
                 // Resolve column types from ABI before schema sync
                 if let Err(e) = resolve_table_column_types(&project_path, &mut manifest) {
@@ -513,7 +513,7 @@ pub async fn start(
 
     // ClickHouse schema sync for no-code projects with custom tables
     if manifest.storage.clickhouse_enabled() && manifest.project_type == ProjectType::NoCode {
-        let has_tables = manifest.contracts.iter().any(|c| c.tables.is_some());
+        let has_tables = manifest.has_custom_tables();
         if has_tables {
             // Resolve column types from ABI before schema sync (if not already done for postgres)
             if !manifest.storage.postgres_enabled() {

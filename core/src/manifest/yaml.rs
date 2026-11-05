@@ -863,6 +863,25 @@ fn validate_manifest(
         }
     }
 
+    // Preserve logical declarations for manifest serialization and ABI inference.
+    // Validate the physical projection after the existing logical diagnostics.
+    for contract in &contracts {
+        for table in contract.tables.iter().flatten() {
+            table.try_resolve_storage_columns().map_err(|error| {
+                ValidateManifestError::CustomIndexingValidationError(error, contract.name.clone())
+            })?;
+        }
+    }
+    if manifest.native_transfers.enabled {
+        for table in manifest.native_transfers.tables.iter().flatten() {
+            table.try_resolve_storage_columns().map_err(|error| {
+                ValidateManifestError::CustomIndexingValidationError(
+                    error,
+                    "native_transfers".into(),
+                )
+            })?;
+        }
+    }
     Ok(())
 }
 

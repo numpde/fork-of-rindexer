@@ -21,16 +21,17 @@ use crate::database::{
 };
 use crate::indexer::{
     reorg::{
-        task::{
-            DerivedColumnRollback, DerivedTableInfo, DerivedTableRollbackOp,
-            DerivedTableRollbackPlan, EventTableInfo, ReorgTask,
-        },
+        task::{DerivedTableRollbackPlan, EventTableInfo, ReorgTask},
         window::BlockChainWindow,
     },
-    tables::{execute_postgres_operation_internal, parse_literal_value_for_column, TableRowData},
+    tables::{
+        apply_table_operations, execute_postgres_operation_internal,
+        parse_literal_value_for_column, prepare_table_operations, TableRowData, TableRuntime,
+        TxMetadata,
+    },
 };
 use crate::manifest::{
-    contract::{injected_columns, ColumnType, OperationType, SetAction, Table},
+    contract::{injected_columns, ColumnType, OperationType, ResolvedTable, Table},
     core::Manifest,
 };
 use crate::EthereumSqlTypeWrapper;
@@ -162,23 +163,26 @@ fn metadata(block: u64) -> HashMap<String, EthereumSqlTypeWrapper> {
     ])
 }
 
-fn boundary_row(index: usize, block: u64) -> TableRowData {
+fn boundary_row(table: &ResolvedTable, index: usize, block: u64) -> TableRowData {
     let mut columns = metadata(block);
     columns.insert("holder".to_string(), EthereumSqlTypeWrapper::String(format!("player{index}")));
     for &(column, abi_type, _, values) in VALUES {
-        columns.insert(column.to_string(), decoded(abi_type, &[values[index]]));
+        columns.insert(
+            table.storage_column(column).unwrap().to_owned(),
+            decoded(abi_type, &[values[index]]),
+        );
     }
     TableRowData { columns, network: "ethereum".to_string() }
 }
 
-fn increment_row(index: usize) -> TableRowData {
-    let mut row = boundary_row(index, 2);
+fn increment_row(table: &ResolvedTable, index: usize) -> TableRowData {
+    let mut row = boundary_row(table, index, 2);
     for &(column, abi_type, ref column_type, values) in VALUES {
         let increment = i64::from(abi_type.starts_with("uint") && values[index] > 0);
         // Cron literals and decoded events must use compatible parameter types.
         let wrapper = parse_literal_value_for_column(&increment.to_string(), column_type)
             .expect("typed increment");
-        row.columns.insert(column.to_string(), wrapper);
+        row.columns.insert(table.storage_column(column).unwrap().to_owned(), wrapper);
     }
     row
 }
@@ -213,39 +217,43 @@ fn custom_table_unsigned_types_preserve_ranges_and_signed_types() {
 
 async fn insert_and_upsert(postgres: &PostgresClient) -> Result<()> {
     let tables = [table("inserts", "insert"), table("balances", "upsert")];
-    for table in &tables {
-        create_table(postgres, table).await?;
-        let name = format!("{SCHEMA}.{}", table.name);
-        let operation = &table.events[0].operations[0];
-        let mut rows: Vec<_> = (0..4).map(|i| boundary_row(i, 1)).collect();
+    for declaration in &tables {
+        create_table(postgres, declaration).await?;
+        let table = declaration.try_resolve_storage_columns().map_err(anyhow::Error::msg)?;
+        let name = format!("{SCHEMA}.{}", table.name());
+        let operation = &table.event_mappings()[0].operations[0];
+        let mut rows: Vec<_> = (0..4).map(|i| boundary_row(&table, i, 1)).collect();
         if operation.operation_type == OperationType::Upsert {
             for (i, row) in rows.iter_mut().enumerate() {
                 for &(column, abi_type, _, values) in VALUES {
                     if abi_type.starts_with("uint") && values[i] > 0 {
-                        row.columns.insert(column.to_string(), decoded(abi_type, &[values[i] - 1]));
+                        row.columns.insert(
+                            table.storage_column(column).unwrap().to_owned(),
+                            decoded(abi_type, &[values[i] - 1]),
+                        );
                     }
                 }
             }
         }
-        execute_postgres_operation_internal(postgres, &name, table, operation, &rows, None)
+        execute_postgres_operation_internal(postgres, &name, &table, operation, &rows, None)
             .await
             .map_err(anyhow::Error::msg)?;
         if operation.operation_type == OperationType::Upsert {
-            let deltas: Vec<_> = (0..4).map(increment_row).collect();
-            execute_postgres_operation_internal(postgres, &name, table, operation, &deltas, None)
+            let deltas: Vec<_> = (0..4).map(|i| increment_row(&table, i)).collect();
+            execute_postgres_operation_internal(postgres, &name, &table, operation, &deltas, None)
                 .await
                 .map_err(anyhow::Error::msg)?;
         }
         let stored = postgres.query(&format!(
-            "SELECT value16::text, value24::text, value32::text, signed16::text, signed32::text FROM {name} ORDER BY holder"
+            "SELECT value_16::text, value_24::text, value_32::text, signed_16::text, signed_32::text FROM {name} ORDER BY holder"
         ), &[]).await?;
-        ensure!(stored.len() == 4, "{} must store all four boundary cases", table.name);
+        ensure!(stored.len() == 4, "{} must store all four boundary cases", table.name());
         for (i, stored) in stored.iter().enumerate() {
             for (j, &(column, _, _, values)) in VALUES.iter().enumerate() {
                 ensure!(
                     stored.get::<_, String>(j) == values[i].to_string(),
                     "{}.{column} case {i} changed value",
-                    table.name
+                    table.name()
                 );
             }
         }
@@ -257,9 +265,9 @@ async fn insert_and_upsert(postgres: &PostgresClient) -> Result<()> {
     let changes = detect_schema_changes(postgres, &manifest).await.map_err(anyhow::Error::msg)?;
     ensure!(changes.is_empty(), "generated schemas disagree with schema checks: {changes:?}");
     // Existing narrow columns must require manual migration, not pass unnoticed.
-    postgres.batch_execute(&format!("TRUNCATE {SCHEMA}.inserts; ALTER TABLE {SCHEMA}.inserts ALTER COLUMN value16 TYPE SMALLINT, ALTER COLUMN value32 TYPE INTEGER")).await?;
+    postgres.batch_execute(&format!("TRUNCATE {SCHEMA}.inserts; ALTER TABLE {SCHEMA}.inserts ALTER COLUMN value_16 TYPE SMALLINT, ALTER COLUMN value_32 TYPE INTEGER")).await?;
     let changes = detect_schema_changes(postgres, &manifest).await.map_err(anyhow::Error::msg)?;
-    for (column, expected) in [("value16", "integer"), ("value32", "bigint")] {
+    for (column, expected) in [("value_16", "integer"), ("value_32", "bigint")] {
         ensure!(changes.iter().any(|change| matches!(change, SchemaChange::ColumnTypeChanged { column_name, new_type, .. } if column_name == column && new_type == expected)), "old {column} schema must require widening: {changes:?}");
     }
     Ok(())
@@ -305,9 +313,8 @@ events:
         })
         .collect::<Vec<_>>();
     let source_columns = generate_column_names_only_with_base_properties(&inputs).join(", ");
-    let event = crate::abi::EventInfo::new(serde_json::from_value(json!({
-        "type":"event", "name":"events", "anonymous":false, "inputs":inputs,
-    }))?)?;
+    let abi = crate::ABIItem { type_: "event".into(), name: "Values".into(), inputs };
+    let event = crate::abi::EventInfo::new(abi.clone())?;
     postgres
         .batch_execute(&super::generate_event_table_sql_with_comments(
             &[event],
@@ -316,38 +323,60 @@ events:
             vec![],
         ))
         .await?;
-    let full_name = format!("{SCHEMA}.totals");
-    for (block, amount16, amount32) in [(1, 1, 1), (2, 65534, 4294967294i64)] {
-        let mut columns = metadata(block);
-        for (column, abi_type, value) in [
-            ("key16", "uint16", 65535),
-            ("key32", "uint32", 4294967295),
-            ("amount16", "uint16", amount16),
-            ("amount32", "uint32", amount32),
-        ] {
-            columns.insert(column.to_string(), decoded(abi_type, &[value]));
-        }
-        let row = TableRowData { columns, network: "ethereum".to_string() };
-        execute_postgres_operation_internal(
-            postgres,
-            &full_name,
-            &table,
-            &table.events[0].operations[0],
-            &[row],
+
+    let runtime =
+        TableRuntime::try_new(&table, "integers", "Values").map_err(anyhow::Error::msg)?;
+    let full_name = &runtime.full_table_name;
+    for (block, amount16, amount32) in [(1u64, 1, 1), (2, 65534, 4294967294u64)] {
+        use crate::types::core::LogParam;
+        use alloy::{
+            dyn_abi::DynSolValue,
+            primitives::{Address, B256, U256},
+        };
+        let hash = B256::from(U256::from(block).to_be_bytes::<32>());
+        let params = [
+            ("key16", 16, 65535),
+            ("key32", 32, 4294967295),
+            ("amount16", 16, amount16),
+            ("amount32", 32, amount32),
+        ]
+        .into_iter()
+        .map(|(name, bits, value)| {
+            LogParam::new(name.into(), DynSolValue::Uint(U256::from(value), bits))
+        })
+        .collect();
+        let metadata = TxMetadata {
+            block_number: block,
+            block_timestamp: None,
+            block_hash: hash,
+            tx_hash: hash,
+            tx_index: 0,
+            log_index: U256::ZERO,
+            contract_address: Address::with_last_byte(1),
+        };
+        let prepared = prepare_table_operations(
+            std::slice::from_ref(&runtime),
+            "Values",
+            &[(params, "ethereum".into(), metadata)],
+            Default::default(),
+            &Default::default(),
+            &HashMap::new(),
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+        apply_table_operations(
+            &prepared,
+            Some(crate::database::postgres::write_mode::PgWriteMode::Eager(postgres)),
+            None,
             None,
         )
         .await
         .map_err(anyhow::Error::msg)?;
-        postgres.batch_execute(&format!("INSERT INTO {SCHEMA}.events ({source_columns}) VALUES ('0x{:040x}',65535,4294967295,{amount16},{amount32},'0x{block:064x}',{block},NULL,'0x{block:064x}','ethereum',0,'0')",1)).await?;
+        postgres.batch_execute(&format!("INSERT INTO {SCHEMA}.values ({source_columns}) VALUES ('0x{:040x}',65535,4294967295,{amount16},{amount32},'0x{block:064x}',{block},NULL,'0x{block:064x}','ethereum',0,'0')",1)).await?;
     }
-    let types = HashMap::from([
-        ("key16".to_string(), ColumnType::Uint16),
-        ("key32".to_string(), ColumnType::Uint32),
-        ("amount16".to_string(), ColumnType::Uint16),
-        ("amount32".to_string(), ColumnType::Uint32),
-    ]);
     let mut plan = DerivedTableRollbackPlan::default();
-    plan.try_add_operation(full_name.clone(), 0, vec![], types.clone(), types)?;
+    let mut derived_tables = Vec::new();
+    plan.try_add_table_event(&mut derived_tables, "integers", "Values", &abi, &table)?;
     let task = ReorgTask {
         network: "ethereum".to_string(),
         fork_point: 2,
@@ -355,37 +384,13 @@ events:
         // The event-table entry supplies raw deletion and checkpoint maintenance.
         event_tables: vec![EventTableInfo::try_new(
             SCHEMA.to_string(),
-            "events".to_string(),
+            "values".to_string(),
             "events".to_string(),
             "integers".to_string(),
             "Values".to_string(),
             "Values".to_string(),
         )?],
-        derived_tables: vec![DerivedTableInfo::try_new(
-            full_name.clone(),
-            false,
-            vec![DerivedTableRollbackOp::try_new(
-                format!("{SCHEMA}.events"),
-                vec![
-                    ("key16".to_string(), "key16".to_string()),
-                    ("key32".to_string(), "key32".to_string()),
-                ],
-                vec![
-                    DerivedColumnRollback::try_new(
-                        "amount16".to_string(),
-                        "amount16".to_string(),
-                        SetAction::Add,
-                    )?,
-                    DerivedColumnRollback::try_new(
-                        "amount32".to_string(),
-                        "amount32".to_string(),
-                        SetAction::Add,
-                    )?,
-                ],
-                None,
-            )?],
-            vec![],
-        )?],
+        derived_tables,
         canonical_blocks: vec![],
     };
     postgres.batch_execute("CREATE TABLE rindexer_internal.events (network TEXT, last_synced_block NUMERIC); INSERT INTO rindexer_internal.events VALUES ('ethereum', 2)").await?;
@@ -400,7 +405,7 @@ events:
         .await?;
     ensure!(result.events_deleted == 1, "only the invalidated event should be deleted");
     let stored = postgres
-        .query_one(&format!("SELECT key16, key32, amount16, amount32 FROM {full_name}"), &[])
+        .query_one(&format!("SELECT key_16, key_32, amount_16, amount_32 FROM {full_name}"), &[])
         .await?;
     ensure!(
         stored.get::<_, i32>(0) == 65535 && stored.get::<_, i64>(1) == 4294967295,
@@ -411,7 +416,7 @@ events:
         "rollback must retain the first block's contributions"
     );
     let remaining =
-        postgres.query_one(&format!("SELECT block_number::text FROM {SCHEMA}.events"), &[]).await?;
+        postgres.query_one(&format!("SELECT block_number::text FROM {SCHEMA}.values"), &[]).await?;
     ensure!(remaining.get::<_, String>(0) == "1", "the canonical event must remain");
     let checkpoint = postgres
         .query_one("SELECT last_synced_block::text FROM rindexer_internal.events", &[])
@@ -454,4 +459,29 @@ async fn postgres_column_identity_schema_sync_refuses_to_drop_legacy_data() {
     let error = result.expect_err("schema sync must not offer add/drop as a column rename");
     assert!(error.contains("value16") && error.contains("value_16"), "{error}");
     assert_eq!(remaining, 65535);
+}
+
+#[tokio::test]
+async fn postgres_column_identity_native_schema_sync_preserves_legacy_data() {
+    let fixture = TestDatabase::new().await;
+    fixture.postgres.batch_execute("CREATE SCHEMA integers_evm_traces; CREATE TABLE integers_evm_traces.balances (value16 INTEGER); INSERT INTO integers_evm_traces.balances VALUES (65535)").await.unwrap();
+    let mut manifest: Manifest=serde_json::from_value(json!({"name":"integers","project_type":"no-code","networks":[],"contracts":[],
+        "native_transfers":{"enabled":false,"tables":[{"name":"balances","global":true,
+            "columns":[{"name":"value16","type":"uint16","default":"0"}],
+            "events":[{"event":"NativeTransfer","operations":[{"type":"upsert","set":[{"column":"value16","action":"add","value":"$value"}]}]}]}]}})).unwrap();
+    let inactive = detect_schema_changes(&fixture.postgres, &manifest).await;
+    manifest.native_transfers.enabled = true;
+    let active = detect_schema_changes(&fixture.postgres, &manifest).await;
+    let value: i32 = fixture
+        .postgres
+        .query_one("SELECT value16 FROM integers_evm_traces.balances", &[])
+        .await
+        .unwrap()
+        .get(0);
+    fixture.finish().await;
+    assert!(inactive.unwrap().is_empty(), "disabled native tables must not be synced");
+    let error =
+        active.expect_err("native-only EvmTraces tables need the same legacy migration guard");
+    assert!(error.contains("value16") && error.contains("value_16"), "{error}");
+    assert_eq!(value, 65535);
 }

@@ -34,6 +34,43 @@ apply to its storage and configuration:
 These notes retain their existing URLs. Their place in this section identifies
 them as maintained fork documentation.
 
+## Column names in custom tables
+
+Write event fields and custom-table columns by their **logical** names in the
+manifest. For example, `where: { key16: "$key16" }` reads the ABI field
+`key16` and writes the custom column declared as `key16`. Both SQL tables
+use `key_16`. With `where: { holder: "$owner" }`, the stored columns are
+`holder` and `owner`: the mapping, not matching spellings, joins the two.
+Use `@key16` for the custom column in a table guard. In PostgreSQL, a mixed
+UPSERT guard such as `$sourceAmount > @totalAmount` reads the incoming value
+from the event, even when no destination column stores it. Each event is
+admitted against the current stored row before the next one is applied. Use
+scalar operands for SQL UPSERT guards; nested operand access is rejected.
+Decoded event paths,
+tuple-array JSON keys, iterator aliases and quoted literals keep their spelling.
+
+PostgreSQL and ClickHouse apply one destination projection to DDL, keys, writes
+and schema comparison. Custom column names must resolve to distinct ASCII SQL
+identifiers of at most 63 bytes. Generated metadata, PostgreSQL system columns
+and internal guard-input names are reserved. Raw ABI columns use the
+[raw naming rules](/docs/migrations/raw-event-column-names); ambiguous stored
+paths are rejected before indexing.
+
+**Upgrade:** a fresh database gets the new names. If a populated custom table
+uses the old literal spelling, stop writers and review the rename before
+restarting. Schema sync refuses to treat a recognized legacy column as an
+add/drop migration. Where recovery records contain old column names or row-key
+fields, a column rename alone is insufficient: migrate those records coherently
+or rebuild derived state, journals, receipts and cursors together from canonical
+history.
+
+Rust callers preparing runtime tables now use
+`TableRuntime::try_new(&declaration, indexer, contract)?`; cron scheduler
+construction is also fallible (`CronScheduler::try_new`). Lower-level SQL
+writers take a `ResolvedTable`, which cannot be passed back as a logical
+declaration. To inspect a declared destination's physical
+name, call `resolved.storage_column("key16")`.
+
 ## Typed arithmetic inputs and recovery keys
 
 Mutable custom-table arithmetic resolves every explicitly configured key and
@@ -106,17 +143,24 @@ from canonical history with its [replay metadata](/docs/migrations/postgres-even
 before retrying. Rows excluded by the operation's event predicate do not need
 the unused operands.
 
-Handwritten Rust recovery callers must provide both source and destination
-column types, including every `where` key, using
-`DerivedTableRollbackPlan::try_add_operation`, then call
-`ReorgTask::execute_with_rollback_plan`. This applies to unconditional
-arithmetic and counters too. Use actual ABI types and destination declarations;
-SQL storage types alone cannot distinguish, for example, signed and unsigned
-256-bit values. Runtime-generated plans supply this metadata automatically.
-`ReorgTask::execute` remains usable for raw, insert-only and journal-only
-recovery, which do not reconstruct arithmetic conversions from raw inputs.
-Incomplete arithmetic plans fail before changing raw rows, derived rows,
-receipts, journals or cursors.
+For handwritten Rust recovery, give the planner the original ABI event and table
+declaration. It supplies the source and destination types, stored columns and
+operation indexes used by rollback:
+
+```rust
+let mut tables = Vec::new();
+let mut plan = DerivedTableRollbackPlan::default();
+plan.try_add_table_event(&mut tables, "Indexer", "Contract", &event, &table)?;
+// Install tables as task.derived_tables; pass &plan to execute_with_rollback_plan.
+```
+
+For a table with multiple event mappings, call `try_add_table_events` once
+with all contributing ABI events. The planner can then infer types across the
+whole table and rejects incomplete or conflicting declarations before adding
+anything to the plan. `try_add_operation` remains a low-level entry point for callers that
+already own a fully specified storage plan. Untyped `ReorgTask::execute` still
+supports raw, insert-only and journal-only recovery. Incomplete arithmetic plans
+fail before changing durable state.
 
 ## Typed predicate admission for arithmetic recovery
 
@@ -137,12 +181,9 @@ admission. This restriction applies to variable-to-variable comparisons too,
 even when the predicate contains no literals.
 
 Every referenced event input must have a known scalar source type. Arrays must
-select a supported scalar leaf. Public callers of conditional arithmetic rollback
-tasks must populate `DerivedTableRollbackPlan::try_add_operation` with the source
-types and call `execute_with_rollback_plan`; arithmetic also requires destination
-types for all keys and numeric columns, even for unconditional operations.
-Direct tuple-array component types use dotted declaration paths such as
-`items.amount`, without array indexes.
+select a supported scalar leaf. Declaration-based plans obtain these types from
+the ABI, including tuple-array members. Use `execute_with_rollback_plan` for
+both conditional and unconditional arithmetic.
 
 Execution applies the same checks to legacy plans before committing changes to
 raw rows, effects, receipts or cursors. A refusal leaves recovery unfinished; it
@@ -508,7 +549,7 @@ Each `tables[].events[].event` name must appear at most once within its table.
 This applies to contract tables and enabled `native_transfers.tables`, whether
 reorg handling is enabled or disabled. Manifest loading, forward table preparation
 and recovery-plan construction reject duplicates, including tables constructed
-directly by Rust callers. `TableRuntime::new` retains its existing signature.
+directly by Rust callers. Use `TableRuntime::try_new` to prepare a logical table declaration.
 
 Combine all intended operations under one event mapping when they share the same
 `iterate` scope. Mappings with different iteration scopes cannot be merged

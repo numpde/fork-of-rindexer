@@ -79,6 +79,7 @@ async fn rollback(fixture: &Fixture, action: SetAction, cross_chain: bool) {
             vec![DerivedColumnJournal::try_new("amount".into(), action, {
                 let mut keys = fixture.params.tables[0]
                     .table
+                    .definition()
                     .primary_key_columns()
                     .into_iter()
                     .map(String::from)

@@ -19,9 +19,9 @@ use crate::{
 async fn postgres_reorg_replaces_cached_view_state_without_restart() {
     let mut fixture = Fixture::new().await;
     let rpc = HistoricalRpc::start().await;
-    let mut tables = fixture.params.tables.as_ref().clone();
-    tables[0].table.events[0].operations[0].set[0].value = Some(CALL.to_string());
-    fixture.params.tables = Arc::new(tables);
+    fixture.params.tables = fixture.runtime_tables_with(|table| {
+        table.events[0].operations[0].set[0].value = Some(CALL.to_string())
+    });
     fixture.params.providers = Arc::new(
         [(
             "ethereum".to_string(),
@@ -135,30 +135,32 @@ async fn required_call_failure_is_atomic(partial: bool) {
     let mut fixture = Fixture::new().await;
     let rpc = HistoricalRpc::start().await;
     rpc.reject_hash_calls(true);
-    let mut tables = fixture.params.tables.as_ref().clone();
-    tables[0].table.events[0].operations[0].set[0].value = Some(format!(
-        "$call($rindexer_contract_address, \"required{}()\")",
-        if partial { "Partial" } else { "Only" }
-    ));
     if partial {
         fixture
             .client
             .batch_execute(&format!(
                 "ALTER TABLE {} ADD COLUMN source NUMERIC DEFAULT 0",
-                tables[0].full_table_name
+                fixture.params.tables[0].full_table_name
             ))
             .await
             .unwrap();
-        tables[0].table.columns.push(
-            serde_json::from_value(json!({"name":"source","type":"uint256","default":"0"}))
-                .unwrap(),
-        );
-        tables[0].table.events[0].operations[0].set.push(
-            serde_json::from_value(json!({"column":"source","action":"set","value":"$value"}))
-                .unwrap(),
-        );
     }
-    fixture.params.tables = Arc::new(tables);
+    fixture.params.tables = fixture.runtime_tables_with(|table| {
+        table.events[0].operations[0].set[0].value = Some(format!(
+            "$call($rindexer_contract_address, \"required{}()\")",
+            if partial { "Partial" } else { "Only" }
+        ));
+        if partial {
+            table.columns.push(
+                serde_json::from_value(json!({"name":"source","type":"uint256","default":"0"}))
+                    .unwrap(),
+            );
+            table.events[0].operations[0].set.push(
+                serde_json::from_value(json!({"column":"source","action":"set","value":"$value"}))
+                    .unwrap(),
+            );
+        }
+    });
     fixture.params.providers = Arc::new(
         [(
             "ethereum".to_string(),
