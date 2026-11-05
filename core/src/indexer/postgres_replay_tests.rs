@@ -1719,3 +1719,6 @@ mod predicate_recovery_tests;
 
 #[path = "operand_recovery_tests.rs"]
 mod operand_recovery_tests;
+
+#[path = "prepared_schema_tests.rs"]
+mod prepared_schema_tests;
