@@ -2002,19 +2002,22 @@ impl ReorgTask {
         let providers = provider
             .map(|provider| HashMap::from([(self.network.clone(), provider.clone())]))
             .unwrap_or_default();
-        self.execute_with_deliveries(window, postgres, clickhouse, &providers, rollback_plan, &[])
-            .await
+        let ctx =
+            super::ReorgContext { postgres, clickhouse, registry: None, trace_registry: None };
+        self.execute_with_deliveries(window, &ctx, &providers, rollback_plan, &[], &[]).await
     }
 
     pub(super) async fn execute_with_deliveries(
         &self,
         window: &mut BlockChainWindow,
-        postgres: Option<&PostgresClient>,
-        clickhouse: Option<&Arc<ClickhouseClient>>,
+        ctx: &super::ReorgContext<'_>,
         providers: &HashMap<String, Arc<dyn ChainProvider>>,
         rollback_plan: &DerivedTableRollbackPlan,
         deliveries: &[Arc<Option<crate::streams::StreamsClients>>],
+        checkpoint_only: &[String],
     ) -> anyhow::Result<ReorgTaskResult> {
+        let postgres = ctx.postgres;
+        let clickhouse = ctx.clickhouse;
         anyhow::ensure!(
             postgres.is_some()
                 || !deliveries
@@ -2124,6 +2127,7 @@ impl ReorgTask {
                     .event_tables
                     .iter()
                     .map(|t| t.checkpoint_table.as_str())
+                    .chain(checkpoint_only.iter().map(String::as_str))
                     .collect::<Vec<_>>();
                 let (deleted, tx_hashes) = PostgresClient::reorg_rollback_in_transaction(
                     pg,
@@ -2150,6 +2154,7 @@ impl ReorgTask {
                     .event_tables
                     .iter()
                     .map(|t| t.checkpoint_table.clone())
+                    .chain(checkpoint_only.iter().cloned())
                     .collect::<Vec<_>>();
                 let (ch_deleted, ch_tx_hashes) = ch
                     .reorg_rollback(

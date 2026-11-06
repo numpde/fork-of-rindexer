@@ -81,6 +81,7 @@
 
 ### Bug fixes
 -------------------------------------------------
+- fix: reorg recovery rewinds PostgreSQL subscription checkpoints even when the event has no raw table; a missing required raw table still stops recovery without changing data or progress.
 - fix: `dependency_events` live indexing now validates RPC log identities against the observed canonical head, including connected header proofs for older logs. Inconsistent responses retry without callbacks or cursor advancement; batches containing removed logs invoke configured network recovery and are refetched in full. Providers must serve consistent headers, and previously committed orphaned or skipped history still needs reviewed recovery or rebuilding.
 - fix: independent `contracts.details` subscriptions now retain separate filters and cursors during `dependency_events` live indexing, including distinct addresses, indexed filters and starting coverage. Restart continues each subscription from its own checkpoint; previously skipped history behind an advanced cursor still requires a reviewed rebuild with coordinated receipts and derived state.
 - fix: RabbitMQ publishers now wait for a positive broker confirmation before reporting success. Broker rejection or a lost connection before confirmation triggers retries; required delivery retains its PostgreSQL outbox obligation until confirmation, preserving the original message ID.

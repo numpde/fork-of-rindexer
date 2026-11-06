@@ -13,19 +13,17 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::database::clickhouse::client::{ClickhouseClient, ClickhouseConnectionError};
-use crate::database::generate::{
-    generate_event_table_full_name, generate_indexer_contract_schema_name,
-};
-use crate::database::postgres::generate::generate_internal_event_table_name;
+#[cfg(test)]
+use crate::database::generate::generate_event_table_full_name;
 use crate::event::config::{ContractEventProcessingConfig, FactoryEventProcessingConfig};
-use crate::helpers::{camel_to_snake, format_duration};
+use crate::helpers::format_duration;
 use crate::indexer::native_transfer::native_transfer_block_processor;
 use crate::indexer::reorg::task::RollbackEventSource;
 use crate::indexer::reorg::{
     reorg_safe_distance_for_chain, DerivedTableInfo, DerivedTableRollbackPlan, EventTableInfo,
     ReorgBlockHashPersistence, ReorgContext, ReorgCoordinator,
 };
-use crate::indexer::schema::PreparedSchema;
+use crate::indexer::schema::{PreparedEvent, PreparedSchema};
 use crate::indexer::Indexer;
 use crate::manifest::network::ReorgHandlingConfig;
 use crate::{
@@ -452,21 +450,50 @@ fn collect_streams_clients_for_network(
     out
 }
 
-fn event_rollback_source(
-    schema: &PreparedSchema,
+fn prepared_recovery_event<'a>(
+    schema: &'a PreparedSchema,
     contract_name: &str,
     event_name: &str,
-) -> anyhow::Result<RollbackEventSource> {
+) -> anyhow::Result<&'a PreparedEvent> {
     let contract = schema.contract(contract_name).map_err(anyhow::Error::msg)?;
-    let event =
-        contract.events.iter().find(|event| event.info.name == event_name).ok_or_else(|| {
-            anyhow::anyhow!(
-                "event '{}::{}' not found in prepared schema",
-                contract_name,
-                event_name
-            )
-        })?;
-    Ok(event.source.clone())
+    contract.events.iter().find(|event| event.info.name == event_name).ok_or_else(|| {
+        anyhow::anyhow!("event '{}::{}' not found in prepared schema", contract_name, event_name)
+    })
+}
+
+/// A source without raw history still owns a durable checkpoint on this network.
+#[derive(Default)]
+struct RecoveryTargets {
+    raw_tables: Vec<EventTableInfo>,
+    checkpoint_only: Vec<String>,
+}
+
+impl RecoveryTargets {
+    fn register(
+        &mut self,
+        source: &PreparedEvent,
+        indexer: &str,
+        contract: &str,
+    ) -> anyhow::Result<()> {
+        let checkpoint = source.checkpoint_table.clone();
+        if let Some(raw) = &source.raw_table {
+            let (schema, table) = raw
+                .split_once('.')
+                .ok_or_else(|| anyhow::anyhow!("Prepared raw table {raw:?} has no schema"))?;
+            self.raw_tables.push(EventTableInfo::try_new(
+                schema.into(),
+                table.into(),
+                checkpoint,
+                indexer.into(),
+                contract.into(),
+                source.info.name.clone(),
+            )?);
+        } else {
+            super::reorg::validate_sql_identifier(&checkpoint, "checkpoint table name")?;
+            self.checkpoint_only.push(checkpoint);
+        }
+        Ok(())
+    }
 }
 
 /// Build derived-table rollback + journal entries for an event's tables and merge
@@ -474,10 +501,31 @@ fn event_rollback_source(
 /// trace events so both sources contribute to reorg rollback.
 // Keep the two output maps explicit instead of wrapping them in a behaviorless type.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(super) fn build_derived_tables_for_event(
     event_name: &str,
     indexer_name: &str,
     contract_name: &str,
+    network: &str,
+    source_column_types: &RollbackEventSource,
+    tables: &[crate::indexer::tables::TableRuntime],
+    derived_tables: &mut HashMap<String, Vec<DerivedTableInfo>>,
+    rollback_plans: &mut HashMap<String, DerivedTableRollbackPlan>,
+) -> anyhow::Result<()> {
+    build_resolved_derived_tables_for_event(
+        event_name,
+        &generate_event_table_full_name(indexer_name, contract_name, event_name),
+        network,
+        source_column_types,
+        tables,
+        derived_tables,
+        rollback_plans,
+    )
+}
+
+fn build_resolved_derived_tables_for_event(
+    event_name: &str,
+    event_table_full: &str,
     network: &str,
     source_column_types: &RollbackEventSource,
     tables: &[crate::indexer::tables::TableRuntime],
@@ -489,14 +537,12 @@ pub(super) fn build_derived_tables_for_event(
         runtime.table.definition().validate_event_mappings().map_err(anyhow::Error::msg)?;
     }
 
-    let event_table_full = generate_event_table_full_name(indexer_name, contract_name, event_name);
-
     for tr in tables.iter() {
         let derived = derived_tables.entry(network.to_string()).or_default();
         rollback_plans.entry(network.to_string()).or_default().add_resolved_table_event(
             derived,
             event_name,
-            &event_table_full,
+            event_table_full,
             source_column_types,
             tr,
         )?;
@@ -665,15 +711,10 @@ pub(super) async fn start_indexing_contract_events_prepared(
         .collect();
 
     // Build per-network event tables and derived tables for reorg rollback.
-    let mut network_event_tables: HashMap<String, Vec<EventTableInfo>> = HashMap::new();
+    let mut network_targets: HashMap<String, RecoveryTargets> = HashMap::new();
     let mut network_derived_tables: HashMap<String, Vec<DerivedTableInfo>> = HashMap::new();
     let mut network_rollback_plans: HashMap<String, DerivedTableRollbackPlan> = HashMap::new();
     for event in registry.events.iter() {
-        let source_column_types = if event.tables.is_empty() {
-            RollbackEventSource::default()
-        } else {
-            event_rollback_source(schema, &event.contract.name, &event.event_name)?
-        };
         // Query details share raw history and derived effects. Register rollback
         // once per source event/network, while rewinding every subscription cursor.
         let mut registered_networks = std::collections::HashSet::new();
@@ -684,31 +725,23 @@ pub(super) async fn start_indexing_contract_events_prepared(
             if !registered_networks.insert(&network_contract.network) {
                 continue;
             }
-            let schema =
-                generate_indexer_contract_schema_name(&event.indexer_name, &event.contract.name);
-            let table_name = camel_to_snake(&event.event_name);
-            let checkpoint_table = generate_internal_event_table_name(&schema, &event.event_name);
-            network_event_tables.entry(network_contract.network.clone()).or_default().push(
-                EventTableInfo::try_new(
-                    schema,
-                    table_name,
-                    checkpoint_table,
-                    event.indexer_name.clone(),
-                    event.contract.name.clone(),
-                    event.event_name.clone(),
-                )?,
-            );
-
-            build_derived_tables_for_event(
-                &event.event_name,
+            let source = prepared_recovery_event(schema, &event.contract.name, &event.event_name)?;
+            network_targets.entry(network_contract.network.clone()).or_default().register(
+                source,
                 &event.indexer_name,
                 &event.contract.name,
-                &network_contract.network,
-                &source_column_types,
-                &event.tables,
-                &mut network_derived_tables,
-                &mut network_rollback_plans,
             )?;
+            if let Some(raw_table) = &source.raw_table {
+                build_resolved_derived_tables_for_event(
+                    &event.event_name,
+                    raw_table,
+                    &network_contract.network,
+                    &source.source,
+                    &event.tables,
+                    &mut network_derived_tables,
+                    &mut network_rollback_plans,
+                )?;
+            }
         }
     }
 
@@ -720,48 +753,42 @@ pub(super) async fn start_indexing_contract_events_prepared(
                 if !reorg_configs.contains_key(&nt_detail.network) {
                     continue;
                 }
-                let schema = generate_indexer_contract_schema_name(
+                let source = prepared_recovery_event(
+                    schema,
+                    NATIVE_TRANSFER_CONTRACT_NAME,
+                    "NativeTransfer",
+                )?;
+                network_targets.entry(nt_detail.network.clone()).or_default().register(
+                    source,
                     &manifest.name,
                     NATIVE_TRANSFER_CONTRACT_NAME,
-                );
-                let table_name = camel_to_snake("NativeTransfer");
-                let checkpoint_table =
-                    generate_internal_event_table_name(&schema, "NativeTransfer");
-                network_event_tables.entry(nt_detail.network.clone()).or_default().push(
-                    EventTableInfo::try_new(
-                        schema,
-                        table_name,
-                        checkpoint_table,
-                        manifest.name.clone(),
-                        NATIVE_TRANSFER_CONTRACT_NAME.to_string(),
-                        "NativeTransfer".to_string(),
-                    )?,
-                );
+                )?;
             }
         }
 
         // Mirror the contract-events pass for native-transfer derived tables: every
         // trace event contributes rollback ops for each configured network.
         for trace_event in trace_registry.events.iter() {
-            let source_column_types = if trace_event.tables.is_empty() {
-                RollbackEventSource::default()
-            } else {
-                event_rollback_source(schema, &trace_event.contract_name, &trace_event.event_name)?
-            };
             for network_detail in trace_event.trace_information.details.iter() {
                 if !reorg_configs.contains_key(&network_detail.network) {
                     continue;
                 }
-                build_derived_tables_for_event(
-                    &trace_event.event_name,
-                    &trace_event.indexer_name,
+                let source = prepared_recovery_event(
+                    schema,
                     &trace_event.contract_name,
-                    &network_detail.network,
-                    &source_column_types,
-                    &trace_event.tables,
-                    &mut network_derived_tables,
-                    &mut network_rollback_plans,
+                    &trace_event.event_name,
                 )?;
+                if let Some(raw_table) = &source.raw_table {
+                    build_resolved_derived_tables_for_event(
+                        &trace_event.event_name,
+                        raw_table,
+                        &network_detail.network,
+                        &source.source,
+                        &trace_event.tables,
+                        &mut network_derived_tables,
+                        &mut network_rollback_plans,
+                    )?;
+                }
             }
         }
     }
@@ -789,7 +816,7 @@ pub(super) async fn start_indexing_contract_events_prepared(
         let window_size = reorg_config
             .window_size
             .unwrap_or_else(|| 2 * reorg_safe_distance_for_chain(*chain_id) as usize);
-        let event_tables = network_event_tables.get(network_name).cloned().unwrap_or_default();
+        let targets = network_targets.remove(network_name).unwrap_or_default();
 
         let window = reorg_persistence.load(network_name, window_size).await
             .with_context(|| format!("Cannot start indexing network {network_name}: persisted reorg window could not be loaded"))
@@ -826,11 +853,12 @@ pub(super) async fn start_indexing_contract_events_prepared(
                 window,
                 Arc::clone(&reorg_persistence),
                 provider,
-                event_tables,
+                targets.raw_tables,
                 derived_tables,
                 streams_clients,
             )?
-            .with_rollback_plan(rollback_plan);
+            .with_rollback_plan(rollback_plan)
+            .with_checkpoint_only(targets.checkpoint_only);
 
             // Run startup validation
             if let Some(startup_task) = coordinator.validate_on_startup().await
@@ -1478,8 +1506,8 @@ mod tests {
         let (directory, manifest) = prepared_filter_fixture();
         let schema = PreparedSchema::try_new(directory.path(), &manifest.to_indexer()).unwrap();
         std::fs::remove_file(directory.path().join("event.json")).unwrap();
-        event_rollback_source(&schema, "FPMMFilter", "FPMMBuy").unwrap();
-        let error = event_rollback_source(&schema, "FPMMFilter", "Missing").unwrap_err();
+        prepared_recovery_event(&schema, "FPMMFilter", "FPMMBuy").unwrap();
+        let error = prepared_recovery_event(&schema, "FPMMFilter", "Missing").unwrap_err();
         assert!(error.to_string().contains("FPMMFilter::Missing"), "{error}");
     }
 
