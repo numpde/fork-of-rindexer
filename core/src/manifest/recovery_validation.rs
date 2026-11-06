@@ -245,3 +245,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "cron_recovery_tests.rs"]
+mod cron_recovery_tests;
