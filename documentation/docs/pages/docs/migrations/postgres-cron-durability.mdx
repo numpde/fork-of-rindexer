@@ -1,0 +1,94 @@
+# PostgreSQL historical-cron durability
+
+Bounded historical cron now writes its PostgreSQL custom-table effects and advances
+`last_synced_block` in one transaction. A checkpoint is valid only under the
+versioned protocol and the *same unchanged schedule*. The guarantee applies to
+committed PostgreSQL table effects, not RPC request counts, chain reorganizations,
+ClickHouse, downstream publications or live cron.
+
+## Supported deployment
+
+The initial durable profile admits **one PostgreSQL destination** with one
+historical cron entry, **one declared operation**, **one nonzero static address**,
+an explicit `start_block` and fixed inclusive `end_block`. It rejects mixed
+PostgreSQL/ClickHouse writes, factory contracts, static address arrays,
+duplicate contract `details` for one network, `cross_chain: true`, and
+destinations shared with any other declared custom-table writer (including
+event-driven and live-cron tables). It also rejects `timestamp: true` and
+synthetic historical timestamp/hash inputs. The physical destination is
+checked across all prepared declarations, including schema overrides.
+Use stop-before-start upgrades and keep the sampled history stable; reorg recovery
+for cron effects is not supported.
+
+The checkpoint's existing physical name still depends on the numeric position of
+the cron entry in the manifest. Until semantic schedule fingerprints are implemented,
+**freeze the entire admitted schedule and its destination** across restarts. In
+particular, do not change its start/end blocks, interval, address, operation,
+table keys, or cron-entry ordering and assume old progress is reusable.
+A changed schedule requires reviewed reconciliation or a rebuild.
+
+## Upgrade and recovery
+
+1. Stop *all* processes and services that can write the affected table, including
+   older rindexer images. Take a consistent PostgreSQL backup of the destination,
+   checkpoint table and other applicable state before making changes.
+2. Inspect the destination and its
+   `rindexer_internal.<generated_schema>_<table>_cron_<index>` checkpoint.
+   Historical checkpoints from older binaries were not committed atomically with
+   their effects. A positive number does not prove completeness; zero was also
+   used to mean “not started.” Neither value can be promoted automatically.
+3. **Preferred: rebuild.** In a controlled maintenance transaction or offline
+   migration, remove the *affected destination contents and checkpoint table
+   together*, preserving a backup. Run normal schema setup against the now-empty
+   destination to create the versioned checkpoint, initially
+   `last_synced_block = NULL` and `protocol_version = 1`. Replay from the
+   trusted declared start block, then verify rows and completed progress.
+   Do not truncate a destination shared with other writers or networks.
+4. **Alternative: reconcile.** Independently verify the complete ordered
+   historical operations against the stored rows and progress. Only a
+   schedule-specific reviewed migration may mark the progress as version 1.
+   There is no generic automatic conversion or “trust legacy checkpoint” flag.
+
+Version 1 distinguishes `NULL` (no sample committed) from `0` (block zero
+committed). A missing row is **not** `NULL`: setup and indexing refuse it. An
+existing checkpoint table is never automatically reseeded when a network row is
+missing, even if the destination currently appears empty. If the checkpoint
+table itself is missing, initialization is allowed only with an empty destination.
+With surviving effects, startup fails until the destination and checkpoint are
+restored or rebuilt consistently. **The converse also fails:** a missing
+destination with an existing historical-cron checkpoint is rejected *before*
+`CREATE TABLE IF NOT EXISTS` can recreate it. Even an empty destination may
+have legitimately completed earlier samples, so an empty table is not evidence
+that a non-NULL checkpoint can be trusted. A newly added network similarly
+requires an explicit initialization or migration; a redeploy does not silently
+add a row.
+
+Never fix a missing checkpoint by inserting `NULL` or changing
+`protocol_version` alone. An additive operation or append-only insert could
+then be applied twice. Conversely, advancing progress without effects skips
+required work. If a transaction's commit reply is lost, the scheduler rereads
+locked durable progress rather than trusting the client response.
+
+## Verification
+
+Run formatting, workspace Clippy and the PostgreSQL cron regressions. For
+rootless development, `make tests/cron-atomic/postgres` compiles the selected
+library tests before starting the external PostgreSQL fixture. Its container
+runner supplies `RINDEXER_TEST_POSTGRES_URL` without exposing the Docker socket. The tests
+also support native Testcontainers when that variable is unset. The external URL
+must point to the dedicated `rindexer_fixture_admin` database; each test creates
+and removes an isolated database.
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo nextest run -p rindexer --lib -E 'test(/cron_atomic_tests::/)'
+```
+
+The regression suite checks INSERT and arithmetic UPSERT behavior,
+checkpoint failure after staged effects, lost checkpoint or destination
+startup, completed block zero, legacy rejection, conflicting destination
+ownership, duplicate network details, concurrent attempts, and a
+real PostgreSQL COMMIT acknowledgement suppressed by the shared wire fault
+proxy. These checks do not replace production-image qualification with an
+actual manifest and database. No exactly-once claim is made for live cron.

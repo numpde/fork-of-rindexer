@@ -39,10 +39,43 @@ pub async fn setup_postgres_prepared(
     schema: &PreparedSchema,
 ) -> Result<PostgresClient, SetupPostgresError> {
     schema.validate_postgres_identities()?;
+    // Admission precedes even drop_each_run; DDL generation alone remains a
+    // pure SQL builder for the existing test-only factory sampling fixture.
+    crate::indexer::cron_scheduler::validate_postgres_cron_targets(
+        schema
+            .contracts()
+            .iter()
+            .chain(schema.native())
+            .map(|contract| (&contract.declaration, contract.tables.as_slice())),
+    )
+    .map_err(GenerateTablesForIndexerSqlError::InvalidPreparedSchema)?;
     info!("Setting up postgres");
 
-    let client = PostgresClient::new().await?;
     let disable_event_tables = manifest.storage.postgres_disable_create_tables();
+    // Admit the complete prepared schema before even an explicitly configured
+    // drop_each_run can delete existing storage.
+    let sql = generate_prepared_tables_sql(schema, disable_event_tables)?;
+    if manifest.storage.clickhouse_enabled()
+        && schema.contracts().iter().chain(schema.native()).any(|contract| {
+            contract.tables.iter().any(|runtime| {
+                runtime
+                    .table
+                    .definition()
+                    .cron
+                    .iter()
+                    .flatten()
+                    .any(|entry| entry.start_block.is_some())
+            })
+        })
+    {
+        return Err(GenerateTablesForIndexerSqlError::InvalidPreparedSchema(
+            "Historical PostgreSQL cron cannot write to mixed PostgreSQL/ClickHouse sinks"
+                .to_string(),
+        )
+        .into());
+    }
+
+    let client = PostgresClient::new().await?;
 
     if manifest.storage.postgres_drop_each_run() {
         info!(
@@ -59,8 +92,6 @@ pub async fn setup_postgres_prepared(
     } else {
         info!("Creating tables for {}", manifest.name);
     }
-
-    let sql = generate_prepared_tables_sql(schema, disable_event_tables)?;
 
     debug!("{}", sql);
     if let Err(e) = client.batch_execute(sql.as_str()).await {

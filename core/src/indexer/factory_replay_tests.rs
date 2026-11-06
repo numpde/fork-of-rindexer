@@ -233,13 +233,23 @@ async fn postgres_factory_cron_samples_the_child_from_its_birth_block() {
         DynSolValue::Tuple(vec![DynSolValue::Address(child)]).abi_encode_params().into(),
     );
     (discovery.callback)(vec![log]).await.unwrap();
-    let scheduler = CronScheduler::try_new_prepared(
+    // The durable PostgreSQL runtime deliberately rejects factory sampling
+    // until complete discovery coverage is established. Keep testing the
+    // preparation/discovery helper without admitting it as a durable job.
+    let providers =
+        Arc::new(HashMap::from([("ethereum".into(), provider as Arc<dyn ChainProvider>)]));
+    let rejected = CronScheduler::try_new_prepared(
         project.schema(),
         Some(fixture.client.clone()),
         None,
-        Arc::new(HashMap::from([("ethereum".into(), provider as Arc<dyn ChainProvider>)])),
+        providers.clone(),
     )
-    .unwrap();
+    .err()
+    .expect("unqualified factory cron must be rejected");
+    assert!(rejected.contains("factory discovery completeness"), "{rejected}");
+    let mut scheduler = CronScheduler::try_new_prepared(project.schema(), None, None, providers)
+        .expect("test-only factory preparation");
+    scheduler.postgres = Some(fixture.client.clone());
     let addresses = scheduler.sample_factory_for_test(&[1, 2]).await;
     let rows = fixture.client.query(
         "SELECT sampled, rindexer_contract_address, rindexer_block_number::text FROM factory_cron_child.samples", &[]

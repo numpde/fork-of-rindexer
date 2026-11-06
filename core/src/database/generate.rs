@@ -186,28 +186,75 @@ fn generate_internal_cron_table_sql(
             let internal_table_name =
                 generate_internal_cron_table_name(schema_name, &table.name, cron_index);
 
-            let create_table_query = format!(
-                r#"CREATE TABLE IF NOT EXISTS rindexer_internal.{internal_table_name} ("network" TEXT PRIMARY KEY, "last_synced_block" NUMERIC);"#
-            );
+            // Schema sync must never infer "never started" from a missing row
+            // in an existing checkpoint table. In particular, a crash or
+            // operator error may remove progress while destination effects survive.
+            let destination_schema = table.database.as_deref().unwrap_or(schema_name);
+            let destination = format!("{destination_schema}.{}", camel_to_snake(&table.name));
 
-            // Determine which networks this cron runs on
+            // Seed all declared networks only when the entire checkpoint table
+            // is first created. Adding a network later requires reconciliation.
             let cron_networks: Vec<&str> = if let Some(network) = &cron.network {
                 vec![network.as_str()]
             } else {
                 networks.clone()
             };
-
-            let insert_queries = cron_networks
+            let cron_networks =
+                cron_networks.into_iter().collect::<std::collections::BTreeSet<_>>();
+            let first_seeds = cron_networks
                 .iter()
                 .map(|network| {
+                    let network = network.replace('\'', "''");
                     format!(
-                        r#"INSERT INTO rindexer_internal.{internal_table_name} ("network", "last_synced_block") VALUES ('{network}', 0) ON CONFLICT ("network") DO NOTHING;"#
+                        "INSERT INTO rindexer_internal.{internal_table_name} \
+                         (network, last_synced_block, protocol_version) \
+                         VALUES ('{network}', NULL, 1);"
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let existing_checks = cron_networks
+                .iter()
+                .map(|network| {
+                    let network = network.replace('\'', "''");
+                    format!(
+                        "IF NOT EXISTS (SELECT 1 FROM rindexer_internal.{internal_table_name} \
+                         WHERE network = '{network}') THEN \
+                           RAISE EXCEPTION 'Cannot resume historical cron: missing checkpoint row \
+                           in rindexer_internal.{internal_table_name} for network %; \
+                           stop writers and reconcile destination rows with progress', '{network}'; \
+                         END IF;"
                     )
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
 
-            sql_statements.push(format!("{create_table_query}\n{insert_queries}"));
+            // The destination lock also serializes concurrent initializers
+            // before they check whether this checkpoint table already exists.
+            // Refuse a newly created checkpoint if destination data survived
+            // deletion of the old checkpoint table.
+            sql_statements.push(format!(
+                r#"DO $cron_checkpoint$
+                BEGIN
+                    LOCK TABLE {destination} IN SHARE ROW EXCLUSIVE MODE;
+                    IF to_regclass('rindexer_internal.{internal_table_name}') IS NULL THEN
+                        IF EXISTS (SELECT 1 FROM {destination}) THEN
+                            RAISE EXCEPTION 'Cannot initialize historical cron: destination {destination} contains rows without a durable checkpoint; stop writers and reconcile or rebuild';
+                        END IF;
+                        CREATE TABLE rindexer_internal.{internal_table_name} (
+                            network TEXT PRIMARY KEY,
+                            last_synced_block NUMERIC,
+                            protocol_version SMALLINT NOT NULL
+                        );
+                        {first_seeds}
+                    ELSE
+                        ALTER TABLE rindexer_internal.{internal_table_name}
+                            ADD COLUMN IF NOT EXISTS protocol_version SMALLINT;
+                        {existing_checks}
+                    END IF;
+                END
+                $cron_checkpoint$;"#
+            ));
         }
     }
 
@@ -269,6 +316,7 @@ fn generate_resolved_tables_sql(
         .iter()
         .map(|runtime| {
             let table = runtime.table.definition();
+            let contract_schema_name = schema_name;
             let schema_name = table.database.as_deref().unwrap_or(schema_name);
             if table.database.is_some() {
                 crate::indexer::reorg::validate_sql_identifier(schema_name, "custom table schema")
@@ -352,6 +400,35 @@ fn generate_resolved_tables_sql(
 
             columns.push(primary_key_constraint);
 
+            // A missing destination with surviving progress is data loss, not
+            // a new empty table. Check before CREATE TABLE IF NOT EXISTS can
+            // hide that loss. Do not require rows in the checkpoint table:
+            // even an unstarted schedule owns an initialized destination.
+            let destination = table_name.replace('\'', "''");
+            let cron_destination_checks = table
+                .cron
+                .iter()
+                .flatten()
+                .enumerate()
+                .filter(|(_, cron)| cron.start_block.is_some())
+                .map(|(index, _)| {
+                    let checkpoint = generate_internal_cron_table_name(
+                        contract_schema_name,
+                        &table.name,
+                        index,
+                    );
+                    format!(
+                        "DO $rindexer_cron_destination$
+                         BEGIN
+                             IF to_regclass('rindexer_internal.{checkpoint}') IS NOT NULL
+                                AND to_regclass('{destination}') IS NULL THEN
+                                 RAISE EXCEPTION 'Cannot resume historical cron: destination {destination} is missing while checkpoint {checkpoint} survives; restore or rebuild both together';
+                             END IF;
+                         END $rindexer_cron_destination$;"
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
             let create_table_sql =
                 format!("CREATE TABLE IF NOT EXISTS {} ({});", table_name, columns.join(", "));
 
@@ -380,7 +457,9 @@ fn generate_resolved_tables_sql(
             } else {
                 String::new()
             };
-            Ok(format!("{create_schema_sql}{create_table_sql}\n{source_network_check}\n{table_comment}"))
+            Ok(format!(
+                "{cron_destination_checks}\n{create_schema_sql}{create_table_sql}\n{source_network_check}\n{table_comment}"
+            ))
         })
         .collect::<Result<Vec<_>, GenerateTablesForIndexerSqlError>>()?
         .join("\n"))
