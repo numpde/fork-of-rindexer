@@ -1972,3 +1972,31 @@ mod column_name_tests {
         assert_eq!(task.cron_entry.operations[0].set[0].column, "total_32");
     }
 }
+
+/// Drive the production address lookup and exactly one historical batch, without
+/// the polling loop that would keep retrying a missing discovery table.
+#[cfg(test)]
+impl CronScheduler {
+    pub(super) async fn sample_factory_for_test(
+        &self,
+        blocks: &[u64],
+    ) -> Result<HashMap<Address, u64>, String> {
+        let [task] = self.tasks.as_slice() else { return Err("expected one cron task".into()) };
+        let context = CronContext { indexer_name: self.indexer_name.clone() };
+        let addresses =
+            get_factory_addresses_with_blocks(task, &self.postgres, &self.clickhouse, &context)
+                .await
+                .map_err(|error| error.to_string())?;
+        execute_cron_operations_batch(
+            task,
+            self.postgres.clone(),
+            self.clickhouse.clone(),
+            self.providers.clone(),
+            blocks,
+            &addresses,
+            Arc::new(AdaptiveRateLimiter::new()),
+        )
+        .await?;
+        Ok(addresses)
+    }
+}
