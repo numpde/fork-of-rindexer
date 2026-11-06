@@ -558,3 +558,7 @@ pub async fn start_rindexer_no_code_prepared(
         .await
         .map_err(StartRindexerNoCode::StartRindexerError)
 }
+
+#[cfg(test)]
+#[path = "start_cron_failure_tests.rs"]
+mod start_cron_failure_tests;

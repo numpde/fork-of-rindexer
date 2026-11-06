@@ -1989,3 +1989,7 @@ impl CronScheduler {
         Ok(addresses)
     }
 }
+
+#[cfg(test)]
+#[path = "cron_historical_failure_tests.rs"]
+mod cron_historical_failure_tests;
