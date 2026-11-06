@@ -50,23 +50,79 @@ fn register<'a>(
     Ok(())
 }
 
-fn register_prepared_contract<'a>(
-    targets: &mut BTreeMap<String, Vec<Declaration<'a>>>,
-    prepared: &'a PreparedContract,
-    owner: &'a str,
-    recovery_enabled: bool,
-) -> Result<(), ValidateManifestError> {
-    // Preparation retains these in declaration order. Keep the logical table for
-    // diagnostics and operation validation, and the writer's exact destination.
-    for (table, runtime) in prepared.declaration.tables.iter().flatten().zip(prepared.tables.iter())
-    {
-        register(
-            targets,
-            runtime.full_table_name.clone(),
-            Declaration { owner, table, recovery_enabled },
-        )?;
+fn prepared_tables(prepared: &PreparedContract) -> impl Iterator<Item = (&Table, String)> {
+    // Keep the logical columns for validation/diagnostics and the writer's resolved destination.
+    prepared
+        .declaration
+        .tables
+        .iter()
+        .flatten()
+        .zip(prepared.tables.iter())
+        .map(|(table, runtime)| (table, runtime.full_table_name.clone()))
+}
+
+fn declared_tables<'a>(
+    indexer: &'a str,
+    contract: &'a str,
+    tables: &'a Option<Vec<Table>>,
+) -> impl Iterator<Item = (&'a Table, String)> {
+    tables.iter().flatten().map(move |table| {
+        (table, generate_table_full_name(indexer, contract, &table.name, table.database.as_deref()))
+    })
+}
+
+struct RecoveryScope<'a> {
+    postgres: bool,
+    recovered: HashSet<&'a str>,
+}
+
+impl RecoveryScope<'_> {
+    fn register_tables<'a>(
+        &self,
+        targets: &mut BTreeMap<String, Vec<Declaration<'a>>>,
+        owner: &'a str,
+        networks: &[&str],
+        tables: impl Iterator<Item = (&'a Table, String)>,
+    ) -> Result<(), ValidateManifestError> {
+        let recovered = networks.iter().copied().find(|network| self.recovered.contains(network));
+        for (table, target) in tables {
+            if self.postgres {
+                for (index, cron) in table.cron.iter().flatten().enumerate() {
+                    if cron.operations.is_empty() {
+                        continue;
+                    }
+                    let cron_networks = match cron.network.as_deref() {
+                        Some(network) => vec![network],
+                        None => networks.to_vec(),
+                    };
+                    for network in cron_networks {
+                        let reason = if self.recovered.contains(network) {
+                            format!("its network {network:?} has reorg recovery enabled")
+                        } else if let Some(other) =
+                            recovered.filter(|_| table.cross_chain && !table.events.is_empty())
+                        {
+                            format!("its network {network:?} shares cross_chain rows with recovered event writes on {other:?}")
+                        } else {
+                            continue;
+                        };
+                        return Err(ValidateManifestError::CustomIndexingValidationError(
+                            format!(
+                                "Table {owner}.{} cron[{index}] writes to PostgreSQL table {target:?}, but {reason}. Recovery cannot undo scheduled writes. Remove this cron writer or keep its rows on a network without reorg recovery.",
+                                table.name
+                            ),
+                            owner.to_owned(),
+                        ));
+                    }
+                }
+            }
+            register(
+                targets,
+                target,
+                Declaration { owner, table, recovery_enabled: recovered.is_some() },
+            )?;
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 /// Validate all recovery restrictions once the runtime-expanded destinations are known.
@@ -77,78 +133,66 @@ pub(super) fn validate(
     contracts: &[Contract],
     schema: Option<&PreparedSchema>,
 ) -> Result<(), ValidateManifestError> {
-    let recovered_networks = manifest
-        .networks
-        .iter()
-        .filter(|network| network.reorg_handling.as_ref().is_some_and(|config| config.enabled))
-        .map(|network| network.name.as_str())
-        .collect::<HashSet<_>>();
-    if recovered_networks.is_empty() {
+    let scope = RecoveryScope {
+        postgres: manifest.storage.postgres_enabled(),
+        recovered: manifest
+            .networks
+            .iter()
+            .filter(|network| network.reorg_handling.as_ref().is_some_and(|config| config.enabled))
+            .map(|network| network.name.as_str())
+            .collect(),
+    };
+    if scope.recovered.is_empty() {
         return Ok(());
     }
+
+    let native_networks = || {
+        manifest.native_transfers.networks.as_ref().map_or_else(
+            || manifest.networks.iter().map(|n| n.name.as_str()).collect::<Vec<_>>(),
+            |details| details.iter().map(|d| d.network.as_str()).collect(),
+        )
+    };
     let mut targets = BTreeMap::new();
     if let Some(schema) = schema {
         for prepared in schema.contracts() {
             let contract = &prepared.declaration;
-            let recovery_enabled = contract
-                .details
-                .iter()
-                .any(|detail| recovered_networks.contains(detail.network.as_str()));
-            register_prepared_contract(&mut targets, prepared, &contract.name, recovery_enabled)?;
+            let networks: Vec<_> = contract.details.iter().map(|d| d.network.as_str()).collect();
+            scope.register_tables(
+                &mut targets,
+                &contract.name,
+                &networks,
+                prepared_tables(prepared),
+            )?;
         }
         if let Some(native) = schema.native() {
-            let recovery_enabled = manifest.native_transfers.networks.as_ref().map_or(
-                !recovered_networks.is_empty(),
-                |networks| {
-                    networks
-                        .iter()
-                        .any(|network| recovered_networks.contains(network.network.as_str()))
-                },
-            );
-            register_prepared_contract(&mut targets, native, "native_transfers", recovery_enabled)?;
+            scope.register_tables(
+                &mut targets,
+                "native_transfers",
+                &native_networks(),
+                prepared_tables(native),
+            )?;
         }
     } else {
         for contract in contracts {
-            let recovery_enabled = contract
-                .details
-                .iter()
-                .any(|detail| recovered_networks.contains(detail.network.as_str()));
-            for table in contract.tables.iter().flatten() {
-                let target = generate_table_full_name(
-                    &manifest.name,
-                    &contract.name,
-                    &table.name,
-                    table.database.as_deref(),
-                );
-                register(
-                    &mut targets,
-                    target,
-                    Declaration { owner: &contract.name, table, recovery_enabled },
-                )?;
-            }
+            let networks: Vec<_> = contract.details.iter().map(|d| d.network.as_str()).collect();
+            scope.register_tables(
+                &mut targets,
+                &contract.name,
+                &networks,
+                declared_tables(&manifest.name, &contract.name, &contract.tables),
+            )?;
         }
         if manifest.native_transfers.enabled {
-            let recovery_enabled = manifest.native_transfers.networks.as_ref().map_or(
-                !recovered_networks.is_empty(),
-                |networks| {
-                    networks
-                        .iter()
-                        .any(|network| recovered_networks.contains(network.network.as_str()))
-                },
-            );
-            for table in manifest.native_transfers.tables.iter().flatten() {
-                let target = generate_table_full_name(
+            scope.register_tables(
+                &mut targets,
+                "native_transfers",
+                &native_networks(),
+                declared_tables(
                     &manifest.name,
                     NATIVE_TRANSFER_CONTRACT_NAME,
-                    &table.name,
-                    table.database.as_deref(),
-                );
-                register(
-                    &mut targets,
-                    target,
-                    Declaration { owner: "native_transfers", table, recovery_enabled },
-                )?;
-            }
+                    &manifest.native_transfers.tables,
+                ),
+            )?;
         }
     }
     for (target, declarations) in targets {
