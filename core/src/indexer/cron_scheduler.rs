@@ -2071,3 +2071,7 @@ impl CronScheduler {
 #[cfg(test)]
 #[path = "cron_historical_failure_tests.rs"]
 mod cron_historical_failure_tests;
+
+#[cfg(test)]
+#[path = "cron_atomic_tests.rs"]
+mod cron_atomic_tests;

@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod postgres_test_wire;
 mod process;
 mod progress;
 
