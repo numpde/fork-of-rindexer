@@ -471,22 +471,26 @@ impl CronScheduler {
         let clickhouse = self.clickhouse;
         let providers = self.providers;
 
-        let mut handles = Vec::new();
+        // A detached worker can fail while another keeps running forever.
+        // JoinSet aborts the other workers when a terminal error is returned.
+        let mut workers = tokio::task::JoinSet::new();
 
         for task in self.tasks {
             let postgres = postgres.clone();
             let clickhouse = clickhouse.clone();
             let providers = providers.clone();
-
-            let handle = tokio::spawn(async move {
-                run_cron_task(task, postgres, clickhouse, providers).await;
-            });
-
-            handles.push(handle);
+            workers.spawn(run_cron_task(task, postgres, clickhouse, providers));
         }
 
-        // Wait for all tasks (they run until shutdown)
-        futures::future::join_all(handles).await;
+        while let Some(joined) = workers.join_next().await {
+            let outcome = joined.map_err(|error| {
+                std::io::Error::other(format!("Cron worker failed to join: {error}"))
+            })?;
+            if let Err(error) = outcome {
+                workers.abort_all();
+                return Err(Box::new(std::io::Error::other(error)));
+            }
+        }
 
         info!("Cron scheduler stopped");
         Ok(())
@@ -639,7 +643,7 @@ async fn run_cron_task(
     postgres: Option<Arc<PostgresClient>>,
     clickhouse: Option<Arc<ClickhouseClient>>,
     providers: Arc<HashMap<String, Arc<dyn ChainProvider>>>,
-) {
+) -> Result<(), String> {
     let is_factory = task.factory_config.is_some();
 
     info!(
@@ -657,19 +661,21 @@ async fn run_cron_task(
             let start_block = start_block_value.to::<u64>();
             if let Err(e) = wait_for_factory_sync(&task, &postgres, &clickhouse, start_block).await
             {
-                error!(
-                    "Failed waiting for factory sync for table '{}' on network '{}': {}",
+                if !is_running() {
+                    return Ok(());
+                }
+                return Err(format!(
+                    "Factory sync for historical cron {}.{} on network {:?} failed: {e}",
+                    task.contract_name,
                     task.table.name(),
                     task.network,
-                    e
-                );
-                return;
+                ));
             }
         }
 
         let historical_completed =
             run_historical_sync(&task, postgres.clone(), clickhouse.clone(), providers.clone())
-                .await;
+                .await?;
 
         if !historical_completed {
             debug!(
@@ -677,7 +683,7 @@ async fn run_cron_task(
                 task.table.name(),
                 task.network
             );
-            return;
+            return Ok(());
         }
 
         // If end_block was specified, stop here (no live cron)
@@ -686,7 +692,7 @@ async fn run_cron_task(
                 "Historical cron sync completed for table '{}' on network '{}' - end_block reached, stopping",
                 task.table.name(), task.network
             );
-            return;
+            return Ok(());
         }
 
         info!(
@@ -697,20 +703,30 @@ async fn run_cron_task(
 
     // Live cron mode
     run_live_cron_loop(&task, postgres, clickhouse, providers).await;
+    Ok(())
 }
 
 /// Run historical sync for a cron task using batched operations.
 ///
 /// This batches multiple blocks together for efficient RPC calls via multicall3
-/// and batched database writes. Returns true if completed successfully, false if interrupted.
+/// and batched database writes. Returns Ok(false) on shutdown; a missing
+/// required sample is an error, never a successful live-mode handoff.
 async fn run_historical_sync(
     task: &CronTask,
     postgres: Option<Arc<PostgresClient>>,
     clickhouse: Option<Arc<ClickhouseClient>>,
     providers: Arc<HashMap<String, Arc<dyn ChainProvider>>>,
-) -> bool {
+) -> Result<bool, String> {
     let start_block = task.cron_entry.start_block.unwrap().to::<u64>();
     let block_interval = task.cron_entry.block_interval.map(|b| b.to::<u64>()).unwrap_or(1); // Default to every block
+    if block_interval == 0 {
+        return Err(format!(
+            "Historical cron {}.{} on {:?} has zero block_interval",
+            task.contract_name,
+            task.table.name(),
+            task.network,
+        ));
+    }
 
     // Get contract addresses (1 for static, N for factory)
     // Get addresses with their birth blocks (for factory contracts, only process blocks >= birth)
@@ -724,17 +740,22 @@ async fn run_historical_sync(
                     task.network,
                     e
                 );
-                return false;
+                return Err(format!(
+                    "Historical cron {}.{} on network {:?} cannot discover addresses: {e}",
+                    task.contract_name,
+                    task.table.name(),
+                    task.network,
+                ));
             }
         };
 
     if addresses_with_blocks.is_empty() {
-        warn!(
-            "No contract addresses for table '{}' on network '{}', skipping historical sync",
+        return Err(format!(
+            "Historical cron {}.{} on network {:?} has no discovered addresses",
+            task.contract_name,
             task.table.name(),
-            task.network
-        );
-        return true; // Not a failure, just nothing to do yet
+            task.network,
+        ));
     }
 
     let is_factory = task.factory_config.is_some();
@@ -750,9 +771,24 @@ async fn run_historical_sync(
     let end_block = if let Some(end) = task.cron_entry.end_block {
         end.to::<u64>()
     } else if let Some(p) = provider {
-        p.get_block_number().await.ok().map(|b| b.to::<u64>()).unwrap_or(start_block)
+        p.get_block_number()
+            .await
+            .map_err(|error| {
+                format!(
+                    "Historical cron {}.{} on network {:?} cannot read head height: {error}",
+                    task.contract_name,
+                    task.table.name(),
+                    task.network,
+                )
+            })?
+            .to::<u64>()
     } else {
-        start_block
+        return Err(format!(
+            "Historical cron {}.{} on network {:?} has no provider for head height",
+            task.contract_name,
+            task.table.name(),
+            task.network,
+        ));
     };
 
     // Get last synced block from database
@@ -772,13 +808,15 @@ async fn run_historical_sync(
     let mut current_block = match last_synced {
         Some(last) => {
             // Resume from last synced block + interval
-            let next = last.to::<u64>() + block_interval;
+            let Some(next) = last.to::<u64>().checked_add(block_interval) else {
+                return Ok(true);
+            };
             if next > end_block {
                 info!(
                     "Historical cron sync for table '{}' on network '{}' already complete (last synced: {}, end: {})",
                     task.table.name(), task.network, last, end_block
                 );
-                return true;
+                return Ok(true);
             }
             next
         }
@@ -798,7 +836,7 @@ async fn run_historical_sync(
     // Process blocks in batches
     while current_block <= end_block {
         if !is_running() {
-            return false;
+            return Ok(false);
         }
 
         // Collect blocks for this batch (batch size is dynamic based on rate limiting)
@@ -807,7 +845,10 @@ async fn run_historical_sync(
         let mut block = current_block;
         while block <= end_block && batch_blocks.len() < current_batch_size {
             batch_blocks.push(block);
-            block += block_interval;
+            let Some(next) = block.checked_add(block_interval) else {
+                break;
+            };
+            block = next;
         }
 
         if batch_blocks.is_empty() {
@@ -835,42 +876,44 @@ async fn run_historical_sync(
         let batch_duration = batch_start_time.elapsed();
 
         match result {
-            Ok(last_block) => {
-                // Save progress after batch
-                if let Some(b) = last_block {
-                    let concurrency = rate_limiter.concurrency();
-                    let batch_sz = rate_limiter.batch_size();
-                    let addr_info = if is_factory {
-                        format!(", {} addresses", addresses_with_blocks.len())
-                    } else {
-                        String::new()
-                    };
-                    info!(
-                        "Cron batch complete: table='{}', blocks {}-{} ({} ops{}), concurrency={}, batch_size={}, {:.1}s, saved at block {}",
-                        task.table.name(), batch_start, batch_end, batch_blocks.len(), addr_info, concurrency, batch_sz, batch_duration.as_secs_f64(), b
-                    );
-                    update_last_synced_cron_block(
-                        &postgres,
-                        &clickhouse,
-                        &task.indexer_name,
-                        &task.contract_name,
-                        task.table.name(),
-                        task.cron_index,
-                        &task.network,
-                        U64::from(b),
-                    )
-                    .await;
-                }
-            }
-            Err(e) => {
-                error!(
-                    "Historical cron batch failed for table '{}' on network '{}' blocks {}-{}: {}",
-                    task.table.name(),
-                    task.network,
-                    batch_start,
-                    batch_end,
-                    e
+            Ok(Some(b)) if b == batch_end => {
+                let concurrency = rate_limiter.concurrency();
+                let batch_sz = rate_limiter.batch_size();
+                let addr_info = if is_factory {
+                    format!(", {} addresses", addresses_with_blocks.len())
+                } else {
+                    String::new()
+                };
+                info!(
+                    "Cron batch complete: table='{}', blocks {}-{} ({} ops{}), concurrency={}, batch_size={}, {:.1}s, saved at block {}",
+                    task.table.name(), batch_start, batch_end, batch_blocks.len(), addr_info, concurrency, batch_sz, batch_duration.as_secs_f64(), b
                 );
+                // The checkpoint update is not transactional with table writes yet.
+                // The next pair will make both operations one PostgreSQL commit.
+                update_last_synced_cron_block(
+                    &postgres,
+                    &clickhouse,
+                    &task.indexer_name,
+                    &task.contract_name,
+                    task.table.name(),
+                    task.cron_index,
+                    &task.network,
+                    U64::from(b),
+                )
+                .await;
+            }
+            Ok(None) if !is_running() => return Ok(false),
+            Ok(last) => {
+                return Err(format!(
+                    "Historical cron {}.{} network {:?} blocks {batch_start}-{batch_end} did not finish: last completed {last:?}",
+                    task.contract_name, task.table.name(), task.network,
+                ));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Historical cron {}.{} network {:?} blocks {batch_start}-{batch_end} failed: {error}",
+                    task.contract_name, task.table.name(), task.network,
+                ));
             }
         }
 
@@ -881,7 +924,10 @@ async fn run_historical_sync(
             tokio::time::sleep(delay).await;
         }
 
-        current_block = batch_end + block_interval;
+        let Some(next_block) = batch_end.checked_add(block_interval) else {
+            break;
+        };
+        current_block = next_block;
     }
 
     let elapsed = start_time.elapsed();
@@ -892,7 +938,7 @@ async fn run_historical_sync(
         elapsed
     );
 
-    true
+    Ok(true)
 }
 
 /// Execute cron operations for a batch of blocks with parallel RPC calls.
@@ -1067,6 +1113,9 @@ async fn execute_cron_operations_batch(
         }
     }
     info!("All RPC calls completed: {}", completed_calls);
+    if !is_running() {
+        return Ok(None);
+    }
 
     // Step 3: Build all rows using cached results (one row per block per address)
     let cache = call_cache.read().await;
@@ -1080,13 +1129,40 @@ async fn execute_cron_operations_batch(
         total_calls,
         (successful_calls * 100).checked_div(total_calls).unwrap_or(0)
     );
+    // Every required view call must resolve for every eligible sample before
+    // the first database write. Collecting later samples cannot fill a gap.
+    for &block_number in blocks {
+        for (&address, &birth_block) in addresses_with_blocks {
+            if block_number < birth_block {
+                continue;
+            }
+            for call in &unique_calls {
+                if cache
+                    .get(&(block_number, address, call.clone()))
+                    .and_then(Option::as_ref)
+                    .is_none()
+                {
+                    let columns = call_patterns
+                        .iter()
+                        .filter(|(pattern, _, _)| pattern == call)
+                        .map(|(_, column, _)| column.as_str())
+                        .collect::<Vec<_>>();
+                    return Err(format!(
+                        "Required cron view call {call:?} for {}.{} on network {:?} at block {block_number}, address {address:?}, columns {columns:?} returned no value",
+                        task.contract_name, task.table.name(), task.network,
+                    ));
+                }
+            }
+        }
+    }
+
     let mut all_rows: Vec<TableRowData> =
         Vec::with_capacity(blocks.len() * addresses_with_blocks.len());
     let mut last_successful_block: Option<u64> = None;
 
     for &block_number in blocks {
         if !is_running() {
-            break;
+            return Ok(None);
         }
 
         for (&contract_address, &birth_block) in addresses_with_blocks {
@@ -1161,14 +1237,6 @@ async fn execute_cron_operations_batch(
                     }
                 }
 
-                if columns.is_empty() {
-                    debug!(
-                        "No columns extracted for block {} address {:?} - skipping row",
-                        block_number, contract_address
-                    );
-                    continue;
-                }
-
                 // Check that all required user columns are present (where clause + set columns)
                 let mut required_columns: Vec<String> = operation
                     .where_clause
@@ -1183,9 +1251,19 @@ async fn execute_cron_operations_batch(
                     required_columns.iter().filter(|col| !columns.contains_key(*col)).collect();
 
                 if !missing_columns.is_empty() {
-                    warn!(
-                        "Skipping row for block {} address {:?} - missing columns: {:?} (have: {:?})",
-                        block_number, contract_address, missing_columns, columns.keys().collect::<Vec<_>>()
+                    return Err(format!(
+                        "Historical cron {}.{} network {:?} block {block_number} address {contract_address:?} operation {:?} requires columns {missing_columns:?}, but only {:?} were resolved",
+                        task.contract_name,
+                        task.table.name(),
+                        task.network,
+                        operation.operation_type,
+                        columns.keys().collect::<Vec<_>>(),
+                    ));
+                }
+                if columns.is_empty() {
+                    debug!(
+                        "No user columns for cron operation at block {} address {:?} - skipping",
+                        block_number, contract_address
                     );
                     continue;
                 }

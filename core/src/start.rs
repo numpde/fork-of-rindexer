@@ -141,6 +141,9 @@ pub enum StartRindexerError {
     #[error("Shutdown handler failed with error: {0}")]
     ShutdownHandlerFailed(String),
 
+    #[error("Cron scheduler failed: {0}")]
+    CronSchedulerFailed(String),
+
     #[error("Port conflict: {0}")]
     PortConflict(String),
 
@@ -438,13 +441,21 @@ pub async fn start_rindexer_prepared(
             }
 
             if graphql_server_handle.is_none() && !manifest.has_any_live_indexing() {
-                // Wait for cron scheduler to complete if it's running
+                // In an indexer-only bounded run, the scheduler is part of the
+                // job's success condition. An inner Err is not a successful join.
                 if let Some(cron_handle) = details.cron_scheduler_handle {
                     info!("Waiting for cron scheduler to complete...");
-                    if let Err(e) = cron_handle.await {
-                        error!("Cron scheduler task failed: {:?}", e);
+                    match cron_handle.await {
+                        Ok(Ok(())) => info!("Cron scheduler completed"),
+                        Ok(Err(error)) => {
+                            return Err(StartRindexerError::CronSchedulerFailed(error));
+                        }
+                        Err(error) => {
+                            return Err(StartRindexerError::CronSchedulerFailed(format!(
+                                "Cron scheduler task failed to join: {error}"
+                            )));
+                        }
                     }
-                    info!("Cron scheduler completed");
                 }
                 return Ok(());
             }
