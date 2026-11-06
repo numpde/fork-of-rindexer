@@ -64,3 +64,52 @@ async fn postgres_guard_uses_unsigned_upsert_input_without_choosing_a_destinatio
     let state=guarded_rows(json!([{"column":"signedView","action":"set","value":"$sourceAmount"},{"column":"totalAmount","action":"set","value":"$sourceAmount"}]),&[1,u64::MAX,4]).await;
     assert_eq!(state,(u64::MAX.to_string(),"-1".into()),"the same ABI value feeds signed BIGINT and exact NUMERIC destinations; the guard reads the unsigned input");
 }
+
+/// A value of one seeds (or resets) the row. The next block tests the guard
+/// against that stored one. Read both states so a DELETE cannot pass on a
+/// missing row or an UPDATE on an unchanged default.
+async fn unsigned_mutation_states(mutation: serde_json::Value) -> Vec<Option<i64>> {
+    let mut definition = serde_json::to_value(params().event).unwrap();
+    definition["inputs"][0]["name"] = json!("sourceAmount");
+    definition["inputs"][0]["type"] = json!("uint64");
+    let seed = json!({"type":"upsert","if":"$sourceAmount == 1",
+        "set":[{"column":"totalAmount","action":"set","value":"1"}]});
+    let table = json!({"name":"totals","global":true,
+        "columns":[{"name":"totalAmount","type":"uint256","default":"0"}],
+        "events":[{"event":"Value","operations":[seed,mutation]}]});
+    let fixture = Fixture::with_table(definition, "Contract", table).await;
+    let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
+    let select =
+        format!("SELECT total_amount::bigint FROM {}", fixture.params.tables[0].full_table_name);
+    let mut states = Vec::new();
+    for (i, value) in [1, 0, 1, 1_u64 << 63, 1, u64::MAX].into_iter().enumerate() {
+        let block = 100 + i as u64;
+        callback(vec![at(&fixture, "ethereum", block, B256::repeat_byte(block as u8), value)])
+            .await
+            .unwrap();
+        let row = fixture.client.query_one_or_none(&select, &[]).await.unwrap();
+        states.push(row.map(|row| row.get(0)));
+    }
+    drop(callback);
+    fixture.finish().await;
+    states
+}
+
+#[tokio::test]
+async fn postgres_guard_uses_unsigned_update_input() {
+    let update = json!({"type":"update","if":"$sourceAmount > @totalAmount",
+        "set":[{"column":"totalAmount","action":"set","value":"99"}]});
+    assert_eq!(
+        unsigned_mutation_states(update).await,
+        [Some(1), Some(1), Some(1), Some(99), Some(1), Some(99)]
+    );
+}
+
+#[tokio::test]
+async fn postgres_guard_uses_unsigned_delete_input() {
+    let delete = json!({"type":"delete","if":"$sourceAmount > @totalAmount"});
+    assert_eq!(
+        unsigned_mutation_states(delete).await,
+        [Some(1), Some(1), Some(1), None, Some(1), None]
+    );
+}
