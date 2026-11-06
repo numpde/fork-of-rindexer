@@ -1758,3 +1758,6 @@ mod operand_recovery_tests;
 
 #[path = "prepared_schema_tests.rs"]
 mod prepared_schema_tests;
+
+#[path = "checkpoint_only_recovery_tests.rs"]
+mod checkpoint_only_recovery_tests;
