@@ -669,6 +669,78 @@ async fn additive_upsert_rollback_and_restart_preserve_the_single_delta() {
 }
 
 #[tokio::test]
+async fn multiple_operations_follow_declared_order_for_each_sample() {
+    let fixture = Fixture::new().await;
+    fixture.use_additive_table().await;
+    let mut manifest = serde_json::to_value(Fixture::additive_manifest()).unwrap();
+    let cron = &mut manifest["contracts"][0]["tables"][0]["cron"][0];
+    cron["end_block"] = json!("102");
+    cron["operations"] = json!([
+        {"type":"upsert", "set":[{"column":"amount", "action":"set", "value":"3"}]},
+        {"type":"upsert", "set":[{"column":"amount", "action":"add", "value":"7"}]}
+    ]);
+    let manifest: Manifest = serde_json::from_value(manifest).unwrap();
+    fixture
+        .scheduler(&manifest, 102)
+        .expect("multiple operations must be admitted")
+        .run()
+        .await
+        .unwrap();
+    assert_eq!(fixture.amount().await.as_deref(), Some("10"));
+    assert_eq!(fixture.checkpoint().await, Some(102));
+    fixture.scheduler(&manifest, 102).unwrap().run().await.unwrap();
+    assert_eq!(fixture.amount().await.as_deref(), Some("10"));
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn failure_in_later_cron_operation_rolls_back_the_whole_sample() {
+    let fixture = Fixture::new().await;
+    fixture.use_additive_table().await;
+    let mut manifest = serde_json::to_value(Fixture::additive_manifest()).unwrap();
+    manifest["contracts"][0]["tables"][0]["cron"][0]["operations"] = json!([
+        {"type":"upsert", "set":[{"column":"amount", "action":"set", "value":"3"}]},
+        {"type":"upsert", "set":[{"column":"amount", "action":"add", "value":"7"}]}
+    ]);
+    let manifest: Manifest = serde_json::from_value(manifest).unwrap();
+    fixture
+        .postgres
+        .batch_execute(&format!(
+            "CREATE FUNCTION rindexer_internal.reject_second_cron_operation() RETURNS trigger
+             LANGUAGE plpgsql AS $cron_fault$ BEGIN RAISE EXCEPTION 'injected second operation failure'; END $cron_fault$;
+             CREATE TRIGGER reject_second_cron_operation BEFORE UPDATE ON {}
+             FOR EACH ROW EXECUTE FUNCTION rindexer_internal.reject_second_cron_operation();",
+            fixture.table
+        ))
+        .await
+        .expect("install fault on the second operation");
+    let error = fixture
+        .scheduler(&manifest, 101)
+        .unwrap()
+        .run()
+        .await
+        .expect_err("failure in a later operation must abort the entire sample")
+        .to_string();
+    assert!(
+        error.contains("injected second operation failure") && error.contains("operation 1"),
+        "wrong failure boundary: {error}"
+    );
+    assert_eq!(fixture.amount().await, None, "the first operation must roll back");
+    assert_eq!(fixture.checkpoint().await, None, "the sample cannot be certified");
+    fixture
+        .postgres
+        .batch_execute(&format!("DROP TRIGGER reject_second_cron_operation ON {}", fixture.table))
+        .await
+        .expect("remove second-operation fault");
+    fixture.scheduler(&manifest, 101).unwrap().run().await.expect("retry entire sample");
+    assert_eq!(fixture.amount().await.as_deref(), Some("10"));
+    assert_eq!(fixture.checkpoint().await, Some(101));
+    fixture.scheduler(&manifest, 101).unwrap().run().await.expect("replay");
+    assert_eq!(fixture.amount().await.as_deref(), Some("10"), "replay cannot double-apply");
+    fixture.finish().await;
+}
+
+#[tokio::test]
 async fn lost_commit_reply_is_reconciled_without_replaying_the_sample() {
     let fixture = Fixture::new().await;
     let proxy = LostCommitResponse::start(&fixture.url).await;
