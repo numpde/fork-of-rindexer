@@ -4820,6 +4820,27 @@ async fn execute_clickhouse_operation(
 // Public helper functions for cron scheduler
 // =============================================================================
 
+/// Stage a cron operation inside the caller's checkpoint transaction.
+/// This must not silently fall back to eager writes or a second connection.
+pub(crate) async fn execute_postgres_cron_operation_in(
+    transaction: &tokio_postgres::Transaction<'_>,
+    table_name: &str,
+    table_def: &crate::manifest::contract::ResolvedTable,
+    operation: &TableOperation,
+    rows: &[TableRowData],
+) -> Result<(), String> {
+    execute_postgres_operation(
+        PgWriteMode::Tx(transaction),
+        table_name,
+        table_def.definition(),
+        operation,
+        rows,
+        None,
+    )
+    .await
+    .map(|_| ())
+}
+
 /// Internal PostgreSQL operation execution - used by cron scheduler.
 /// This is a public wrapper around `execute_postgres_operation`.
 pub async fn execute_postgres_operation_internal(

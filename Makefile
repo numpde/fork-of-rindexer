@@ -351,11 +351,18 @@ ci: rust/checks tests ## Validate the first container-development slice (not all
 
 .PHONY: tests/permanent-failures/docker tests/permanent-failures/postgres
 
+.PHONY: tests/cron-atomic/postgres
 .PHONY: tests/postgres-replay/docker
 .PHONY: tests/reorg/docker
 tests/reorg/docker: tests/posture ## Check shared network rewinds, reorg validation and stale-work fencing offline
 	@$(call offline_runner,$$dependency_image)
 	$(compose) run --rm --no-deps -T offline reorg
+
+tests/cron-atomic/postgres: tests/posture ## Check atomic historical-cron checkpoints with the external PostgreSQL fixture
+	@$(call offline_runner,$$dependency_image)
+	$(compose) run --rm --no-deps -T offline cron-atomic-compile
+	$(compose) up -d --no-build --pull never --wait --wait-timeout 90 postgres
+	$(compose) run --rm --no-deps -T postgres-tests cron-atomic
 
 tests/postgres-replay/docker: tests/posture ## Check uncertain PostgreSQL commits, replayed events and derived effects
 	@$(call offline_runner,$$dependency_image)

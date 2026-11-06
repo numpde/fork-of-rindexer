@@ -82,6 +82,10 @@ export default defineConfig({
           text: "PostgreSQL Event Replay",
           link: "/docs/migrations/postgres-event-replay",
         },
+        {
+          text: "PostgreSQL Historical Cron Durability",
+          link: "/docs/migrations/postgres-cron-durability",
+        },
       ],
     },
     {

@@ -1,6 +1,5 @@
 use alloy::primitives::U64;
 use clickhouse::Row;
-use rust_decimal::Decimal;
 use serde::Deserialize;
 use std::time::Duration;
 use std::{path::Path, str::FromStr, sync::Arc};
@@ -12,6 +11,7 @@ use tokio::{
 use tracing::{debug, error};
 
 use crate::database::clickhouse::client::ClickhouseClient;
+use crate::database::postgres::client::pg_error_to_string;
 use crate::database::postgres::generate::{
     generate_internal_cron_table_name, generate_internal_cron_table_name_no_shorten,
     generate_internal_event_table_name_no_shorten,
@@ -499,7 +499,8 @@ pub async fn evm_trace_update_progress_and_last_synced_task(
 // Cron Sync State Functions
 // ============================================================================
 
-/// Configuration for cron sync state operations.
+/// One PostgreSQL cron checkpoint, scoped by the existing internal table and network.
+#[derive(Clone, Copy)]
 pub struct CronSyncConfig<'a> {
     pub postgres: &'a Option<Arc<PostgresClient>>,
     pub clickhouse: &'a Option<Arc<ClickhouseClient>>,
@@ -510,42 +511,57 @@ pub struct CronSyncConfig<'a> {
     pub network: &'a str,
 }
 
-/// Get the last synced block for a cron entry from the database.
-///
-/// Returns `None` if the block is 0 (never synced) or on error.
-pub async fn get_last_synced_cron_block(config: CronSyncConfig<'_>) -> Option<U64> {
-    // Query PostgreSQL for last synced block
-    if let Some(postgres) = config.postgres {
-        let schema =
-            generate_indexer_contract_schema_name(config.indexer_name, config.contract_name);
-        let table_name =
-            generate_internal_cron_table_name(&schema, config.table_name, config.cron_index);
-        let query = format!(
-            "SELECT last_synced_block FROM rindexer_internal.{table_name} WHERE network = $1"
-        );
+fn postgres_cron_table(config: CronSyncConfig<'_>) -> String {
+    let schema = generate_indexer_contract_schema_name(config.indexer_name, config.contract_name);
+    generate_internal_cron_table_name(&schema, config.table_name, config.cron_index)
+}
 
-        return match postgres
-            .query_one(&query, &[&config.network, &crate::event::cursor::NETWORK_CURSOR_KEY])
+fn read_versioned_cron_row(
+    row: tokio_postgres::Row,
+    table: &str,
+    network: &str,
+) -> Result<Option<u64>, String> {
+    let version: Option<i16> = row
+        .try_get("protocol_version")
+        .map_err(|e| format!("Cannot decode cron protocol for {table}/{network}: {e}"))?;
+    if version != Some(1) {
+        return Err(format!(
+            "Cron checkpoint {table}/{network} has uncertified legacy protocol \
+             {version:?}; stop writers and rebuild or explicitly reconcile destination \
+             rows and progress together before starting durable historical cron"
+        ));
+    }
+    let value: Option<String> = row
+        .try_get("last_synced_block")
+        .map_err(|e| format!("Cannot decode cron progress for {table}/{network}: {e}"))?;
+    value
+        .map(|text| {
+            text.parse::<u64>()
+                .map_err(|e| format!("Invalid cron progress {text:?} for {table}/{network}: {e}"))
+        })
+        .transpose()
+}
+
+/// Read authoritative progress. NULL means never started, including when start_block is zero.
+/// A missing row, unsupported protocol, or any database error must never mean a fresh schedule.
+pub async fn get_last_synced_cron_block(config: CronSyncConfig<'_>) -> Result<Option<U64>, String> {
+    if let Some(postgres) = config.postgres {
+        let table = postgres_cron_table(config);
+        let query = format!(
+            "SELECT protocol_version, last_synced_block::TEXT AS last_synced_block \
+             FROM rindexer_internal.{table} WHERE network = $1"
+        );
+        let row = postgres
+            .query_one_or_none(&query, &[&config.network])
             .await
-        {
-            Ok(row) => {
-                let result: Decimal = row.get("last_synced_block");
-                let parsed =
-                    U64::from_str(&result.to_string()).expect("Failed to parse last_synced_block");
-                if parsed.is_zero() {
-                    None
-                } else {
-                    Some(parsed)
-                }
-            }
-            Err(e) => {
-                error!("Error fetching cron last synced block: {:?}", e);
-                None
-            }
-        };
+            .map_err(|e| format!("Cannot read cron checkpoint {table}/{}: {e}", config.network))?
+            .ok_or_else(|| {
+                format!("Cron checkpoint row missing from {table} for network {}", config.network)
+            })?;
+        return read_versioned_cron_row(row, &table, config.network)
+            .map(|block| block.map(U64::from));
     }
 
-    // Query ClickHouse for last synced block
     if let Some(clickhouse) = config.clickhouse {
         #[derive(Row, Deserialize)]
         struct LastBlock {
@@ -554,88 +570,100 @@ pub async fn get_last_synced_cron_block(config: CronSyncConfig<'_>) -> Option<U6
 
         let schema =
             generate_indexer_contract_schema_name(config.indexer_name, config.contract_name);
-        let table_name = generate_internal_cron_table_name_no_shorten(
+        let table = generate_internal_cron_table_name_no_shorten(
             &schema,
             config.table_name,
             config.cron_index,
         );
         let query = format!(
-            "SELECT last_synced_block FROM rindexer_internal.{table_name} FINAL WHERE network = '{}'",
+            "SELECT last_synced_block FROM rindexer_internal.{table} FINAL WHERE network = '{}'",
             config.network
         );
-
-        let row = clickhouse.query_one::<LastBlock>(&query).await;
-
-        return match row {
-            Ok(row) => {
-                let result = row.last_synced_block;
-                if result == 0 {
-                    None
-                } else {
-                    Some(U64::from(result))
-                }
-            }
-            Err(e) => {
-                error!("Error fetching cron last synced block from clickhouse: {:?}", e);
-                None
-            }
-        };
+        let row = clickhouse
+            .query_one::<LastBlock>(&query)
+            .await
+            .map_err(|e| format!("Cannot read ClickHouse cron checkpoint {table}: {e}"))?;
+        return Ok((row.last_synced_block != 0).then_some(U64::from(row.last_synced_block)));
     }
 
-    None
+    // The no-database path is used by isolated preparation tests.
+    Ok(None)
 }
 
-/// Update the last synced block for a cron entry in the database.
-#[allow(clippy::too_many_arguments)]
-pub async fn update_last_synced_cron_block(
-    postgres: &Option<Arc<PostgresClient>>,
-    clickhouse: &Option<Arc<ClickhouseClient>>,
-    indexer_name: &str,
-    contract_name: &str,
-    table_name: &str,
-    cron_index: usize,
-    network: &str,
-    to_block: U64,
-) {
-    debug!(
-        "update_last_synced_cron_block called: indexer={}, contract={}, table={}, cron_index={}, network={}, to_block={}",
-        indexer_name, contract_name, table_name, cron_index, network, to_block
+/// Lock the checkpoint BEFORE staging any table effects. Waiting on this row
+/// serializes both the decision to apply a prepared batch and its eventual commit.
+pub async fn lock_postgres_cron_checkpoint(
+    transaction: &tokio_postgres::Transaction<'_>,
+    config: CronSyncConfig<'_>,
+) -> Result<Option<u64>, String> {
+    let table = postgres_cron_table(config);
+    let query = format!(
+        "SELECT protocol_version, last_synced_block::TEXT AS last_synced_block \
+         FROM rindexer_internal.{table} WHERE network = $1 FOR UPDATE"
     );
+    let row = transaction
+        .query_opt(&query, &[&config.network])
+        .await
+        .map_err(|e| format!("Cannot lock cron checkpoint {table}/{}: {e}", config.network))?
+        .ok_or_else(|| {
+            format!("Cron checkpoint row missing from {table} for network {}", config.network)
+        })?;
+    read_versioned_cron_row(row, &table, config.network)
+}
 
-    if let Some(postgres) = postgres {
-        let schema = generate_indexer_contract_schema_name(indexer_name, contract_name);
-        let internal_table_name =
-            generate_internal_cron_table_name(&schema, table_name, cron_index);
-        let query = format!(
-            "UPDATE rindexer_internal.{internal_table_name} SET last_synced_block = {to_block} WHERE network = '{network}' AND {to_block} > last_synced_block"
-        );
-
-        debug!("Cron sync update query: {}", query);
-
-        let result = postgres.batch_execute(&query).await;
-
-        match &result {
-            Ok(_) => debug!("Cron sync update successful for table {}", internal_table_name),
-            Err(e) => error!("Error updating cron last synced block in postgres: {:?}", e),
-        }
-    } else {
-        debug!("update_last_synced_cron_block: postgres is None");
+/// Advance inside the caller-owned PostgreSQL transaction after every
+/// scheduled table operation has completed. An absent row cannot be ignored.
+pub async fn advance_postgres_cron_checkpoint(
+    transaction: &tokio_postgres::Transaction<'_>,
+    config: CronSyncConfig<'_>,
+    to_block: u64,
+) -> Result<(), String> {
+    let table = postgres_cron_table(config);
+    let query = format!(
+        "UPDATE rindexer_internal.{table} SET last_synced_block = $1 \
+         WHERE network = $2 AND protocol_version = 1"
+    );
+    let value = EthereumSqlTypeWrapper::U64(to_block);
+    let affected = transaction.execute(&query, &[&value, &config.network]).await.map_err(|e| {
+        format!(
+            "Cannot advance cron checkpoint {table}/{}: {}",
+            config.network,
+            pg_error_to_string(&e)
+        )
+    })?;
+    if affected != 1 {
+        return Err(format!(
+            "Cron checkpoint {table}/{} updated {affected} rows, expected exactly one",
+            config.network
+        ));
     }
+    Ok(())
+}
 
-    if let Some(clickhouse) = clickhouse {
-        let schema = generate_indexer_contract_schema_name(indexer_name, contract_name);
-        let internal_table_name =
-            generate_internal_cron_table_name_no_shorten(&schema, table_name, cron_index);
-        let query = format!(
-            "INSERT INTO rindexer_internal.{internal_table_name} (network, last_synced_block) VALUES ('{network}', {to_block})"
+/// ClickHouse continues to use its pre-existing non-transactional protocol.
+/// It is not part of the PostgreSQL durability guarantee.
+pub async fn update_last_synced_clickhouse_cron_block(
+    config: CronSyncConfig<'_>,
+    to_block: U64,
+) -> Result<(), String> {
+    if let Some(clickhouse) = config.clickhouse {
+        let schema =
+            generate_indexer_contract_schema_name(config.indexer_name, config.contract_name);
+        let table = generate_internal_cron_table_name_no_shorten(
+            &schema,
+            config.table_name,
+            config.cron_index,
         );
-
-        let result = clickhouse.execute(&query).await;
-
-        if let Err(e) = result {
-            error!("Error updating cron last synced block in clickhouse: {:?}", e);
-        }
+        let query = format!(
+            "INSERT INTO rindexer_internal.{table} (network, last_synced_block) VALUES ('{}', {to_block})",
+            config.network
+        );
+        clickhouse
+            .execute(&query)
+            .await
+            .map_err(|e| format!("Cannot advance ClickHouse cron checkpoint {table}: {e}"))?;
     }
+    Ok(())
 }
 
 #[cfg(test)]

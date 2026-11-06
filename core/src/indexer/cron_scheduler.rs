@@ -18,7 +18,8 @@ use crate::database::postgres::client::PostgresClient;
 use crate::database::sql_type_wrapper::EthereumSqlTypeWrapper;
 use crate::event::read_factory_addresses_from_event;
 use crate::indexer::last_synced::{
-    get_last_synced_cron_block, update_last_synced_cron_block, CronSyncConfig,
+    advance_postgres_cron_checkpoint, get_last_synced_cron_block, lock_postgres_cron_checkpoint,
+    update_last_synced_clickhouse_cron_block, CronSyncConfig,
 };
 use crate::indexer::schema::PreparedSchema;
 use crate::is_running;
@@ -270,6 +271,125 @@ pub struct CronScheduler {
     pub indexer_name: String,
 }
 
+/// Validate the narrow durable PostgreSQL cron profile against every
+/// prepared table. Production database setup and scheduler construction call
+/// the same validator; SQL generation alone is not admission.
+pub(crate) fn validate_postgres_cron_targets<'a>(
+    contracts: impl IntoIterator<Item = (&'a Contract, &'a [TableRuntime])>,
+) -> Result<(), String> {
+    let mut destinations: HashMap<String, (String, bool)> = HashMap::new();
+    for (contract, runtimes) in contracts {
+        for runtime in runtimes {
+            let table = runtime.table.definition();
+            let historical = table.cron.iter().flatten().any(|entry| entry.start_block.is_some());
+            let destination = runtime
+                .full_table_name
+                .split('.')
+                .map(|part| crate::helpers::postgres_catalog_identifier(part).to_ascii_lowercase())
+                .collect::<Vec<_>>()
+                .join(".");
+            let owner = format!("{}::{}", contract.name, table.name);
+            if let Some((other, other_historical)) = destinations.get(&destination) {
+                if historical || *other_historical {
+                    return Err(format!(
+                        "Historical PostgreSQL cron destination {destination} is shared by {other} and {owner}; separate checkpoints cannot coordinate writers"
+                    ));
+                }
+            } else {
+                destinations.insert(destination, (owner.clone(), historical));
+            }
+            if !historical {
+                continue;
+            }
+            let context = format!("Historical PostgreSQL cron {owner}");
+            if table.cross_chain {
+                return Err(format!(
+                    "{context}: cross_chain keys overlap independent network checkpoints"
+                ));
+            }
+            if !table.events.is_empty()
+                || table.cron.as_ref().is_none_or(|entries| entries.len() != 1)
+            {
+                return Err(format!(
+                    "{context}: the destination must have exactly one cron writer and no event writer"
+                ));
+            }
+            if table.timestamp {
+                return Err(format!(
+                    "{context}: canonical historical timestamps are not yet supported"
+                ));
+            }
+            for entry in table.cron.iter().flatten().filter(|entry| entry.start_block.is_some()) {
+                if entry.end_block.is_none() {
+                    return Err(format!(
+                        "{context}: a fixed end_block is required until live cron is durable"
+                    ));
+                }
+                if entry.operations.len() != 1 {
+                    return Err(format!(
+                        "{context}: exactly one operation is supported until ordered multi-operation batches are implemented"
+                    ));
+                }
+                let uses_synthetic_metadata = entry.operations.iter().any(|operation| {
+                    operation
+                        .where_clause
+                        .values()
+                        .map(String::as_str)
+                        .chain(operation.set.iter().map(|column| column.effective_value()))
+                        .any(|value| {
+                            [
+                                "$rindexer_timestamp",
+                                "$rindexer_block_timestamp",
+                                "$rindexer_tx_hash",
+                                "$rindexer_block_hash",
+                            ]
+                            .iter()
+                            .any(|reference| value.contains(reference))
+                        })
+                });
+                if uses_synthetic_metadata {
+                    return Err(format!(
+                        "{context}: synthetic historical provenance cannot be used as an input"
+                    ));
+                }
+                let networks: Vec<&str> = entry.network.as_ref().map_or_else(
+                    || contract.details.iter().map(|detail| detail.network.as_str()).collect(),
+                    |network| vec![network.as_str()],
+                );
+                for network in networks {
+                    let matching = contract
+                        .details
+                        .iter()
+                        .filter(|detail| detail.network == network)
+                        .collect::<Vec<_>>();
+                    if matching.len() != 1 {
+                        return Err(format!(
+                            "{context}: network {network:?} requires exactly one contract details entry, found {}; multi-address sampling is not admitted",
+                            matching.len()
+                        ));
+                    }
+                    let detail = matching[0];
+                    if detail.factory.is_some() {
+                        return Err(format!(
+                            "{context}: factory discovery completeness is not yet supported"
+                        ));
+                    }
+                    if !matches!(
+                        detail.address.as_ref(),
+                        Some(alloy::rpc::types::ValueOrArray::Value(address))
+                            if *address != Address::ZERO
+                    ) {
+                        return Err(format!(
+                            "{context}: exactly one nonzero static address is required"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 impl CronScheduler {
     /// Create a new cron scheduler from the manifest.
     ///
@@ -335,6 +455,10 @@ impl CronScheduler {
         clickhouse: Option<Arc<ClickhouseClient>>,
         providers: Arc<HashMap<String, Arc<dyn ChainProvider>>>,
     ) -> Result<Self, String> {
+        let contracts = contracts.into_iter().collect::<Vec<_>>();
+        if postgres.is_some() {
+            validate_postgres_cron_targets(contracts.iter().copied())?;
+        }
         let mut tasks = Vec::new();
 
         for (contract, tables) in contracts {
@@ -395,6 +519,17 @@ impl CronScheduler {
                     for network in networks {
                         // Find the contract details for this network
                         let detail = contract.details.iter().find(|d| d.network == network);
+
+                        if postgres.is_some()
+                            && clickhouse.is_some()
+                            && cron_entry.start_block.is_some()
+                        {
+                            return Err(format!(
+                                "Historical PostgreSQL cron {}.{} on network {network}: mixed PostgreSQL/ClickHouse sinks are not atomic",
+                                contract.name,
+                                table.name()
+                            ));
+                        }
 
                         // Check if this is a factory-indexed contract
                         let (contract_address, factory_config) = if let Some(factory) =
@@ -802,7 +937,18 @@ async fn run_historical_sync(
         network: &task.network,
     };
 
-    let last_synced = get_last_synced_cron_block(sync_config).await;
+    let last_synced = get_last_synced_cron_block(sync_config).await?;
+    if let Some(last) = last_synced {
+        let block = last.to::<u64>();
+        if block < start_block || !(block - start_block).is_multiple_of(block_interval) {
+            return Err(format!(
+                "Historical cron {}.{} checkpoint {block} is outside the sampling grid (start={start_block}, interval={block_interval})",
+                task.contract_name,
+                task.table.name()
+            ));
+        }
+    }
+    let mut expected_previous = last_synced.map(|block| block.to::<u64>());
 
     // Determine starting point
     let mut current_block = match last_synced {
@@ -861,11 +1007,9 @@ async fn run_historical_sync(
         // Track batch timing to detect rate limiting
         let batch_start_time = std::time::Instant::now();
 
-        // Execute batch and get last successful block
-        let result = execute_cron_operations_batch(
+        // Resolve every required RPC input outside the database transaction.
+        let result = prepare_cron_operations_batch(
             task,
-            postgres.clone(),
-            clickhouse.clone(),
             providers.clone(),
             &batch_blocks,
             &addresses_with_blocks,
@@ -876,36 +1020,78 @@ async fn run_historical_sync(
         let batch_duration = batch_start_time.elapsed();
 
         match result {
-            Ok(Some(b)) if b == batch_end => {
-                let concurrency = rate_limiter.concurrency();
-                let batch_sz = rate_limiter.batch_size();
-                let addr_info = if is_factory {
-                    format!(", {} addresses", addresses_with_blocks.len())
+            Ok(Some((completed, rows))) if completed == batch_end => {
+                if let Some(postgres) = &postgres {
+                    match apply_postgres_historical_batch(
+                        task,
+                        postgres,
+                        sync_config,
+                        &rows,
+                        expected_previous,
+                        completed,
+                    )
+                    .await?
+                    {
+                        CronBatchOutcome::Committed => {
+                            expected_previous = Some(completed);
+                        }
+                        CronBatchOutcome::Replan(progress) => {
+                            if let Some(last) = progress {
+                                let on_grid = last >= start_block
+                                    && (last - start_block).is_multiple_of(block_interval);
+                                if !on_grid {
+                                    return Err(format!(
+                                        "Historical cron checkpoint {last} moved outside the declared sample grid"
+                                    ));
+                                }
+                            }
+                            expected_previous = progress;
+                            current_block = match progress {
+                                Some(last) => match last.checked_add(block_interval) {
+                                    Some(next) => next,
+                                    None => break,
+                                },
+                                None => start_block,
+                            };
+                            continue;
+                        }
+                    }
                 } else {
-                    String::new()
-                };
+                    // ClickHouse retains its previous best-effort checkpoint
+                    // protocol, outside the PostgreSQL transaction guarantee.
+                    if !rows.is_empty() {
+                        let Some(operation) = task.cron_entry.operations.first() else {
+                            return Err("Historical cron has no declared operation".into());
+                        };
+                        if let Some(clickhouse) = &clickhouse {
+                            super::tables::execute_clickhouse_operation_internal(
+                                clickhouse,
+                                &task.full_table_name,
+                                &task.table,
+                                operation,
+                                &rows,
+                            )
+                            .await?;
+                        }
+                    }
+                    update_last_synced_clickhouse_cron_block(sync_config, U64::from(completed))
+                        .await?;
+                }
                 info!(
-                    "Cron batch complete: table='{}', blocks {}-{} ({} ops{}), concurrency={}, batch_size={}, {:.1}s, saved at block {}",
-                    task.table.name(), batch_start, batch_end, batch_blocks.len(), addr_info, concurrency, batch_sz, batch_duration.as_secs_f64(), b
-                );
-                // The checkpoint update is not transactional with table writes yet.
-                // The next pair will make both operations one PostgreSQL commit.
-                update_last_synced_cron_block(
-                    &postgres,
-                    &clickhouse,
-                    &task.indexer_name,
-                    &task.contract_name,
+                    "Cron batch committed: table='{}', blocks {}-{}, batch_size={}, {:.1}s, checkpoint={}",
                     task.table.name(),
-                    task.cron_index,
-                    &task.network,
-                    U64::from(b),
-                )
-                .await;
+                    batch_start,
+                    batch_end,
+                    rate_limiter.batch_size(),
+                    batch_duration.as_secs_f64(),
+                    completed
+                );
             }
             Ok(None) if !is_running() => return Ok(false),
             Ok(last) => {
+                let completed = last.map(|(block, _)| block);
                 return Err(format!(
-                    "Historical cron {}.{} network {:?} blocks {batch_start}-{batch_end} did not finish: last completed {last:?}",
+                    "Historical cron {}.{} network {:?} blocks {batch_start}-{batch_end} did not finish: last completed {completed:?}",
                     task.contract_name, task.table.name(), task.network,
                 ));
             }
@@ -941,23 +1127,110 @@ async fn run_historical_sync(
     Ok(true)
 }
 
-/// Execute cron operations for a batch of blocks with parallel RPC calls.
-///
-/// This executes all $call operations in parallel, then writes results to the
-/// database in a batch. Returns the last successful block number.
+/// Whether the current attempt committed, or another writer advanced durable
+/// progress while its RPC values were being prepared.
+enum CronBatchOutcome {
+    Committed,
+    Replan(Option<u64>),
+}
+
+/// One transaction owns the checkpoint decision and all table effects.
+/// A stale prepared batch never writes; a concurrent runner can replan.
+async fn apply_postgres_historical_batch(
+    task: &CronTask,
+    postgres: &PostgresClient,
+    sync: CronSyncConfig<'_>,
+    rows: &[TableRowData],
+    expected_previous: Option<u64>,
+    completed: u64,
+) -> Result<CronBatchOutcome, String> {
+    let [operation] = task.cron_entry.operations.as_slice() else {
+        return Err("Durable historical cron requires exactly one operation".into());
+    };
+    let mut connection = postgres.raw_connection().await.map_err(|e| e.to_string())?;
+    let transaction =
+        connection.transaction().await.map_err(|e| format!("Cannot begin cron batch: {e}"))?;
+    let durable = lock_postgres_cron_checkpoint(&transaction, sync).await?;
+    if durable != expected_previous {
+        if matches!((expected_previous, durable), (Some(_), None))
+            || matches!(
+                (expected_previous, durable),
+                (Some(previous), Some(current)) if current < previous
+            )
+        {
+            return Err(format!(
+                "Historical cron checkpoint regressed from {expected_previous:?} to {durable:?}"
+            ));
+        }
+        // The lock is released with the transaction, without any table write.
+        return Ok(CronBatchOutcome::Replan(durable));
+    }
+    if durable.is_some_and(|block| block >= completed) {
+        return Err(format!(
+            "Historical cron attempted to advance past checkpoint {durable:?} with completed block {completed}"
+        ));
+    }
+    if !rows.is_empty() {
+        super::tables::execute_postgres_cron_operation_in(
+            &transaction,
+            &task.full_table_name,
+            &task.table,
+            operation,
+            rows,
+        )
+        .await?;
+    }
+    advance_postgres_cron_checkpoint(&transaction, sync, completed).await?;
+
+    // Commit may succeed even when its reply never reaches this client.
+    match transaction.commit().await {
+        Ok(()) => Ok(CronBatchOutcome::Committed),
+        Err(commit_error) => {
+            drop(connection);
+            // Locking the same row waits for the original transaction to
+            // settle before declaring whether the progress committed.
+            let mut recovery = postgres.raw_connection().await.map_err(|error| {
+                format!("Cron COMMIT outcome unknown ({commit_error}); cannot reconnect: {error}")
+            })?;
+            let reconciliation = recovery.transaction().await.map_err(|error| {
+                format!("Cron COMMIT outcome unknown ({commit_error}); cannot start reconciliation: {error}")
+            })?;
+            let actual =
+                lock_postgres_cron_checkpoint(&reconciliation, sync).await.map_err(|error| {
+                    format!(
+                        "Cron COMMIT outcome unknown ({commit_error}); cannot reconcile: {error}"
+                    )
+                })?;
+            drop(reconciliation);
+            if matches!(actual, Some(block) if block >= completed) {
+                info!(
+                    "Historical cron COMMIT reply lost, but checkpoint confirms block {completed}"
+                );
+                Ok(CronBatchOutcome::Committed)
+            } else {
+                Err(format!(
+                    "Cron COMMIT outcome unknown ({commit_error}); durable checkpoint {actual:?} \
+                     does not certify completed block {completed}; aborting for safe restart"
+                ))
+            }
+        }
+    }
+}
+
+/// Prepare a complete historical batch using bounded parallel RPC calls.
+/// The resulting ordered work is returned to the caller; no database write
+/// occurs until the checkpoint transaction owns the application decision.
 ///
 /// For factory-indexed contracts, `addresses_with_blocks` maps each address to its birth block.
 /// Only (block, address) pairs where block >= birth_block are processed.
 /// For static contracts, birth_block is 0.
-async fn execute_cron_operations_batch(
+async fn prepare_cron_operations_batch(
     task: &CronTask,
-    postgres: Option<Arc<PostgresClient>>,
-    clickhouse: Option<Arc<ClickhouseClient>>,
     providers: Arc<HashMap<String, Arc<dyn ChainProvider>>>,
     blocks: &[u64],
     addresses_with_blocks: &HashMap<Address, u64>,
     rate_limiter: Arc<AdaptiveRateLimiter>,
-) -> Result<Option<u64>, String> {
+) -> Result<Option<(u64, Vec<TableRowData>)>, String> {
     use futures::stream::{FuturesUnordered, StreamExt};
 
     if blocks.is_empty() || addresses_with_blocks.is_empty() {
@@ -1314,44 +1587,50 @@ async fn execute_cron_operations_batch(
 
     drop(cache); // Release the read lock
 
-    if all_rows.is_empty() {
-        return Ok(last_successful_block);
+    Ok(last_successful_block.map(|block| (block, all_rows)))
+}
+
+#[cfg(test)]
+async fn execute_cron_operations_batch(
+    task: &CronTask,
+    postgres: Option<Arc<PostgresClient>>,
+    clickhouse: Option<Arc<ClickhouseClient>>,
+    providers: Arc<HashMap<String, Arc<dyn ChainProvider>>>,
+    blocks: &[u64],
+    addresses_with_blocks: &HashMap<Address, u64>,
+    rate_limiter: Arc<AdaptiveRateLimiter>,
+) -> Result<Option<u64>, String> {
+    let prepared =
+        prepare_cron_operations_batch(task, providers, blocks, addresses_with_blocks, rate_limiter)
+            .await?;
+    let Some((completed, rows)) = prepared else {
+        return Ok(None);
+    };
+    if !rows.is_empty() {
+        let operation = &task.cron_entry.operations[0];
+        if let Some(postgres) = &postgres {
+            super::tables::execute_postgres_operation_internal(
+                postgres,
+                &task.full_table_name,
+                &task.table,
+                operation,
+                &rows,
+                None,
+            )
+            .await?;
+        }
+        if let Some(clickhouse) = &clickhouse {
+            super::tables::execute_clickhouse_operation_internal(
+                clickhouse,
+                &task.full_table_name,
+                &task.table,
+                operation,
+                &rows,
+            )
+            .await?;
+        }
     }
-
-    // Step 4: Write all rows to database in batch
-    let operation = &task.cron_entry.operations[0];
-
-    info!(
-        "Tables::{} - {:?} - {} rows",
-        task.table.name(),
-        operation.operation_type,
-        all_rows.len()
-    );
-
-    if let Some(postgres) = &postgres {
-        super::tables::execute_postgres_operation_internal(
-            postgres,
-            &task.full_table_name,
-            &task.table,
-            operation,
-            &all_rows,
-            None,
-        )
-        .await?;
-    }
-
-    if let Some(clickhouse) = &clickhouse {
-        super::tables::execute_clickhouse_operation_internal(
-            clickhouse,
-            &task.full_table_name,
-            &task.table,
-            operation,
-            &all_rows,
-        )
-        .await?;
-    }
-
-    Ok(last_successful_block)
+    Ok(Some(completed))
 }
 
 // Note: Prefetching is handled by the VIEW_CALL_CACHE in extract_cron_value
@@ -2071,3 +2350,7 @@ impl CronScheduler {
 #[cfg(test)]
 #[path = "cron_historical_failure_tests.rs"]
 mod cron_historical_failure_tests;
+
+#[cfg(test)]
+#[path = "cron_atomic_tests.rs"]
+mod cron_atomic_tests;

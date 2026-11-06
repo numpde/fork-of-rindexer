@@ -25,6 +25,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Mutex as StdMutex, Weak,
 };
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Default)]
