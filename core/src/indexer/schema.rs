@@ -573,3 +573,7 @@ mod tests {
         assert!(pg.as_str().contains("\"entries\" JSONB"));
     }
 }
+
+#[cfg(test)]
+#[path = "postgres_identity_tests.rs"]
+mod postgres_identity_tests;
