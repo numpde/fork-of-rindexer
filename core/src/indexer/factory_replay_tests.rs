@@ -251,6 +251,11 @@ async fn postgres_factory_cron_samples_the_child_from_its_birth_block() {
         addresses.expect("look up the admitted discovery source"),
         HashMap::from([(child, 2)])
     );
+    let unprepared =
+        CronScheduler::try_new(project.manifest(), None, None, Arc::new(HashMap::new()));
+    let error =
+        unprepared.err().expect("an unprepared factory cron cannot resolve the discovery ABI");
+    assert!(error.contains("try_new_prepared"), "{error}");
     assert_eq!(rows.len(), 1, "no pre-birth row or emitter sample");
     assert_eq!(rows[0].get::<_, String>(0), format!("{child:#x}"));
     assert_eq!(rows[0].get::<_, String>(1), format!("{child:#x}"));
