@@ -47,6 +47,7 @@ pub struct ReorgCoordinator {
     persistence: Arc<ReorgBlockHashPersistence>,
     provider: Option<Arc<dyn ChainProvider>>,
     event_tables: Vec<EventTableInfo>,
+    checkpoint_only: Vec<String>,
     derived_tables: Vec<DerivedTableInfo>,
     rollback_plan: DerivedTableRollbackPlan,
     pending_recovery: PendingRecovery,
@@ -80,6 +81,7 @@ impl ReorgCoordinator {
             event_tables,
             derived_tables,
             rollback_plan: DerivedTableRollbackPlan::default(),
+            checkpoint_only: vec![],
             pending_recovery: PendingRecovery::default(),
             streams_clients,
             blocks_since_flush: 0,
@@ -88,6 +90,11 @@ impl ReorgCoordinator {
 
     pub(crate) fn with_rollback_plan(mut self, rollback_plan: DerivedTableRollbackPlan) -> Self {
         self.rollback_plan = rollback_plan;
+        self
+    }
+
+    pub(crate) fn with_checkpoint_only(mut self, checkpoints: Vec<String>) -> Self {
+        self.checkpoint_only = checkpoints;
         self
     }
 
@@ -523,11 +530,11 @@ impl ReorgCoordinator {
             let result = reorg_task
                 .execute_with_deliveries(
                     &mut self.window,
-                    ctx.postgres,
-                    ctx.clickhouse,
+                    ctx,
                     &providers,
                     &self.rollback_plan,
                     &self.streams_clients,
+                    &self.checkpoint_only,
                 )
                 .await?;
             // No await separates commit, invalidation and removal of the request.
@@ -711,6 +718,7 @@ mod tests {
             event_tables: vec![],
             derived_tables: vec![],
             rollback_plan: DerivedTableRollbackPlan::default(),
+            checkpoint_only: vec![],
             pending_recovery: PendingRecovery::default(),
             streams_clients: vec![],
             blocks_since_flush: 0,
@@ -1268,6 +1276,7 @@ mod tests {
                 },
             ],
             rollback_plan: DerivedTableRollbackPlan::default(),
+            checkpoint_only: vec![],
             pending_recovery: PendingRecovery::default(),
             streams_clients: vec![],
             blocks_since_flush: 0,
@@ -1299,6 +1308,7 @@ mod tests {
                 journal_columns: vec![],
             }],
             rollback_plan: DerivedTableRollbackPlan::default(),
+            checkpoint_only: vec![],
             pending_recovery: PendingRecovery::default(),
             streams_clients: vec![],
             blocks_since_flush: 0,
@@ -1329,6 +1339,7 @@ mod tests {
             .unwrap()],
             derived_tables: vec![],
             rollback_plan: DerivedTableRollbackPlan::default(),
+            checkpoint_only: vec![],
             pending_recovery: PendingRecovery::default(),
             streams_clients: vec![],
             blocks_since_flush: 0,
@@ -1363,6 +1374,7 @@ mod tests {
             event_tables: vec![],
             derived_tables: vec![],
             rollback_plan: DerivedTableRollbackPlan::default(),
+            checkpoint_only: vec![],
             pending_recovery: PendingRecovery::default(),
             streams_clients,
             blocks_since_flush: 0,

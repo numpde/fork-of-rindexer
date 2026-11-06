@@ -1,7 +1,4 @@
-use alloy::{
-    dyn_abi::DynSolValue,
-    json_abi::{Event, JsonAbi},
-};
+use alloy::{dyn_abi::DynSolValue, json_abi::Event};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::{
@@ -11,25 +8,23 @@ use std::{
 };
 use tracing::{debug, error, info, warn};
 
-use super::cron_scheduler::{manifest_has_cron_tables, CronScheduler};
-use super::native_transfer::{NATIVE_TRANSFER_ABI, NATIVE_TRANSFER_CONTRACT_NAME};
+use super::cron_scheduler::CronScheduler;
+use super::native_transfer::NATIVE_TRANSFER_ABI;
+use super::schema::{PreparedContract, PreparedSchema};
 use super::tables::{
     apply_table_operations, prepare_table_operations, process_table_operations, PreparedTableOps,
     TableRuntime, TxMetadata,
 };
 use crate::database::clickhouse::client::ClickhouseClient;
-use crate::database::clickhouse::setup::{setup_clickhouse, SetupClickhouseError};
-use crate::database::generate::{
-    generate_event_table_full_name, generate_indexer_contract_schema_name,
-};
+use crate::database::clickhouse::setup::{setup_clickhouse_prepared, SetupClickhouseError};
+use crate::database::generate::GenerateTablesForIndexerSqlError;
 use crate::database::postgres::client::{pg_error_to_string, BulkCursorUpdate, CursorAdvance};
 use crate::database::postgres::event_applications::EventApplication;
-use crate::database::postgres::generate::generate_internal_event_table_name;
 use crate::database::postgres::write_mode::PgWriteMode;
 use crate::database::sql_type_wrapper::{
     map_ethereum_wrapper_to_json, map_log_params_to_ethereum_wrapper, EthereumSqlTypeWrapper,
 };
-use crate::manifest::contract::{Contract, Table};
+use crate::manifest::contract::Table;
 use crate::manifest::core::Constants;
 use crate::metrics::database as db_metrics;
 use crate::provider::ChainProvider;
@@ -39,8 +34,7 @@ use crate::{
     chat::ChatClients,
     database::postgres::{
         client::PostgresClient,
-        generate::generate_column_names_only_with_base_properties,
-        setup::{setup_postgres, SetupPostgresError},
+        setup::{setup_postgres_prepared, SetupPostgresError},
     },
     event::{
         callback_registry::{
@@ -55,13 +49,14 @@ use crate::{
     manifest::{
         contract::ParseAbiError,
         core::Manifest,
-        yaml::{read_manifest, ReadManifestError},
+        yaml::{read_manifest_prepared, ReadManifestError},
     },
     provider::{validate_manifest_network_rpc_urls, CreateNetworkProvider, RetryClientError},
     setup_info_logger,
     streams::StreamsClients,
     types::core::LogParam,
-    AsyncCsvAppender, FutureExt, IndexingDetails, StartDetails, StartNoCodeDetails,
+    AsyncCsvAppender, FutureExt, IndexingDetails, PreparedProject, StartDetails,
+    StartNoCodeDetails,
 };
 use crate::{
     event::callback_registry::TraceResult,
@@ -75,6 +70,9 @@ pub enum SetupNoCodeError {
 
     #[error("Could not read manifest: {0}")]
     CouldNotReadManifest(#[from] ReadManifestError),
+
+    #[error("Could not prepare storage schema: {0}")]
+    CouldNotPrepareSchema(#[from] GenerateTablesForIndexerSqlError),
 
     #[error("Could not setup postgres: {0}")]
     SetupPostgresError(#[from] SetupPostgresError),
@@ -105,7 +103,7 @@ pub fn resolve_table_column_types(
         }
 
         // Get ABI items to build event type map
-        let is_filter = contract.identify_and_modify_filter();
+        let is_filter = contract.is_filter();
         let abi_items = match ABIItem::get_abi_items(project_path, contract, is_filter) {
             Ok(items) => items,
             Err(e) => return Err(SetupNoCodeError::ProcessIndexersError(e.into())),
@@ -146,7 +144,7 @@ pub fn resolve_table_column_types(
 
 /// Build an `event_name -> field_name -> solidity_type` map from a list of ABI items.
 #[allow(clippy::result_large_err)]
-fn build_event_abi_types(
+pub(super) fn build_event_abi_types(
     abi_items: Vec<ABIItem>,
 ) -> Result<HashMap<String, HashMap<String, String>>, SetupNoCodeError> {
     let event_infos = ABIItem::extract_event_names_and_signatures_from_abi(abi_items)
@@ -180,10 +178,29 @@ fn resolve_tables_against_abi(
     Ok(())
 }
 
+/// Prepare and set up a no-code project as a standalone operation.
+///
+/// Each call reads the manifest and prepares a new schema. The returned
+/// [`StartDetails`] preserves the existing public API and does not retain that
+/// [`PreparedProject`]. To share one snapshot across separate setup and indexing
+/// stages, prepare a project once, pass it to [`setup_no_code_prepared`], then pass
+/// the same project to [`crate::start_rindexer_prepared`].
+/// [`crate::start_rindexer_no_code`] retains one snapshot for the complete startup.
 #[allow(clippy::result_large_err, reason = "preserve existing error API")]
 pub async fn setup_no_code(
     details: StartNoCodeDetails<'_>,
 ) -> Result<StartDetails<'_>, SetupNoCodeError> {
+    let (manifest, schema) = read_manifest_prepared(details.manifest_path)?;
+    let prepared = PreparedProject::from_parts(manifest, schema);
+    setup_no_code_prepared(details, &prepared).await
+}
+
+/// Register callbacks and set up storage from an already admitted snapshot.
+#[allow(clippy::result_large_err, reason = "preserve existing error API")]
+pub async fn setup_no_code_prepared<'a>(
+    details: StartNoCodeDetails<'a>,
+    prepared: &PreparedProject,
+) -> Result<StartDetails<'a>, SetupNoCodeError> {
     if !details.indexing_details.enabled && !details.graphql_details.enabled {
         return Err(SetupNoCodeError::NothingToStartNoCode);
     }
@@ -191,13 +208,14 @@ pub async fn setup_no_code(
 
     match project_path {
         Some(project_path) => {
-            let mut manifest = read_manifest(details.manifest_path)?;
+            let manifest = prepared.manifest();
+            let schema = prepared.schema();
             setup_info_logger();
 
             info!("Starting rindexer no code");
 
             if details.indexing_details.enabled {
-                validate_manifest_network_rpc_urls(&manifest)?;
+                validate_manifest_network_rpc_urls(manifest)?;
             }
 
             // Configure view call concurrency limit if specified
@@ -205,17 +223,17 @@ pub async fn setup_no_code(
                 crate::indexer::tables::configure_view_call_limit(limit).await;
             }
 
-            // Resolve table column types from ABI before database setup
-            resolve_table_column_types(project_path, &mut manifest)?;
-
             let mut postgres: Option<Arc<PostgresClient>> = None;
             if manifest.storage.postgres_enabled() {
-                postgres = Some(Arc::new(setup_postgres(project_path, &manifest).await?));
+                postgres =
+                    Some(Arc::new(setup_postgres_prepared(project_path, manifest, schema).await?));
             }
 
             let mut clickhouse: Option<Arc<ClickhouseClient>> = None;
             if manifest.storage.clickhouse_enabled() {
-                clickhouse = Some(Arc::new(setup_clickhouse(project_path, &manifest).await?));
+                clickhouse = Some(Arc::new(
+                    setup_clickhouse_prepared(project_path, manifest, schema).await?,
+                ));
             }
 
             if !details.indexing_details.enabled {
@@ -228,7 +246,7 @@ pub async fn setup_no_code(
                 });
             }
 
-            let network_providers = CreateNetworkProvider::create(&manifest).await?;
+            let network_providers = CreateNetworkProvider::create(manifest).await?;
             info!(
                 "Networks enabled: {}",
                 network_providers
@@ -238,9 +256,10 @@ pub async fn setup_no_code(
                     .join(", ")
             );
 
-            let events = process_events(
+            let events = process_events_prepared(
                 project_path,
-                &manifest,
+                manifest,
+                schema,
                 postgres.clone(),
                 clickhouse.clone(),
                 &network_providers,
@@ -261,9 +280,10 @@ pub async fn setup_no_code(
                     .join(", ")
             );
 
-            let trace_events = process_trace_events(
+            let trace_events = process_trace_events_prepared(
                 project_path,
-                &mut manifest,
+                manifest,
+                schema,
                 postgres.clone(),
                 clickhouse.clone(),
                 &network_providers,
@@ -288,7 +308,9 @@ pub async fn setup_no_code(
             }
 
             // Start cron scheduler if any tables have cron triggers
-            if manifest_has_cron_tables(&manifest) {
+            if schema.contracts().iter().chain(schema.native()).any(|contract| {
+                contract.tables.iter().any(|runtime| runtime.table.definition().has_cron())
+            }) {
                 let providers_map: Arc<HashMap<String, Arc<dyn ChainProvider>>> = Arc::new(
                     network_providers
                         .iter()
@@ -298,12 +320,13 @@ pub async fn setup_no_code(
                         .collect(),
                 );
 
-                let scheduler = CronScheduler::new(
-                    &manifest,
+                let scheduler = CronScheduler::try_new_prepared(
+                    schema,
                     postgres.clone(),
                     clickhouse.clone(),
                     providers_map,
-                );
+                )
+                .map_err(ProcessIndexersError::TableColumnTypeResolutionError)?;
 
                 let cron_scheduler_handle = if scheduler.has_tasks() {
                     info!("Starting cron scheduler with {} tasks", scheduler.tasks.len());
@@ -355,16 +378,14 @@ struct NoCodeCallbackParams {
     index_event_in_order: bool,
     csv: Option<Arc<AsyncCsvAppender>>,
     postgres: Option<Arc<PostgresClient>>,
-    sql_event_table_name: String,
+    raw_table: Option<String>,
+    checkpoint_table: String,
     sql_column_names: Vec<String>,
     clickhouse: Option<Arc<ClickhouseClient>>,
     streams_clients: Arc<Option<StreamsClients>>,
     chat_clients: Arc<Option<ChatClients>>,
     /// Custom tables for aggregation operations
     tables: Arc<Vec<TableRuntime>>,
-    /// Whether to store raw events in the event table.
-    /// False when event is only used for custom tables (not in include_events).
-    store_raw_events: bool,
     /// RPC providers for view calls in custom tables (keyed by network name)
     providers: Arc<HashMap<String, Arc<dyn ChainProvider>>>,
     /// User-defined constants from the manifest (can be network-scoped)
@@ -425,8 +446,10 @@ struct DecodedCallbackEvent {
 /// Apply only newly claimed PostgreSQL events and retain resolved timestamps in raw rows.
 /// Independent sinks keep the original batch membership; the caller supplies a
 /// cursor only when PostgreSQL can own it.
+#[allow(clippy::too_many_arguments)]
 async fn apply_postgres_events(
     postgres: &PostgresClient,
+    raw_table: &str,
     params: &NoCodeCallbackParams,
     applications: &[EventApplication],
     raw_rows: &mut [Vec<EthereumSqlTypeWrapper>],
@@ -437,14 +460,13 @@ async fn apply_postgres_events(
     if !is_running() {
         return Err("Shutdown requested".into());
     }
-    let schema = generate_indexer_contract_schema_name(&params.indexer_name, &params.contract_name);
-    let namespace = generate_internal_event_table_name(&schema, &params.event_info.name);
+    let namespace = &params.checkpoint_table;
     let mut connection = postgres.raw_connection().await.map_err(|error| error.to_string())?;
     let transaction = connection.transaction().await.map_err(|error| pg_error_to_string(&error))?;
     let new_events = crate::database::postgres::event_applications::claim(
         &transaction,
-        &namespace,
-        &params.sql_event_table_name,
+        namespace,
+        raw_table,
         applications,
     )
     .await?;
@@ -520,7 +542,7 @@ async fn apply_postgres_events(
             for (index,application) in applications.iter().enumerate().filter(|(index,_)| new_events[*index]) {
                 let (_,data)=messages.get(index).ok_or_else(||"Cannot record required delivery: source event payload is missing".to_string())?;
                 let message=EventMessage {event_name:params.event_info.name.clone(),event_signature_hash:params.event.selector(),network:application.tx_information.network.clone(),block_number:application.tx_information.block_number,event_data:Value::Array(vec![data.clone()])};
-                clients.enqueue_required_event(&transaction,&params.sql_event_table_name,&application.tx_information,&message).await.map_err(|error|format!("Cannot record required stream delivery in the source transaction: {error:#}"))?;
+                clients.enqueue_required_event(&transaction,raw_table,&application.tx_information,&message).await.map_err(|error|format!("Cannot record required stream delivery in the source transaction: {error:#}"))?;
             }
         }
 
@@ -530,7 +552,7 @@ async fn apply_postgres_events(
         let inserted = match cursor {
             Some(cursor) => PostgresClient::insert_bulk_with_cursor_in(
                 &transaction,
-                &params.sql_event_table_name,
+                raw_table,
                 &params.sql_column_names,
                 &rows,
                 cursor,
@@ -539,7 +561,7 @@ async fn apply_postgres_events(
             .map(Some),
             None => PostgresClient::insert_bulk_in(
                 &transaction,
-                &params.sql_event_table_name,
+                raw_table,
                 &params.sql_column_names,
                 &rows,
             )
@@ -571,11 +593,11 @@ async fn apply_postgres_events(
     match (advance, cursor) {
         (Some(CursorAdvance::Advanced { updated_rows }), Some(cursor)) => debug!(
             "ATOMIC-CURSOR commit: {} rows={} cursor[{}]={} (updated={})",
-            params.sql_event_table_name, rows.len(), cursor.internal_table_name, cursor.to_block, updated_rows,
+            raw_table, rows.len(), cursor.internal_table_name, cursor.to_block, updated_rows,
         ),
         (Some(CursorAdvance::AlreadyAhead { current }), Some(cursor)) => debug!(
             "ATOMIC-CURSOR commit: {} rows={} cursor[{}] to_block={} not advanced (already at {} — concurrent live/historic loop ahead)",
-            params.sql_event_table_name, rows.len(), cursor.internal_table_name, cursor.to_block, current,
+            raw_table, rows.len(), cursor.internal_table_name, cursor.to_block, current,
         ),
         _ => {}
     }
@@ -598,7 +620,7 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
                     params.postgres.is_some()
                         && params.clickhouse.is_none()
                         && params.csv.is_none()
-                        && params.store_raw_events,
+                        && params.raw_table.is_some(),
                 )
                 .err()
         });
@@ -776,7 +798,7 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
                 all_params.extend(event_parameters);
                 all_params.extend(end_global_parameters);
 
-                if params.postgres.is_some() && params.store_raw_events
+                if params.postgres.is_some() && params.raw_table.is_some()
                     && all_params.iter().any(EthereumSqlTypeWrapper::postgres_text_contains_nul)
                 {
                     return Err(CallbackError::Permanent(format!(
@@ -828,7 +850,7 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
             // callback obligation and callbacks commit serially. Other configurations
             // checkpoint after the whole callback; receipts still protect their PG
             // effects independently. Cursor ordering assumes one writer process.
-            let atomic_pg_cursor = params.store_raw_events
+            let atomic_pg_cursor = params.raw_table.is_some()
                 && matches!(&results, CallbackResult::Event(_))
                 && params.postgres.is_some()
                 && params.clickhouse.is_none()
@@ -847,17 +869,16 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
 
             // PostgreSQL application and whole-callback completion are separate
             // boundaries. Other sinks still receive the original input on replay.
-            let postgres_applied = match params.postgres.as_ref() {
-                Some(postgres) if params.store_raw_events => {
+            let postgres_applied = match (params.postgres.as_ref(), params.raw_table.as_deref()) {
+                (Some(postgres), Some(raw_table)) => {
                     let cursor = atomic_pg_cursor.then(|| {
-                        let schema = generate_indexer_contract_schema_name(&params.indexer_name, &params.contract_name);
                         BulkCursorUpdate {
                             cursor_key: cursor_key.clone(),
-                            internal_table_name: generate_internal_event_table_name(&schema, &params.event_info.name),
+                            internal_table_name: params.checkpoint_table.clone(),
                             network: network.clone(), to_block: to_block.to(),
                         }
                     });
-                    Some(apply_postgres_events(postgres, &params, &applications, &mut sql_bulk_data,
+                    Some(apply_postgres_events(postgres, raw_table, &params, &applications, &mut sql_bulk_data,
                         &table_events_data, cursor.as_ref(), &event_message_data).await?)
                 }
                 _ => None,
@@ -867,10 +888,10 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
                 if applied == 0 && atomic_pg_cursor { return Ok(()); }
             }
 
-            if params.store_raw_events {
+            if let Some(raw_table) = params.raw_table.as_deref() {
                 if let Some(clickhouse) = &params.clickhouse {
                     if !sql_bulk_data.is_empty() {
-                        clickhouse.insert_bulk(&params.sql_event_table_name,
+                        clickhouse.insert_bulk(raw_table,
                             &params.sql_column_names, &sql_bulk_data).await
                             .map_err(|error| {
                                 error!("{}::{} - Error performing clickhouse bulk insert: {}", params.contract_name, params.event_info.name, error);
@@ -1062,6 +1083,9 @@ fn no_code_callback(params: Arc<NoCodeCallbackParams>) -> EventCallbacks {
 
 #[derive(thiserror::Error, Debug)]
 pub enum ProcessIndexersError {
+    #[error("Could not prepare storage schema: {0}")]
+    CouldNotPrepareSchema(#[from] GenerateTablesForIndexerSqlError),
+
     #[error("Could not read ABI string: {0}")]
     CouldNotReadAbiString(#[from] io::Error),
 
@@ -1103,16 +1127,38 @@ pub async fn process_events(
     clickhouse: Option<Arc<ClickhouseClient>>,
     network_providers: &[CreateNetworkProvider],
 ) -> Result<Vec<EventCallbackRegistryInformation>, ProcessIndexersError> {
+    let schema = PreparedSchema::try_new(project_path, &manifest.to_indexer())?;
+    process_events_prepared(
+        project_path,
+        manifest,
+        &schema,
+        postgres,
+        clickhouse,
+        network_providers,
+    )
+    .await
+}
+
+/// Build event callbacks from the same declarations used for DDL and rollback.
+pub async fn process_events_prepared(
+    project_path: &Path,
+    manifest: &Manifest,
+    schema: &PreparedSchema,
+    postgres: Option<Arc<PostgresClient>>,
+    clickhouse: Option<Arc<ClickhouseClient>>,
+    network_providers: &[CreateNetworkProvider],
+) -> Result<Vec<EventCallbackRegistryInformation>, ProcessIndexersError> {
     let mut events: Vec<EventCallbackRegistryInformation> = vec![];
 
-    for mut contract in manifest.all_contracts().clone() {
-        let contract_events = process_contract(
+    for contract in schema.contracts() {
+        let contract_events = process_contract_prepared(
             project_path,
             manifest,
             postgres.clone(),
             clickhouse.clone(),
             network_providers,
-            &mut contract,
+            contract,
+            schema,
         )
         .await?;
 
@@ -1122,17 +1168,17 @@ pub async fn process_events(
     Ok(events)
 }
 
-async fn process_contract(
+async fn process_contract_prepared(
     project_path: &Path,
     manifest: &Manifest,
     postgres: Option<Arc<PostgresClient>>,
     clickhouse: Option<Arc<ClickhouseClient>>,
     network_providers: &[CreateNetworkProvider],
-    contract: &mut Contract,
+    prepared: &PreparedContract,
+    schema: &PreparedSchema,
 ) -> Result<Vec<EventCallbackRegistryInformation>, ProcessIndexersError> {
-    if contract.name.to_lowercase() == NATIVE_TRANSFER_CONTRACT_NAME.to_lowercase() {
-        return Err(ProcessIndexersError::ContractNameConflict(contract.name.to_string()));
-    }
+    let contract = &prepared.declaration;
+    let contract_name = &prepared.name;
 
     // Build providers map for view calls
     let providers: Arc<HashMap<String, Arc<dyn ChainProvider>>> = Arc::new(
@@ -1147,32 +1193,18 @@ async fn process_contract(
         manifest.networks.iter().map(|n| (n.name.clone(), n.multicall3_address.clone())).collect(),
     );
 
-    // TODO - this could be shared with `get_abi_items`
-    let abi_str = contract.parse_abi(project_path)?;
-    let abi: JsonAbi = serde_json::from_str(&abi_str)?;
-    let is_filter = contract.identify_and_modify_filter();
-    let abi_items = ABIItem::get_abi_items(project_path, contract, is_filter)?;
-    let event_names = ABIItem::extract_event_names_and_signatures_from_abi(abi_items)?;
-
     let mut events: Vec<EventCallbackRegistryInformation> = vec![];
 
-    for event_info in event_names {
-        let event_name = event_info.name.clone();
-        let event = abi
-            .events
-            .get(&event_name)
-            .and_then(|events| events.first())
-            .ok_or_else(|| {
-                ProcessIndexersError::EventNameNotFoundInAbi(
-                    contract.name.clone(),
-                    event_name.clone(),
-                )
-            })?
-            .clone();
+    let tables_arc = &prepared.tables;
 
-        let contract_information = ContractInformation::create(
-            project_path,
-            contract,
+    for prepared_event in &prepared.events {
+        let event_info = prepared_event.info.clone();
+
+        let event = &prepared_event.event;
+
+        let contract_information = ContractInformation::create_prepared(
+            prepared,
+            schema,
             network_providers,
             noop_decoder(),
             manifest,
@@ -1188,7 +1220,7 @@ async fn process_contract(
             let headers: Vec<String> = event_info.csv_headers_for_event();
             let csv_path_str = csv_path.to_str().expect("Failed to convert csv path to string");
             let csv_path =
-                event_info.create_csv_file_for_event(project_path, &contract.name, csv_path_str)?;
+                event_info.create_csv_file_for_event(project_path, contract_name, csv_path_str)?;
             let csv_appender = AsyncCsvAppender::new(&csv_path);
             if !Path::new(&csv_path).exists() {
                 csv_appender.append_header(headers).await?;
@@ -1197,9 +1229,7 @@ async fn process_contract(
             csv = Some(Arc::new(csv_appender));
         }
 
-        let sql_column_names = generate_column_names_only_with_base_properties(&event_info.inputs);
-        let sql_event_table_name =
-            generate_event_table_full_name(&manifest.name, &contract.name, &event_info.name);
+        let sql_column_names = prepared_event.columns.column_names().to_vec();
 
         let streams_client = if let Some(streams) = &contract.streams {
             Some(StreamsClients::new(streams.clone()).await)
@@ -1218,28 +1248,10 @@ async fn process_contract(
             .as_ref()
             .is_some_and(|vec| vec.contains(&event_info.name));
 
-        // Build custom tables for this contract
-        let contract_tables: Vec<TableRuntime> = contract
-            .tables
-            .as_ref()
-            .map(|tables| {
-                tables
-                    .iter()
-                    .map(|table| TableRuntime::new(table.clone(), &manifest.name, &contract.name))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        // Store raw events when this event's raw event table exists — same
-        // predicate the DDL and migrations use (include_events plus events
-        // that drive custom tables, the reorg recomputation source of truth)
-        let store_raw_events = contract.stores_raw_events(&event_name);
-
         let is_factory_event = contract.is_factory_only_event(&event_info.name);
         let atomic_safe_concurrency =
             index_event_in_order || manifest.config.callback_concurrency.unwrap_or(1) <= 1;
 
-        let tables_arc = Arc::new(contract_tables);
         let streams_arc = Arc::new(streams_client);
         let event = EventCallbackRegistryInformation {
             id: generate_random_id(10),
@@ -1251,18 +1263,19 @@ async fn process_contract(
             callback: no_code_callback(Arc::new(NoCodeCallbackParams {
                 event_info,
                 indexer_name: manifest.name.clone(),
-                contract_name: contract.name.clone(),
+                contract_name: contract_name.clone(),
                 event: event.clone(),
                 index_event_in_order,
                 csv,
                 postgres: postgres.clone(),
                 clickhouse: clickhouse.clone(),
-                sql_event_table_name,
+                raw_table: prepared_event.raw_table.clone(),
+                checkpoint_table: prepared_event.checkpoint_table.clone(),
                 sql_column_names,
                 streams_clients: Arc::clone(&streams_arc),
                 chat_clients: Arc::new(chat_clients),
-                tables: Arc::clone(&tables_arc),
-                store_raw_events,
+                tables: Arc::clone(tables_arc),
+
                 providers: providers.clone(),
                 constants: Arc::new(manifest.constants.clone()),
                 multicall_addresses: multicall_addresses.clone(),
@@ -1270,7 +1283,7 @@ async fn process_contract(
                 atomic_safe_concurrency,
             }))
             .event_callback,
-            tables: tables_arc,
+            tables: Arc::clone(tables_arc),
             reorg_sender: None,
             streams_clients: streams_arc,
             providers: providers.clone(),
@@ -1291,59 +1304,44 @@ pub async fn process_trace_events(
     clickhouse: Option<Arc<ClickhouseClient>>,
     network_providers: &[CreateNetworkProvider],
 ) -> Result<Vec<TraceCallbackRegistryInformation>, ProcessIndexersError> {
+    let schema = PreparedSchema::try_new(project_path, &manifest.to_indexer())?;
+    process_trace_events_prepared(
+        project_path,
+        manifest,
+        &schema,
+        postgres,
+        clickhouse,
+        network_providers,
+    )
+    .await
+}
+
+/// Register native-transfer callbacks using the admitted synthetic event schema.
+pub async fn process_trace_events_prepared(
+    project_path: &Path,
+    manifest: &Manifest,
+    schema: &PreparedSchema,
+    postgres: Option<Arc<PostgresClient>>,
+    clickhouse: Option<Arc<ClickhouseClient>>,
+    network_providers: &[CreateNetworkProvider],
+) -> Result<Vec<TraceCallbackRegistryInformation>, ProcessIndexersError> {
     let mut events: Vec<TraceCallbackRegistryInformation> = vec![];
 
-    if !manifest.has_enabled_native_transfers() {
+    let Some(prepared) = schema.native() else {
         return Ok(events);
-    }
-
-    let abi_str = NATIVE_TRANSFER_ABI;
-    let abi: JsonAbi = serde_json::from_str(abi_str)?;
-
-    #[allow(clippy::useless_conversion)]
-    let abi_items: Vec<ABIItem> = serde_json::from_str(abi_str)?;
-    let event_names = ABIItem::extract_event_names_and_signatures_from_abi(abi_items)?;
+    };
 
     let contract = &manifest.native_transfers;
-    let contract_name = NATIVE_TRANSFER_CONTRACT_NAME.to_string();
+    let contract_name = &prepared.name;
 
-    for event_info in event_names {
-        let event_name = event_info.name.clone();
-        let event = &abi
-            .events
-            .iter()
-            .find(|(name, _)| *name == &event_name)
-            .map(|(_, event)| event)
-            .ok_or_else(|| {
-                ProcessIndexersError::EventNameNotFoundInAbi(
-                    contract_name.clone(),
-                    event_name.clone(),
-                )
-            })?
-            .first()
-            .ok_or_else(|| {
-                ProcessIndexersError::EventNameNotFoundInAbi(
-                    contract_name.clone(),
-                    event_name.clone(),
-                )
-            })?
-            .clone();
+    let nt_tables_arc = &prepared.tables;
+
+    for prepared_event in &prepared.events {
+        let event_info = prepared_event.info.clone();
+        let event = &prepared_event.event;
 
         let trace_information =
             TraceInformation::create(manifest.native_transfers.clone(), network_providers)?;
-
-        let nt_tables: Vec<TableRuntime> = manifest
-            .native_transfers
-            .tables
-            .as_ref()
-            .map(|tables| {
-                tables
-                    .iter()
-                    .map(|table| TableRuntime::new(table.clone(), &manifest.name, &contract_name))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let nt_tables_arc = Arc::new(nt_tables);
 
         let mut csv: Option<Arc<AsyncCsvAppender>> = None;
         if contract.generate_csv.unwrap_or(true) && manifest.storage.csv_enabled() {
@@ -1355,7 +1353,7 @@ pub async fn process_trace_events(
             let headers: Vec<String> = event_info.csv_headers_for_event();
             let csv_path_str = csv_path.to_str().expect("Failed to convert csv path to string");
             let csv_path =
-                event_info.create_csv_file_for_event(project_path, &contract_name, csv_path_str)?;
+                event_info.create_csv_file_for_event(project_path, contract_name, csv_path_str)?;
             let csv_appender = AsyncCsvAppender::new(&csv_path);
             if !Path::new(&csv_path).exists() {
                 csv_appender.append_header(headers).await?;
@@ -1364,9 +1362,7 @@ pub async fn process_trace_events(
             csv = Some(Arc::new(csv_appender));
         }
 
-        let sql_column_names = generate_column_names_only_with_base_properties(&event_info.inputs);
-        let sql_event_table_name =
-            generate_event_table_full_name(&manifest.name, &contract_name, &event_info.name);
+        let sql_column_names = prepared_event.columns.column_names().to_vec();
 
         let streams_client = if let Some(streams) = &contract.streams {
             Some(StreamsClients::new(streams.clone()).await)
@@ -1407,12 +1403,13 @@ pub async fn process_trace_events(
             csv,
             postgres: postgres.clone(),
             clickhouse: clickhouse.clone(),
-            sql_event_table_name,
+            raw_table: prepared_event.raw_table.clone(),
+            checkpoint_table: prepared_event.checkpoint_table.clone(),
             sql_column_names,
             streams_clients: Arc::clone(&streams_arc),
             chat_clients: Arc::new(chat_clients),
-            tables: nt_tables_arc.clone(),
-            store_raw_events: true, // Native transfers always store raw events
+            tables: Arc::clone(nt_tables_arc),
+
             providers,
             constants: Arc::new(manifest.constants.clone()),
             multicall_addresses,
@@ -1430,7 +1427,7 @@ pub async fn process_trace_events(
             contract_name: contract_name.clone(),
             trace_information: trace_information.clone(),
             callback: no_code_callback(callback_params).trace_callback,
-            tables: nt_tables_arc,
+            tables: Arc::clone(nt_tables_arc),
             streams_clients: streams_arc,
         };
 

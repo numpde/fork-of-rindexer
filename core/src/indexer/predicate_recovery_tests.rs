@@ -159,12 +159,11 @@ async fn postgres_string_predicates_require_equivalent_recovery_or_startup_refus
             json!([]),
         )
         .await;
-        let mut source_types = std::collections::HashMap::new();
-        crate::indexer::start::collect_source_column_types(
+        let source_types = crate::indexer::reorg::task::RollbackEventSource::new(
+            "Value",
             &fixture.params.event_info.inputs,
-            None,
-            &mut source_types,
-        );
+        )
+        .unwrap();
         let mut derived = std::collections::HashMap::new();
         let mut plans = std::collections::HashMap::new();
         let admitted = crate::indexer::start::build_derived_tables_for_event(
@@ -182,10 +181,7 @@ async fn postgres_string_predicates_require_equivalent_recovery_or_startup_refus
             assert!(error.contains("string") && error.contains("predicate"), "{error}");
             let raw: i64 = fixture
                 .client
-                .query_one(
-                    &format!("SELECT count(*) FROM {}", fixture.params.sql_event_table_name),
-                    &[],
-                )
+                .query_one(&format!("SELECT count(*) FROM {}", fixture.params.stored_table()), &[])
                 .await
                 .unwrap()
                 .get(0);
@@ -298,7 +294,7 @@ async fn postgres_legacy_string_or_untyped_predicates_fail_without_changing_hist
                 table.clone(),
                 false,
                 vec![DerivedTableRollbackOp::try_new(
-                    fixture.params.sql_event_table_name.clone(),
+                    fixture.params.stored_table().to_owned(),
                     vec![],
                     vec![DerivedColumnRollback::try_new(
                         "amount".into(),
@@ -316,11 +312,14 @@ async fn postgres_legacy_string_or_untyped_predicates_fail_without_changing_hist
         };
         let mut source_types = std::collections::HashMap::new();
         if typed {
-            crate::indexer::start::collect_source_column_types(
+            source_types = crate::indexer::reorg::task::RollbackEventSource::new(
+                "Value",
                 &fixture.params.event_info.inputs,
-                None,
-                &mut source_types,
-            );
+            )
+            .unwrap()
+            .types
+            .as_ref()
+            .clone();
         }
         let mut plan = DerivedTableRollbackPlan::default();
         plan.try_add_operation(

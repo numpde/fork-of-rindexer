@@ -13246,9 +13246,12 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "testcontainers-modules",
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",
  "tokio",
+ "tokio-postgres",
+ "url",
 ]
 
 [[package]]

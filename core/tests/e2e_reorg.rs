@@ -5,10 +5,7 @@
 //! `cargo test`:
 //!   cargo nextest run -q -p rindexer --test e2e_reorg
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 
 use alloy::primitives::{Address, B256};
 use reqwest::Client as HttpClient;
@@ -21,9 +18,9 @@ use rindexer::indexer::reorg::{
     },
     window::{BlockChainWindow, ParentValidation},
 };
-use rindexer::manifest::contract::{ColumnType, IterateBinding, SetAction};
-use rindexer::ClickhouseClient;
+use rindexer::manifest::contract::{SetAction, Table};
 use rindexer::PostgresClient;
+use rindexer::{ABIItem, ClickhouseClient};
 use rust_decimal::Decimal;
 use serde_json::{json, Value};
 use testcontainers::runners::AsyncRunner;
@@ -33,6 +30,91 @@ use testcontainers_modules::postgres::Postgres;
 
 #[path = "support/anvil.rs"]
 mod anvil;
+
+/// The scalar Ping/Pong fixtures use an address sender/recipient, a uint256 id,
+/// NUMERIC accumulators and address keys (the named counter uses VARCHAR).
+/// Declare that ABI and the logical destination columns once; recovery derives
+/// its storage names, types, and operation indexes from these declarations.
+fn ping_pong_rollback_plan(task: &ReorgTask) -> DerivedTableRollbackPlan {
+    let mut plan = DerivedTableRollbackPlan::default();
+    for table in &task.derived_tables {
+        if table.rollback_ops.is_empty() {
+            continue;
+        }
+        let (database, name) = table.full_table_name.split_once('.').unwrap();
+        assert_eq!(database, "test_schema");
+        let mut columns: Vec<Value> = Vec::new();
+        let mut mappings: Vec<Value> = Vec::new();
+        let mut events: Vec<ABIItem> = Vec::new();
+        for operation in &table.rollback_ops {
+            let (source_schema, event_name) = operation.event_table.split_once('.').unwrap();
+            assert_eq!(source_schema, "test_schema");
+            let mut where_clause = serde_json::Map::new();
+            for (derived, source) in &operation.where_columns {
+                assert!(
+                    matches!(source.as_str(), "sender" | "to"),
+                    "declare the fixture's new source type"
+                );
+                let kind = match derived.as_str() {
+                    "counter_name" => "string",
+                    "user_address" | "user_addr" | "holder" => "address",
+                    _ => panic!("declare the fixture's new key type: {derived}"),
+                };
+                if !columns.iter().any(|column| column["name"] == *derived) {
+                    columns.push(json!({"name":derived,"type":kind}));
+                }
+                where_clause.insert(derived.clone(), json!(format!("${source}")));
+            }
+            let mut set = Vec::new();
+            for column in &operation.columns {
+                assert_eq!(column.event_column, "id", "declare the fixture's new numeric source");
+                if !columns.iter().any(|declared| declared["name"] == column.derived_column) {
+                    columns.push(json!({"name":column.derived_column,"type":"uint256"}));
+                }
+                let mut assignment = json!({
+                    "column":column.derived_column,"action":column.action
+                });
+                if !column.action.is_counter_action() {
+                    assignment["value"] = json!(format!("${}", column.event_column));
+                }
+                set.push(assignment);
+            }
+            let declared = json!({
+                "type":"upsert", "where":where_clause, "set":set,
+                "if":operation.condition
+            });
+            if let Some(mapping) =
+                mappings.iter_mut().find(|mapping| mapping["event"] == event_name)
+            {
+                mapping["operations"].as_array_mut().unwrap().push(declared);
+            } else {
+                mappings.push(json!({"event":event_name,"operations":[declared]}));
+                events.push(
+                    serde_json::from_value(json!({
+                        "name":event_name,"type":"event","anonymous":false,
+                        "inputs":[
+                            {"name":"sender","type":"address","indexed":false},
+                            {"name":"to","type":"address","indexed":false},
+                            {"name":"id","type":"uint256","indexed":false}
+                        ]
+                    }))
+                    .unwrap(),
+                );
+            }
+        }
+        let declaration: Table = serde_json::from_value(json!({
+            "name":name,"database":database,"cross_chain":table.cross_chain,
+            "columns":columns,"events":mappings
+        }))
+        .unwrap();
+        let mut declared_tables = Vec::new();
+        // These fixtures explicitly create the test_schema raw tables. The
+        // indexer/contract pair below gives the same schema through normal naming.
+        plan.try_add_table_events(&mut declared_tables, "test", "schema", &events, &declaration)
+            .unwrap();
+    }
+    plan
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -2153,9 +2235,15 @@ async fn test_reorg_reversal_add() {
     let rindexer_pg = env.rindexer_pg().await;
     let mut task_window = BlockChainWindow::try_new(256).unwrap();
 
-    task.execute(&mut task_window, Some(&rindexer_pg), None, None)
-        .await
-        .expect("add reversal reorg task failed");
+    task.execute_with_rollback_plan(
+        &mut task_window,
+        Some(&rindexer_pg),
+        None,
+        None,
+        &ping_pong_rollback_plan(&task),
+    )
+    .await
+    .expect("add reversal reorg task failed");
 
     // balance was 180, events at block2 (id=50) + block3 (id=30) = 80 subtracted → 100
     let balance: rust_decimal::Decimal = pg
@@ -2265,9 +2353,15 @@ async fn test_reorg_reversal_reserved_word_column() {
     let rindexer_pg = env.rindexer_pg().await;
     let mut task_window = BlockChainWindow::try_new(256).unwrap();
 
-    task.execute(&mut task_window, Some(&rindexer_pg), None, None)
-        .await
-        .expect("reserved-word reversal reorg task failed");
+    task.execute_with_rollback_plan(
+        &mut task_window,
+        Some(&rindexer_pg),
+        None,
+        None,
+        &ping_pong_rollback_plan(&task),
+    )
+    .await
+    .expect("reserved-word reversal reorg task failed");
 
     // 180 - (50 + 30) = 100 after reversing blocks 2 and 3.
     let total: rust_decimal::Decimal = pg
@@ -2359,9 +2453,15 @@ async fn test_reorg_reversal_subtract() {
     let rindexer_pg = env.rindexer_pg().await;
     let mut task_window = BlockChainWindow::try_new(256).unwrap();
 
-    task.execute(&mut task_window, Some(&rindexer_pg), None, None)
-        .await
-        .expect("subtract reversal reorg task failed");
+    task.execute_with_rollback_plan(
+        &mut task_window,
+        Some(&rindexer_pg),
+        None,
+        None,
+        &ping_pong_rollback_plan(&task),
+    )
+    .await
+    .expect("subtract reversal reorg task failed");
 
     // debt was 800, reversal adds back 200 → 1000
     let debt: rust_decimal::Decimal = pg
@@ -2454,9 +2554,15 @@ async fn test_reorg_reversal_increment() {
     let rindexer_pg = env.rindexer_pg().await;
     let mut task_window = BlockChainWindow::try_new(256).unwrap();
 
-    task.execute(&mut task_window, Some(&rindexer_pg), None, None)
-        .await
-        .expect("increment reversal reorg task failed");
+    task.execute_with_rollback_plan(
+        &mut task_window,
+        Some(&rindexer_pg),
+        None,
+        None,
+        &ping_pong_rollback_plan(&task),
+    )
+    .await
+    .expect("increment reversal reorg task failed");
 
     // counter was 3, two events in reorg range → decremented by 2 → 1
     let count: rust_decimal::Decimal = pg
@@ -2538,7 +2644,7 @@ async fn test_reorg_reversal_with_condition() {
                     action: SetAction::Add,
                 }],
                 // Only events where id > 7 were accumulated
-                condition: Some("id::NUMERIC > 7".to_string()),
+                condition: Some("$id > 7".to_string()),
             }],
             journal_columns: vec![],
         }],
@@ -2548,8 +2654,19 @@ async fn test_reorg_reversal_with_condition() {
     let rindexer_pg = env.rindexer_pg().await;
     let mut task_window = BlockChainWindow::try_new(256).unwrap();
 
+    let rollback_plan = ping_pong_rollback_plan(&task);
+    // The declaration is valid; corrupt the public task afterward to check that
+    // runtime validation still rejects legacy SQL before changing any data.
+    task.derived_tables[0].rollback_ops[0].condition = Some("id::NUMERIC > 7".to_string());
+
     let error = task
-        .execute(&mut task_window, Some(&rindexer_pg), None, None)
+        .execute_with_rollback_plan(
+            &mut task_window,
+            Some(&rindexer_pg),
+            None,
+            None,
+            &rollback_plan,
+        )
         .await
         .err()
         .expect("legacy SQL must fail before changing canonical data");
@@ -2576,19 +2693,6 @@ async fn test_reorg_reversal_with_condition() {
 
     // Retry only after expressing the same numeric predicate in filter syntax.
     task.derived_tables[0].rollback_ops[0].condition = Some("$id > 7".to_string());
-    let mut rollback_plan = DerivedTableRollbackPlan::default();
-    rollback_plan
-        .try_add_operation(
-            "test_schema.filtered_balances".into(),
-            0,
-            vec![],
-            HashMap::from([
-                ("id".into(), ColumnType::Uint256),
-                ("sender".into(), ColumnType::Address),
-            ]),
-            HashMap::from([("balance".into(), ColumnType::Uint256)]),
-        )
-        .unwrap();
     task.execute_with_rollback_plan(
         &mut task_window,
         Some(&rindexer_pg),
@@ -2634,7 +2738,7 @@ async fn test_reorg_reversal_transfer_batch_iterate() {
              network VARCHAR(50) NOT NULL PRIMARY KEY,
              last_synced_block NUMERIC NOT NULL
          );
-         CREATE TABLE test_schema.erc1155_transfer_batch (
+         CREATE TABLE test_schema.transfer_batch (
              rindexer_id SERIAL PRIMARY KEY,
              operator CHAR(42) NOT NULL,
              \"from\" CHAR(42) NOT NULL,
@@ -2671,7 +2775,7 @@ async fn test_reorg_reversal_transfer_batch_iterate() {
     .await
     .unwrap();
     ch.execute(
-        "CREATE TABLE test_schema.erc1155_transfer_batch (
+        "CREATE TABLE test_schema.transfer_batch (
              operator FixedString(42),
              `from` FixedString(42),
              `to` FixedString(42),
@@ -2710,7 +2814,7 @@ async fn test_reorg_reversal_transfer_batch_iterate() {
     let zero_tx = "0x0000000000000000000000000000000000000000000000000000000000000000";
     let block_hash = zero_tx;
     pg.execute(
-        "INSERT INTO test_schema.erc1155_transfer_batch
+        "INSERT INTO test_schema.transfer_batch
          (operator, \"from\", \"to\", ids, values, from_enabled, to_enabled, tx_hash, block_number,
           block_hash, network, tx_index, log_index)
          VALUES ($1, $2, $3, ARRAY['101', '202']::VARCHAR(78)[],
@@ -2721,7 +2825,7 @@ async fn test_reorg_reversal_transfer_batch_iterate() {
     .await
     .unwrap();
     ch.execute(&format!(
-        "INSERT INTO test_schema.erc1155_transfer_batch
+        "INSERT INTO test_schema.transfer_batch
          (operator, `from`, `to`, ids, values, from_enabled, to_enabled, tx_hash, block_number, block_hash,
           network, tx_index, log_index)
          VALUES ('{sender}', '{sender}', '{recipient}', [101, 202], [7, 11], 1, 1,
@@ -2736,7 +2840,7 @@ async fn test_reorg_reversal_transfer_batch_iterate() {
     for (log_index, user, amounts) in [(0, sender, [20u64, 30]), (1, recipient, [1, 2])] {
         let values = amounts.map(|amount| amount.to_string()).to_vec();
         pg.execute(
-            "INSERT INTO test_schema.erc1155_transfer_batch
+            "INSERT INTO test_schema.transfer_batch
              (operator, \"from\", \"to\", ids, values, from_enabled, to_enabled, tx_hash, block_number,
               block_hash, network, tx_index, log_index)
              VALUES ($1, $2, $3, ARRAY['101', '202']::VARCHAR(78)[], $4, FALSE, TRUE,
@@ -2755,7 +2859,7 @@ async fn test_reorg_reversal_transfer_batch_iterate() {
         .await
         .unwrap();
         ch.execute(&format!(
-            "INSERT INTO test_schema.erc1155_transfer_batch
+            "INSERT INTO test_schema.transfer_batch
              (operator, `from`, `to`, ids, values, from_enabled, to_enabled, tx_hash, block_number, block_hash,
               network, tx_index, log_index)
              VALUES ('{sender}', '{zero_address}', '{user}', [101, 202], [{}, {}], 0, 1,
@@ -2802,79 +2906,59 @@ async fn test_reorg_reversal_transfer_batch_iterate() {
         .unwrap();
     }
 
-    let iterate = vec![
-        IterateBinding::parse("$ids as token_id").unwrap(),
-        IterateBinding::parse("$values as amount").unwrap(),
-    ];
-    let source_column_types = HashMap::from([
-        ("from".to_string(), ColumnType::Address),
-        ("to".to_string(), ColumnType::Address),
-        ("from_enabled".to_string(), ColumnType::Bool),
-        ("to_enabled".to_string(), ColumnType::Bool),
-        ("ids".to_string(), ColumnType::Array(Box::new(ColumnType::Uint256))),
-        ("values".to_string(), ColumnType::Array(Box::new(ColumnType::Uint256))),
-    ]);
-    let derived_column_types = HashMap::from([
-        ("user_address".to_string(), ColumnType::Address),
-        ("token_id".to_string(), ColumnType::Uint256),
-        ("balance".to_string(), ColumnType::Uint256),
-    ]);
-    let rollback_op = |user_field: &str, action: SetAction, condition: &str| {
-        DerivedTableRollbackOp::try_new(
-            "test_schema.erc1155_transfer_batch".to_string(),
-            vec![
-                ("user_address".to_string(), user_field.to_string()),
-                ("token_id".to_string(), "token_id".to_string()),
-            ],
-            vec![DerivedColumnRollback::try_new(
-                "balance".to_string(),
-                "amount".to_string(),
-                action,
-            )
-            .unwrap()],
-            Some(condition.to_string()),
-        )
-        .unwrap()
-    };
+    let event: ABIItem = serde_json::from_value(json!({
+        "name":"TransferBatch","type":"event","anonymous":false,
+        "inputs":[
+            {"name":"operator","type":"address","indexed":false},
+            {"name":"from","type":"address","indexed":false},
+            {"name":"to","type":"address","indexed":false},
+            {"name":"ids","type":"uint256[]","indexed":false},
+            {"name":"values","type":"uint256[]","indexed":false},
+            {"name":"from_enabled","type":"bool","indexed":false},
+            {"name":"to_enabled","type":"bool","indexed":false}
+        ]
+    }))
+    .unwrap();
     // The fixture records explicit admission flags: canonical mints do not
     // debit the zero address, while the orphan transfer enables both effects.
     // Address predicates themselves are refused by typed recovery admission.
-    let rollback_ops = vec![
-        rollback_op("from", SetAction::Subtract, "$from_enabled == true"),
-        rollback_op("to", SetAction::Add, "$to_enabled == true"),
-    ];
-    let derived_table = "test_schema.custody_balances".to_string();
+    let table: Table = serde_json::from_value(json!({
+        "name":"custody_balances","database":"test_schema",
+        "columns":[
+            {"name":"user_address","type":"address"},
+            {"name":"token_id","type":"uint256"},
+            {"name":"balance","type":"uint256"}
+        ],
+        "events":[{"event":"TransferBatch", "iterate":["$ids as token_id","$values as amount"],
+            "operations":[
+                {"type":"upsert","where":{"user_address":"$from","token_id":"$token_id"},
+                 "if":"$from_enabled == true",
+                 "set":[{"column":"balance","action":"subtract","value":"$amount"}]},
+                {"type":"upsert","where":{"user_address":"$to","token_id":"$token_id"},
+                 "if":"$to_enabled == true",
+                 "set":[{"column":"balance","action":"add","value":"$amount"}]}
+            ]}]
+    }))
+    .unwrap();
+    let mut derived_tables = Vec::new();
     let mut rollback_plan = DerivedTableRollbackPlan::default();
-    for operation_index in 0..rollback_ops.len() {
-        rollback_plan
-            .try_add_operation(
-                derived_table.clone(),
-                operation_index,
-                iterate.clone(),
-                source_column_types.clone(),
-                derived_column_types.clone(),
-            )
-            .unwrap();
-    }
+    rollback_plan
+        .try_add_table_event(&mut derived_tables, "test", "schema", &event, &table)
+        .unwrap();
     let task = ReorgTask {
         network: network.to_string(),
         fork_point: block2,
         detection_point: block2,
         event_tables: vec![EventTableInfo::try_new(
             "test_schema".to_string(),
-            "erc1155_transfer_batch".to_string(),
+            "transfer_batch".to_string(),
             "test_schema_transfer_batch".to_string(),
             "test_indexer".to_string(),
             "Erc1155".to_string(),
             "TransferBatch".to_string(),
         )
         .unwrap()],
-        derived_tables: vec![DerivedTableInfo {
-            full_table_name: derived_table,
-            cross_chain: false,
-            rollback_ops,
-            journal_columns: vec![],
-        }],
+        derived_tables,
         canonical_blocks: vec![],
     };
 
@@ -2885,7 +2969,7 @@ async fn test_reorg_reversal_transfer_batch_iterate() {
 
     let rindexer_pg = env.rindexer_pg().await;
     pg.batch_execute(&format!(
-        "UPDATE test_schema.erc1155_transfer_batch
+        "UPDATE test_schema.transfer_batch
          SET values = ARRAY['7']::VARCHAR(78)[] WHERE block_number = {block2}"
     ))
     .await
@@ -2908,14 +2992,11 @@ async fn test_reorg_reversal_transfer_batch_iterate() {
         error.to_string().contains("unequal lengths"),
         "unexpected unequal-iterate error: {error:#}"
     );
-    let raw_rows: i64 = pg
-        .query_one("SELECT count(*) FROM test_schema.erc1155_transfer_batch", &[])
-        .await
-        .unwrap()
-        .get(0);
+    let raw_rows: i64 =
+        pg.query_one("SELECT count(*) FROM test_schema.transfer_batch", &[]).await.unwrap().get(0);
     assert_eq!(raw_rows, 3, "failed preflight must preserve canonical and orphan events");
     pg.batch_execute(&format!(
-        "UPDATE test_schema.erc1155_transfer_batch
+        "UPDATE test_schema.transfer_batch
          SET values = ARRAY['7', '11']::VARCHAR(78)[] WHERE block_number = {block2}"
     ))
     .await
@@ -2968,14 +3049,11 @@ async fn test_reorg_reversal_transfer_batch_iterate() {
         assert_eq!(ch_balance, expected);
     }
 
-    let remaining_events: i64 = pg
-        .query_one("SELECT count(*) FROM test_schema.erc1155_transfer_batch", &[])
-        .await
-        .unwrap()
-        .get(0);
+    let remaining_events: i64 =
+        pg.query_one("SELECT count(*) FROM test_schema.transfer_batch", &[]).await.unwrap().get(0);
     assert_eq!(remaining_events, 2, "only canonical mint events should survive rollback");
     let remaining_ch_events: u64 =
-        ch.query_one("SELECT count() FROM test_schema.erc1155_transfer_batch FINAL").await.unwrap();
+        ch.query_one("SELECT count() FROM test_schema.transfer_batch FINAL").await.unwrap();
     assert_eq!(remaining_ch_events, 2, "ClickHouse must retain the canonical mint events");
     let checkpoint: Decimal = pg
         .query_one(
@@ -3088,26 +3166,36 @@ async fn test_reorg_reversal_expands_postgres_jsonb_tuple_arrays() {
         .unwrap();
     }
 
-    let derived_table = "test_schema.account_balances".to_string();
+    let event: ABIItem = serde_json::from_value(json!({
+        "name":"AccountBatch","type":"event","anonymous":false,
+        "inputs":[
+            {"name":"accounts","type":"tuple[]","indexed":false,"components":[
+                {"name":"owner","type":"address"},
+                {"name":"tokenAmount","type":"uint256"}
+            ]},
+            {"name":"values","type":"uint256[]","indexed":false}
+        ]
+    }))
+    .unwrap();
+    let table: Table = serde_json::from_value(json!({
+        "name":"account_balances","database":"test_schema",
+        "columns":[
+            {"name":"owner","type":"address"},
+            {"name":"balance","type":"uint256"},
+            // A later phase deliberately targets this declared but physically
+            // missing column to exercise rollback after SQL has begun.
+            {"name":"missing_balance","type":"uint256"}
+        ],
+        "events":[{"event":"AccountBatch", "iterate":["$accounts as account","$values as value"],
+            "operations":[{"type":"upsert","where":{"owner":"$account.owner"},
+                "if":"$account.tokenAmount > 0",
+                "set":[{"column":"balance","action":"add","value":"$account.tokenAmount"}]}]}]
+    }))
+    .unwrap();
+    let mut derived_tables = Vec::new();
     let mut rollback_plan = DerivedTableRollbackPlan::default();
     rollback_plan
-        .try_add_operation(
-            derived_table.clone(),
-            0,
-            vec![
-                IterateBinding::parse("$accounts as account").unwrap(),
-                IterateBinding::parse("$values as value").unwrap(),
-            ],
-            HashMap::from([
-                ("accounts.owner".to_string(), ColumnType::Address),
-                ("accounts.tokenAmount".to_string(), ColumnType::Uint256),
-                ("values".to_string(), ColumnType::Array(Box::new(ColumnType::Uint256))),
-            ]),
-            HashMap::from([
-                ("owner".to_string(), ColumnType::Address),
-                ("balance".to_string(), ColumnType::Uint256),
-            ]),
-        )
+        .try_add_table_event(&mut derived_tables, "test", "schema", &event, &table)
         .unwrap();
     let mut task = ReorgTask {
         network: network.to_string(),
@@ -3122,23 +3210,7 @@ async fn test_reorg_reversal_expands_postgres_jsonb_tuple_arrays() {
             "AccountBatch".to_string(),
         )
         .unwrap()],
-        derived_tables: vec![DerivedTableInfo {
-            full_table_name: derived_table,
-            cross_chain: false,
-            rollback_ops: vec![DerivedTableRollbackOp::try_new(
-                "test_schema.account_batch".to_string(),
-                vec![("owner".to_string(), "account.owner".to_string())],
-                vec![DerivedColumnRollback::try_new(
-                    "balance".to_string(),
-                    "account.tokenAmount".to_string(),
-                    SetAction::Add,
-                )
-                .unwrap()],
-                Some("$account.tokenAmount > 0".to_string()),
-            )
-            .unwrap()],
-            journal_columns: vec![],
-        }],
+        derived_tables,
         canonical_blocks: vec![],
     };
     let rindexer_pg = env.rindexer_pg().await;
@@ -3510,9 +3582,15 @@ async fn test_reorg_reversal_decrement() {
     let rindexer_pg = env.rindexer_pg().await;
     let mut task_window = BlockChainWindow::try_new(256).unwrap();
 
-    task.execute(&mut task_window, Some(&rindexer_pg), None, None)
-        .await
-        .expect("decrement reversal reorg task failed");
+    task.execute_with_rollback_plan(
+        &mut task_window,
+        Some(&rindexer_pg),
+        None,
+        None,
+        &ping_pong_rollback_plan(&task),
+    )
+    .await
+    .expect("decrement reversal reorg task failed");
 
     // Was 7, 2 decrements reversed (incremented) → 9
     let remaining: rust_decimal::Decimal = pg
@@ -3742,9 +3820,15 @@ async fn test_reorg_mixed_reversible_and_journal() {
     let rindexer_pg = env.rindexer_pg().await;
     let mut task_window = BlockChainWindow::try_new(256).unwrap();
 
-    task.execute(&mut task_window, Some(&rindexer_pg), None, None)
-        .await
-        .expect("mixed reversal+journal reorg task failed");
+    task.execute_with_rollback_plan(
+        &mut task_window,
+        Some(&rindexer_pg),
+        None,
+        None,
+        &ping_pong_rollback_plan(&task),
+    )
+    .await
+    .expect("mixed reversal+journal reorg task failed");
 
     // total_volume: was 800, reversed Add of 500+200 = 700 → 100
     // max_trade: journal block2(500)+block3(200) deleted, remaining block1(100) → MAX = 100
@@ -3855,9 +3939,15 @@ async fn test_reorg_reversal_uninvolved_row_unchanged() {
     let rindexer_pg = env.rindexer_pg().await;
     let mut task_window = BlockChainWindow::try_new(256).unwrap();
 
-    task.execute(&mut task_window, Some(&rindexer_pg), None, None)
-        .await
-        .expect("uninvolved row reorg task failed");
+    task.execute_with_rollback_plan(
+        &mut task_window,
+        Some(&rindexer_pg),
+        None,
+        None,
+        &ping_pong_rollback_plan(&task),
+    )
+    .await
+    .expect("uninvolved row reorg task failed");
 
     // deployer balance: was 80, reversed Add of 30 (block2 only) → 50
     let deployer_bal: rust_decimal::Decimal = pg
@@ -4003,7 +4093,16 @@ async fn test_reorg_clickhouse_add_reversal() {
 
     task.derived_tables[0].rollback_ops[0].columns[0].derived_column =
         "missing_balance".to_string();
-    let error = match task.execute(&mut task_window, None, Some(&ch), None).await {
+    let error = match task
+        .execute_with_rollback_plan(
+            &mut task_window,
+            None,
+            Some(&ch),
+            None,
+            &ping_pong_rollback_plan(&task),
+        )
+        .await
+    {
         Ok(_) => panic!("invalid ClickHouse reversal must fail after raw deletion"),
         Err(error) => error,
     };
@@ -4028,7 +4127,16 @@ async fn test_reorg_clickhouse_add_reversal() {
         rollback_ops: vec![],
         journal_columns: vec![],
     });
-    let error = match task.execute(&mut task_window, None, Some(&ch), None).await {
+    let error = match task
+        .execute_with_rollback_plan(
+            &mut task_window,
+            None,
+            Some(&ch),
+            None,
+            &ping_pong_rollback_plan(&task),
+        )
+        .await
+    {
         Ok(_) => panic!("invalid later ClickHouse phase must fail"),
         Err(error) => error,
     };
@@ -4058,9 +4166,15 @@ async fn test_reorg_clickhouse_add_reversal() {
     assert_eq!(retained_marker, 1, "only the pending-attempt marker should remain");
 
     task.derived_tables.pop();
-    task.execute(&mut task_window, Some(&rindexer_pg), Some(&ch), None)
-        .await
-        .expect("ClickHouse reversal retry must reuse the retained snapshot");
+    task.execute_with_rollback_plan(
+        &mut task_window,
+        Some(&rindexer_pg),
+        Some(&ch),
+        None,
+        &ping_pong_rollback_plan(&task),
+    )
+    .await
+    .expect("ClickHouse reversal retry must reuse the retained snapshot");
 
     // PG: balance was 180, events at block2 (id=50) + block3 (id=30) = 80 subtracted -> 100
     let balance: rust_decimal::Decimal = pg
@@ -4218,9 +4332,15 @@ async fn test_reorg_reversal_reserved_word_column_clickhouse() {
     let rindexer_pg = env.rindexer_pg().await;
     let mut task_window = BlockChainWindow::try_new(256).unwrap();
 
-    task.execute(&mut task_window, Some(&rindexer_pg), Some(&ch), None)
-        .await
-        .expect("clickhouse reserved-word reversal reorg task failed");
+    task.execute_with_rollback_plan(
+        &mut task_window,
+        Some(&rindexer_pg),
+        Some(&ch),
+        None,
+        &ping_pong_rollback_plan(&task),
+    )
+    .await
+    .expect("clickhouse reserved-word reversal reorg task failed");
 
     // CH: "to" was 180, reversing blocks 2 and 3 subtracts 50 + 30 -> 100.
     let ch_total: u64 = ch
@@ -4407,9 +4527,15 @@ async fn test_reorg_two_events_same_table_reversible() {
     let rindexer_pg = env.rindexer_pg().await;
     let mut task_window = BlockChainWindow::try_new(256).unwrap();
 
-    task.execute(&mut task_window, Some(&rindexer_pg), None, None)
-        .await
-        .expect("dual-event reversible reorg task failed");
+    task.execute_with_rollback_plan(
+        &mut task_window,
+        Some(&rindexer_pg),
+        None,
+        None,
+        &ping_pong_rollback_plan(&task),
+    )
+    .await
+    .expect("dual-event reversible reorg task failed");
 
     // Reversal of Ping Add in reorg range: -(200 + 50) = -250
     // Reversal of Pong Subtract in reorg range: +(30 + 10) = +40

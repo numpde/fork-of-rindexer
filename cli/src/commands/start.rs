@@ -2,16 +2,13 @@ use std::{env, path::PathBuf, process::Command, thread, time::Duration};
 
 use colored::Colorize;
 use rindexer::{
-    apply_clickhouse_schema_change, apply_schema_change, detect_clickhouse_schema_changes,
-    detect_schema_changes,
-    manifest::{
-        core::ProjectType,
-        yaml::{read_manifest, YAML_CONFIG_NAME},
-    },
+    apply_clickhouse_schema_change, apply_schema_change, detect_prepared_clickhouse_schema_changes,
+    detect_prepared_schema_changes,
+    manifest::{core::ProjectType, yaml::YAML_CONFIG_NAME},
     provider::validate_manifest_network_rpc_urls,
-    resolve_table_column_types, rindexer_error, rindexer_info, setup_info_logger,
-    start_rindexer_no_code, ClickhouseClient, ClickhouseSchemaChange, GraphqlOverrideSettings,
-    IndexerNoCodeDetails, PostgresClient, SchemaChange, StartNoCodeDetails,
+    rindexer_error, rindexer_info, setup_info_logger, start_rindexer_no_code_prepared,
+    ClickhouseClient, ClickhouseSchemaChange, GraphqlOverrideSettings, IndexerNoCodeDetails,
+    PostgresClient, PreparedProject, PreparedSchema, SchemaChange, StartNoCodeDetails,
 };
 
 use crate::{
@@ -96,10 +93,10 @@ async fn check_docker_compose_status(
 /// Returns Ok(true) if we should continue, Ok(false) if user cancelled.
 async fn handle_schema_sync(
     client: &PostgresClient,
-    manifest: &rindexer::manifest::core::Manifest,
+    schema: &PreparedSchema,
     auto_yes: bool,
 ) -> Result<bool, String> {
-    let changes = detect_schema_changes(client, manifest).await?;
+    let changes = detect_prepared_schema_changes(client, schema).await?;
 
     if changes.is_empty() {
         return Ok(true);
@@ -238,10 +235,10 @@ async fn handle_schema_sync(
 /// Returns Ok(true) if we should continue, Ok(false) if user cancelled.
 async fn handle_clickhouse_schema_sync(
     client: &ClickhouseClient,
-    manifest: &rindexer::manifest::core::Manifest,
+    schema: &PreparedSchema,
     auto_yes: bool,
 ) -> Result<bool, String> {
-    let changes = detect_clickhouse_schema_changes(client, manifest).await?;
+    let changes = detect_prepared_clickhouse_schema_changes(client, schema).await?;
 
     if changes.is_empty() {
         return Ok(true);
@@ -454,13 +451,16 @@ pub async fn start(
 
     validate_rindexer_yaml_exist(&project_path);
 
-    let mut manifest = read_manifest(&project_path.join(YAML_CONFIG_NAME)).map_err(|e| {
-        print_error_message(&format!("Could not read the rindexer.yaml file: {e}"));
+    // Admit all ABI and table declarations before schema synchronization can write.
+    // The same snapshot is retained by no-code setup, callbacks and recovery.
+    let prepared = PreparedProject::read(&project_path.join(YAML_CONFIG_NAME)).map_err(|e| {
+        print_error_message(&format!("Could not prepare storage schema: {e}"));
         e
     })?;
+    let manifest = prepared.manifest();
 
     if matches!(command, StartSubcommands::Indexer | StartSubcommands::All { .. }) {
-        if let Err(e) = validate_manifest_network_rpc_urls(&manifest) {
+        if let Err(e) = validate_manifest_network_rpc_urls(manifest) {
             print_error_message(&format!("Error starting the server: {e}"));
             std::process::exit(1);
         }
@@ -489,21 +489,15 @@ pub async fn start(
 
         // Schema sync for no-code projects with custom tables
         if manifest.project_type == ProjectType::NoCode {
-            let has_tables = manifest.contracts.iter().any(|c| c.tables.is_some());
+            let has_tables = manifest.has_custom_tables();
             if has_tables {
-                // Resolve column types from ABI before schema sync
-                if let Err(e) = resolve_table_column_types(&project_path, &mut manifest) {
-                    print_error_message(&format!("Could not resolve column types: {e}"));
-                    return Err(e.to_string().into());
-                }
-
                 // Need to get a fresh client for schema sync
                 let client = PostgresClient::new().await.map_err(|e| {
                     print_error_message(&format!("Could not connect to postgres: {e}"));
                     e
                 })?;
 
-                if let Err(e) = handle_schema_sync(&client, &manifest, auto_yes).await {
+                if let Err(e) = handle_schema_sync(&client, prepared.schema(), auto_yes).await {
                     print_error_message(&format!("Schema sync failed: {e}"));
                     return Err(e.into());
                 }
@@ -513,22 +507,16 @@ pub async fn start(
 
     // ClickHouse schema sync for no-code projects with custom tables
     if manifest.storage.clickhouse_enabled() && manifest.project_type == ProjectType::NoCode {
-        let has_tables = manifest.contracts.iter().any(|c| c.tables.is_some());
+        let has_tables = manifest.has_custom_tables();
         if has_tables {
-            // Resolve column types from ABI before schema sync (if not already done for postgres)
-            if !manifest.storage.postgres_enabled() {
-                if let Err(e) = resolve_table_column_types(&project_path, &mut manifest) {
-                    print_error_message(&format!("Could not resolve column types: {e}"));
-                    return Err(e.to_string().into());
-                }
-            }
-
             let client = ClickhouseClient::new().await.map_err(|e| {
                 print_error_message(&format!("Could not connect to ClickHouse: {e}"));
                 e
             })?;
 
-            if let Err(e) = handle_clickhouse_schema_sync(&client, &manifest, auto_yes).await {
+            if let Err(e) =
+                handle_clickhouse_schema_sync(&client, prepared.schema(), auto_yes).await
+            {
                 print_error_message(&format!("ClickHouse schema sync failed: {e}"));
                 return Err(e.into());
             }
@@ -581,7 +569,7 @@ pub async fn start(
                     watch,
                 };
 
-                start_rindexer_no_code(details).await.map_err(|e| {
+                start_rindexer_no_code_prepared(details, prepared).await.map_err(|e| {
                     print_error_message(&format!("Error starting the server: {e}"));
                     e
                 })?;
@@ -597,7 +585,7 @@ pub async fn start(
                     watch,
                 };
 
-                start_rindexer_no_code(details).await.map_err(|e| {
+                start_rindexer_no_code_prepared(details, prepared).await.map_err(|e| {
                     print_error_message(&format!("Error starting the indexer: {e}"));
                     e
                 })?;
@@ -613,9 +601,10 @@ pub async fn start(
                     watch,
                 };
 
-                let _ = start_rindexer_no_code(details).await.map_err(|e| {
+                start_rindexer_no_code_prepared(details, prepared).await.map_err(|e| {
                     print_error_message(&format!("Error starting the server: {e}"));
-                });
+                    e
+                })?;
             }
         },
     }

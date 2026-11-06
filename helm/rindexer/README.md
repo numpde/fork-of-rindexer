@@ -7,7 +7,7 @@ A Helm chart for deploying the `rindexer` application. This chart supports integ
 
 ## Prerequisites
 
-- Kubernetes 1.16+
+- Kubernetes 1.19+ (for the Pod seccomp profile)
 - Helm 3.0+
 - PersistentVolume provisioner support in the underlying infrastructure
 
@@ -44,7 +44,7 @@ The following table lists the configurable parameters of the `rindexer` chart an
 | `image.digest`                           | Required reviewed `sha256:` image digest          | Empty; installation fails until set |
 | `image.pullPolicy`                       | Image pull policy                                | `IfNotPresent`                |
 | `service.type`                           | Kubernetes service type                          | `ClusterIP`                   |
-| `service.port`                           | Kubernetes service port                          | `3001`                        |
+| `service.port`                           | Service port exposed to clients; targets application port `3001` | `3001`                        |
 | `ingress.enabled`                        | Enable Ingress resource                          | `false`                       |
 | `ingress.annotations`                    | Ingress annotations                              | `{}`                          |
 | `ingress.hosts`                          | Ingress accepted hostnames                       | `[]`
@@ -63,10 +63,28 @@ The following table lists the configurable parameters of the `rindexer` chart an
 | `securityContext.allowPrivilegeEscalation` | Allow privilege escalation in the container     | `false`                       |
 | `securityContext.runAsNonRoot`           | Ensure the container runs as a non-root user     | `true`                        |
 | `securityContext.dropCapabilities`       | Capabilities to drop in the container            | `['ALL']`                     |
+| `securityContext.seccompProfile`         | Kubernetes Pod seccomp profile                    | `{type: RuntimeDefault}`      |
+
+With `securityContext.enabled=true`, user/group IDs, `fsGroup`, `runAsNonRoot`,
+and `seccompProfile` apply to the Pod. `allowPrivilegeEscalation` and
+`capabilities.drop` apply to the application container. The defaults request
+non-root execution, block privilege escalation, drop all Linux capabilities,
+and use the container runtime's default seccomp profile. A custom profile can
+use `{type: Localhost, localhostProfile: profiles/rindexer.json}` when that
+profile is installed on the nodes. Setting `securityContext.enabled=false`
+omits both security contexts.
+
 
 ## PostgreSQL Integration
 
 If PostgreSQL is enabled, the chart will configure the application to connect to it using the specified credentials.
+
+With `postgresql.enabled=true`, the chart starts both indexing and GraphQL. The
+GraphQL listener uses port `3001` inside the Pod. `service.port` controls the
+Service port exposed to clients: for example, `service.port=80` routes port `80`
+to the same GraphQL listener on port `3001`. With PostgreSQL disabled, the chart
+starts only the indexer and does not start a GraphQL listener.
+
 
 ### Configuring External PostgreSQL
 
@@ -190,3 +208,8 @@ or forced pod deletion can also overlap a terminating writer with its replacemen
 so coordinate those operations separately. Back up
 and reconcile database migrations before upgrading. Run the rendered chart checks
 with `python3 helm/rindexer/tests/deployment.py /path/to/helm`.
+
+The generated configuration and ABI ConfigMaps are hashed into the Pod template.
+A Helm upgrade that changes either ConfigMap replaces the Pod, including when the
+image digest stays the same. This reloads the `subPath`-mounted `rindexer.yaml`
+and the ABI files at startup. Unchanged chart inputs keep the same checksums.

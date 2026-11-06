@@ -199,6 +199,26 @@ pub(crate) async fn fetch_canonical_headers(
     Ok(blocks)
 }
 
+/// Physical table identity after PostgreSQL truncates each qualified identifier.
+pub(crate) fn recovery_table_identity(name: &str) -> String {
+    name.split('.')
+        .map(|part| crate::helpers::postgres_catalog_identifier(part.trim_matches('"')))
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// Quoted writes and bare recovery SQL must select the same schema and table.
+pub(crate) fn validate_recovered_table_name(name: &str) -> anyhow::Result<()> {
+    let (schema, table) = name.split_once('.').ok_or_else(|| anyhow::anyhow!(
+        "expected one schema.table destination; database must name a single schema, without database qualification"
+    ))?;
+    validate_sql_identifier(schema, "recovered table identifier")?;
+    validate_sql_identifier(table, "recovered table identifier")?;
+    anyhow::ensure!(!name.bytes().any(|byte| byte.is_ascii_uppercase()),
+        "use lowercase identifiers, including the database schema override, so quoted forward writes and bare recovery SQL address the same table");
+    Ok(())
+}
+
 /// Validates that a string is safe to use as a SQL identifier (table name, column name, schema).
 /// Rejects anything that doesn't match `[a-zA-Z_][a-zA-Z0-9_]*`.
 pub fn validate_sql_identifier(name: &str, kind: &str) -> anyhow::Result<()> {

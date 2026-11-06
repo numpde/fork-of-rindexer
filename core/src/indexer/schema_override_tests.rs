@@ -38,15 +38,14 @@ async fn postgres_custom_schema_override_is_shared_by_startup_writes_and_schema_
         let mut params = fixture.params.clone();
         params.contract_name = contract.name.clone();
         let schema = generate_indexer_contract_schema_name(&indexer.name, &contract.name);
-        params.sql_event_table_name = format!("{schema}.value");
+        params.set_test_raw_table(&schema);
         params.tables = Arc::new(
             contract
                 .tables
                 .as_ref()
                 .unwrap()
                 .iter()
-                .cloned()
-                .map(|table| TableRuntime::new(table, &indexer.name, &contract.name))
+                .map(|table| TableRuntime::try_new(table, &indexer.name, &contract.name).unwrap())
                 .collect(),
         );
         let callback = no_code_callback(Arc::new(params)).event_callback;
@@ -98,7 +97,6 @@ async fn postgres_shared_target_recovery_requires_one_manifest_owner() {
     use crate::indexer::reorg::{
         BlockChainWindow, EventTableInfo, ReorgBlockHashPersistence, ReorgContext, ReorgCoordinator,
     };
-    use crate::manifest::contract::ColumnType;
     use crate::provider::mock::MockChainProvider;
     let table = json!({"name":"totals","database":"shared_state","global":true,
         "columns":[{"name":"amount","type":"uint256","default":"0"},{"name":"b","type":"uint256","default":"0"}],
@@ -141,15 +139,14 @@ async fn postgres_shared_target_recovery_requires_one_manifest_owner() {
         let mut params = fixture.params.clone();
         params.contract_name = contract.name.clone();
         let schema = generate_indexer_contract_schema_name(&indexer.name, &contract.name);
-        params.sql_event_table_name = format!("{schema}.value");
+        params.set_test_raw_table(&schema);
         params.tables = Arc::new(
             contract
                 .tables
                 .as_ref()
                 .unwrap()
                 .iter()
-                .cloned()
-                .map(|table| TableRuntime::new(table, &indexer.name, &contract.name))
+                .map(|table| TableRuntime::try_new(table, &indexer.name, &contract.name).unwrap())
                 .collect(),
         );
         crate::indexer::start::build_derived_tables_for_event(
@@ -157,7 +154,11 @@ async fn postgres_shared_target_recovery_requires_one_manifest_owner() {
             &indexer.name,
             &contract.name,
             "ethereum",
-            &[("value".into(), ColumnType::Uint256)].into(),
+            &crate::indexer::reorg::task::RollbackEventSource::new(
+                "Value",
+                &params.event_info.inputs,
+            )
+            .unwrap(),
             &params.tables,
             &mut derived,
             &mut plans,

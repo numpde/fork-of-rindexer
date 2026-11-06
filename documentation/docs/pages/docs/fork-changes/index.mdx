@@ -34,6 +34,159 @@ apply to its storage and configuration:
 These notes retain their existing URLs. Their place in this section identifies
 them as maintained fork documentation.
 
+## PostgreSQL storage ownership
+
+Startup checks generated contract schemas, raw tables and checkpoint names before
+schema synchronization, reset or creation. Each logical source must own its
+physical destination: for example, `Value16` and `Value_16` cannot both store
+rows in `value_16`. Separate subscriptions to one declared event may share raw
+history while retaining their own progress. Place custom tables in distinct
+destinations from raw or internal tables. The check also reserves explicitly
+named engine indexes and the ordinary primary-key index and serial sequence names
+of raw tables. PostgreSQL can shorten or number auxiliary names to fit its live
+catalog; startup does not predict those names. If an older configuration already mixed
+sources, review and rebuild affected history, derived rows, receipts and progress
+from a verified starting block; changing a declaration cannot separate old rows.
+
+## Column names in custom tables
+
+Write event fields and custom-table columns by their **logical** names in the
+manifest. For example, `where: { key16: "$key16" }` reads the ABI field
+`key16` and writes the custom column declared as `key16`. Both SQL tables
+use `key_16`. With `where: { holder: "$owner" }`, the stored columns are
+`holder` and `owner`: the mapping, not matching spellings, joins the two.
+Use `@key16` for the custom column in a table guard. In PostgreSQL, a mixed
+UPSERT guard such as `$sourceAmount > @totalAmount` reads the incoming value
+from the event, even when no destination column stores it. Each event is
+admitted against the current stored row before the next one is applied. Use
+scalar operands for SQL UPSERT guards; nested operand access is rejected.
+Decoded event paths,
+tuple-array JSON keys, iterator aliases and quoted literals keep their spelling.
+
+Startup prepares one immutable schema before connecting to storage or applying
+schema changes. PostgreSQL and ClickHouse schema creation and comparison, raw
+and custom writes, indexes, relationships, cron, and recovery consume its checked
+columns and types. Changing an ABI file after preparation does not change the
+running schema; a new startup prepares the changed declarations. Custom column names must resolve to distinct ASCII SQL
+identifiers of at most 63 bytes. Generated metadata, PostgreSQL system columns
+and internal guard-input names are reserved. Raw ABI columns use the
+[raw naming rules](/docs/migrations/raw-event-column-names); ambiguous stored
+paths are rejected before indexing.
+
+**Upgrade:** a fresh database gets the new names. If a populated custom table
+uses the old literal spelling, stop writers and review the rename before
+restarting. Schema sync refuses to treat a recognized legacy column as an
+add/drop migration. Where recovery records contain old column names or row-key
+fields, a column rename alone is insufficient: migrate those records coherently
+or rebuild derived state, journals, receipts and cursors together from canonical
+history.
+
+Rust callers preparing runtime tables now use
+`TableRuntime::try_new(&declaration, indexer, contract)?`; cron scheduler
+construction is also fallible (`CronScheduler::try_new`). Lower-level SQL
+writers take a `ResolvedTable`, which cannot be passed back as a logical
+declaration. To inspect a declared destination's physical
+name, call `resolved.storage_column("key16")`.
+
+Custom Rust startup code can retain a `PreparedProject` from
+`PreparedProject::read(&manifest_path)?`, use `prepared.schema()` with the
+prepared schema-comparison and setup entry points, then pass the same project
+to `start_rindexer_no_code_prepared` or `start_rindexer_prepared`. The normal
+CLI does this automatically. Standalone helpers that accept logical declarations
+prepare their own snapshot for that call.
+
+## Typed arithmetic inputs and recovery keys
+
+Mutable custom-table arithmetic resolves every explicitly configured key and
+`add`/`subtract` operand before committing an event. A column `default` remains
+the baseline for a new row; it does not replace a missing event field, an
+out-of-bounds dynamic or fixed array element, a missing tuple component, or a
+NULL arithmetic input. A conversion outside its supported input range returns
+an error instead of panicking. For PostgreSQL event transactions, the raw rows,
+derived effects, application receipts and cursor remain uncommitted and the
+callback can retry.
+
+Conditions still select which inputs are required. For an optional unsigned
+array element, an event-only guard such as `if: "$values[0] >= 0"` admits a
+present element and skips an absent one. Verify that the guard expresses the
+intended admission rule. Arithmetic `iterate` bindings must resolve and have
+equal lengths; empty arrays contribute no rows.
+
+Forward arithmetic preparation and PostgreSQL recovery select the same scalar
+conversion from the ABI source type and the custom-table destination type. The
+conversion applies to reversal deltas, reversal keys and the keys used to find
+surviving canonical metadata. Supported cases retain their established meaning:
+
+- Unsigned values assigned to signed custom-table types use the existing
+  256-bit two's-complement interpretation before checked narrowing. For example,
+  `uint256` value `2^256 - 1` contributes `-1` to an `int256` accumulator, and
+  recovery reverses that `-1`.
+- Boolean numeric operands contribute `1` for `true` and `0` for `false`.
+  Numeric string keys retain their decimal representation, unsigned Boolean
+  keys use nonzero truth values, and unsigned address keys use the low 20 bytes.
+- Timestamp metadata used as a numeric operand contributes epoch seconds.
+  Unsigned timestamp keys use exact whole seconds throughout the supported
+  date range; recovery does not round large epochs through floating-point
+  microseconds or depend on the database session's time zone.
+- `bytes32` keys retain the established custom-table encoding: the ASCII
+  `0x` prefix and 64 hexadecimal digits stored in `BYTEA`. A `bytes32` source
+  mapped to a `string` key retains the same hexadecimal text. This differs from
+  raw ABI byte storage and does not rewrite existing keys. Address-array keys
+  retain their nonempty array representation. Empty address-array keys are refused
+  because the existing forward encoder represents them as SQL NULL.
+
+This change preserves existing custom-column storage types, including the
+`BIGINT` representation used by custom `uint64` columns. It does not migrate
+column schemas or repair prior arithmetic overflow or already corrupted state.
+
+Some old byte conversions stored Rust debug text as bytes, and fixed-byte
+values converted to strings included padding that dynamic bytes did not.
+Recovery's source type metadata does not distinguish every one of those ABI
+layouts. The following arithmetic key conversions now fail explicitly instead
+of choosing a different key representation:
+
+| ABI source | Custom-table destination |
+| --- | --- |
+| `bytes` or `bytes1` through `bytes31` | `bytes`, `bytes32`, or `string` |
+| `bytes32` | `bytes` |
+
+Use a compatible ABI `bytes32` source with a `bytes32` or `string` key, an ABI
+`string` source with a `string` key, or keep the transformation outside this
+recovery path. Existing data using an affected representation needs a reviewed
+rebuild with coordinated journals, receipts and cursors before changing its
+key configuration. Renaming or recasting a key while retaining old receipts
+does not reapply previously committed contributions.
+
+Recovery checks required inputs in all contributing raw history before
+mutating durable state. This includes the orphan suffix, retained canonical
+history and other contributing networks for cross-chain tables. An older
+writer may have substituted a default for a missing key or operand, so a raw
+NULL cannot safely identify the row or the applied delta. Such history leaves
+recovery unfinished with an explicit error. Reconstruct the affected state
+from canonical history with its [replay metadata](/docs/migrations/postgres-event-replay)
+before retrying. Rows excluded by the operation's event predicate do not need
+the unused operands.
+
+For handwritten Rust recovery, give the planner the original ABI event and table
+declaration. It supplies the source and destination types, stored columns and
+operation indexes used by rollback:
+
+```rust
+let mut tables = Vec::new();
+let mut plan = DerivedTableRollbackPlan::default();
+plan.try_add_table_event(&mut tables, "Indexer", "Contract", &event, &table)?;
+// Install tables as task.derived_tables; pass &plan to execute_with_rollback_plan.
+```
+
+For a table with multiple event mappings, call `try_add_table_events` once
+with all contributing ABI events. The planner can then infer types across the
+whole table and rejects incomplete or conflicting declarations before adding
+anything to the plan. The former public `try_add_operation` metadata-map API is
+now internal: replace it with one of these declaration-based constructors.
+Untyped `ReorgTask::execute` still
+supports raw, insert-only and journal-only recovery. Incomplete arithmetic plans
+fail before changing durable state.
+
 ## Typed predicate admission for arithmetic recovery
 
 Operations reversed from raw history now validate their predicates during
@@ -53,12 +206,9 @@ admission. This restriction applies to variable-to-variable comparisons too,
 even when the predicate contains no literals.
 
 Every referenced event input must have a known scalar source type. Arrays must
-select a supported scalar leaf. Public callers of conditional arithmetic rollback
-tasks must populate `DerivedTableRollbackPlan::try_add_operation` with the source
-types and call `execute_with_rollback_plan`; the untyped `execute` shortcut remains
-usable for unconditional operations and predicates using only known transaction
-metadata. Direct tuple-array component types use dotted declaration paths such as
-`items.amount`, without array indexes.
+select a supported scalar leaf. Declaration-based plans obtain these types from
+the ABI, including tuple-array members. Use `execute_with_rollback_plan` for
+both conditional and unconditional arithmetic.
 
 Execution applies the same checks to legacy plans before committing changes to
 raw rows, effects, receipts or cursors. A refusal leaves recovery unfinished; it
@@ -322,6 +472,25 @@ before resuming. Changing the manifest does not repair a row lost in an earlier
 rollback. Coordinate any required rebuild with derived state, recovery journals,
 application receipts and cursors; see the [sequence-ordering migration](/docs/migrations/sequence-ordering).
 
+## RabbitMQ broker confirmations
+
+RabbitMQ publishers enable publisher confirmations for each channel and wait for
+its broker acknowledgement. A broker rejection or a connection loss before
+confirmation returns an error to the existing retry policy. With
+`delivery_guarantee: at_least_once`, the PostgreSQL outbox retains the original
+payload and message ID until the confirmed publication is acknowledged in the
+database. An uncertain publication can be retried with the same message ID, so
+consumers should use that ID to deduplicate repeated deliveries.
+
+The confirmation records broker acceptance. Consumer processing has its own
+acknowledgement policy. Queue bindings and persistence settings must support the
+deployment's delivery requirements. Existing obligations already acknowledged by
+an earlier version cannot be reconstructed automatically; reconcile any known
+missing deliveries against retained source history.
+
+Rust callers with exhaustive `RabbitMQError` matches must add `BrokerNack` and
+`ConfirmationNotRequested` cases.
+
 ## Hanging destinations with durable delivery
 
 With `delivery_guarantee: at_least_once`, a hanging publisher now receives a
@@ -398,6 +567,27 @@ only for reorg-enabled networks, preserving literal arithmetic on other networks
 Insert-only tables retain their existing behavior. Editing YAML does not repair
 state previously lost through an incomplete rollback plan: coordinate any verified
 canonical rebuild with derived state, journals, receipts and cursors.
+
+## Unique event mappings within each table
+
+Each `tables[].events[].event` name must appear at most once within its table.
+This applies to contract tables and enabled `native_transfers.tables`, whether
+reorg handling is enabled or disabled. Manifest loading, forward table preparation
+and recovery-plan construction reject duplicates, including tables constructed
+directly by Rust callers. Use `TableRuntime::try_new` to prepare a logical table declaration.
+
+Combine all intended operations under one event mapping when they share the same
+`iterate` scope. Mappings with different iteration scopes cannot be merged
+automatically: redesign a common scope or use separate physical tables with
+complete write models. Multiple operations within one mapping, distinct event
+names within a table, and the same event name in separate tables remain valid.
+
+Previously, forward processing selected the first matching mapping, while
+recovery planned operations from every matching mapping. Later mappings could
+therefore remain unapplied, yet be reversed during a reorg. Correcting the YAML
+does not replay existing application receipts or repair previously reversed
+state. Verify the intended effects against canonical history and coordinate any
+derived-state rebuild with journals, receipts and cursors before resuming writes.
 
 ## Multiple derived writes from one event
 

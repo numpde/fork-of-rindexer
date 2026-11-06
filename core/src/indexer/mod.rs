@@ -17,6 +17,7 @@ mod last_synced;
 pub mod native_transfer;
 pub mod no_code;
 pub mod reorg;
+pub mod schema;
 pub mod start;
 pub mod task_tracker;
 pub mod tip_logs;

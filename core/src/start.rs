@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::signal;
@@ -6,10 +6,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 use crate::database::clickhouse::setup::SetupClickhouseError;
+use crate::database::generate::GenerateTablesForIndexerSqlError;
 use crate::events::RindexerEventEmitter;
 use crate::hot_reload::orchestrator::ReloadOrchestrator;
 use crate::hot_reload::watcher::ManifestWatcher;
-use crate::indexer::start::{start_historical_indexing, start_live_indexing};
+use crate::indexer::schema::PreparedSchema;
+use crate::indexer::start::{start_historical_indexing_prepared, start_live_indexing_prepared};
 use crate::indexer::IndexingEventsProgressState;
 use crate::{
     api::{
@@ -19,24 +21,65 @@ use crate::{
         client::PostgresConnectionError,
         indexes::{ApplyPostgresIndexesError, PostgresIndexResult},
         relationship::{ApplyAllRelationships, Relationship},
-        setup::{setup_postgres, SetupPostgresError},
+        setup::{setup_postgres_prepared, SetupPostgresError},
     },
     event::callback_registry::{EventCallbackRegistry, TraceCallbackRegistry},
     health::HealthServer,
     indexer::{
-        no_code::{setup_no_code, SetupNoCodeError},
+        no_code::{setup_no_code_prepared, SetupNoCodeError},
         start::StartIndexingError,
         ContractEventDependencies, ContractEventDependenciesMapFromRelationshipsError,
     },
     initiate_shutdown,
     logger::mark_shutdown_started,
     manifest::{
-        core::ProjectType,
+        core::{Manifest, ProjectType},
         storage::RelationshipsAndIndexersError,
-        yaml::{read_manifest, ReadManifestError},
+        yaml::{read_manifest_prepared, validate_prepared_manifest, ReadManifestError},
     },
-    setup_clickhouse, setup_info_logger, RindexerEventStream,
+    setup_clickhouse_prepared, setup_info_logger, RindexerEventStream,
 };
+
+/// One admitted manifest and its immutable storage declarations for an indexing run.
+///
+/// Prepare before schema synchronization or any database writes, then retain this
+/// snapshot through callback registration, historical indexing and live recovery.
+#[derive(Clone)]
+pub struct PreparedProject {
+    manifest: Arc<Manifest>,
+    schema: Arc<PreparedSchema>,
+}
+
+impl PreparedProject {
+    pub fn try_new(
+        project_path: &Path,
+        manifest: Manifest,
+    ) -> Result<Self, GenerateTablesForIndexerSqlError> {
+        let schema = PreparedSchema::try_new(project_path, &manifest.to_indexer())?;
+        validate_prepared_manifest(project_path, &manifest, &schema).map_err(|error| {
+            GenerateTablesForIndexerSqlError::InvalidPreparedSchema(error.to_string())
+        })?;
+        Ok(Self::from_parts(manifest, schema))
+    }
+
+    pub(crate) fn from_parts(manifest: Manifest, schema: PreparedSchema) -> Self {
+        Self { manifest: Arc::new(manifest), schema: Arc::new(schema) }
+    }
+
+    #[allow(clippy::result_large_err, reason = "preserve existing error API")]
+    pub fn read(manifest_path: &Path) -> Result<Self, StartRindexerError> {
+        let (manifest, schema) = read_manifest_prepared(&manifest_path.to_path_buf())?;
+        Ok(Self::from_parts(manifest, schema))
+    }
+
+    pub fn manifest(&self) -> &Manifest {
+        &self.manifest
+    }
+
+    pub fn schema(&self) -> &PreparedSchema {
+        &self.schema
+    }
+}
 
 pub struct IndexingDetails {
     pub registry: EventCallbackRegistry,
@@ -59,6 +102,9 @@ pub enum StartRindexerError {
 
     #[error("Could not read manifest: {0}")]
     CouldNotReadManifest(#[from] ReadManifestError),
+
+    #[error("Could not prepare storage schema: {0}")]
+    CouldNotPrepareSchema(#[from] GenerateTablesForIndexerSqlError),
 
     #[error("Could not start graphql error {0}")]
     CouldNotStartGraphqlServer(#[from] StartGraphqlServerError),
@@ -95,6 +141,9 @@ pub enum StartRindexerError {
     #[error("Shutdown handler failed with error: {0}")]
     ShutdownHandlerFailed(String),
 
+    #[error("Cron scheduler failed: {0}")]
+    CronSchedulerFailed(String),
+
     #[error("Port conflict: {0}")]
     PortConflict(String),
 
@@ -117,8 +166,26 @@ async fn handle_shutdown(signal: &str) {
     std::process::exit(0);
 }
 
+/// Start a project by preparing its current manifest and ABI declarations.
+///
+/// This standalone compatibility entrypoint creates a fresh [`PreparedProject`];
+/// [`StartDetails`] does not carry the snapshot used by earlier setup or schema
+/// synchronization. To retain one schema across those stages, prepare a project
+/// once and pass it to [`start_rindexer_prepared`]. For staged no-code startup,
+/// first use [`crate::indexer::no_code::setup_no_code_prepared`] with that same
+/// project; [`start_rindexer_no_code`] performs both stages in one call.
 #[allow(clippy::result_large_err, reason = "preserve existing error API")]
 pub async fn start_rindexer(details: StartDetails<'_>) -> Result<(), StartRindexerError> {
+    let prepared = PreparedProject::read(details.manifest_path)?;
+    start_rindexer_prepared(details, prepared).await
+}
+
+/// Start a project using the snapshot already admitted by schema synchronization.
+#[allow(clippy::result_large_err, reason = "preserve existing error API")]
+pub async fn start_rindexer_prepared(
+    details: StartDetails<'_>,
+    prepared: PreparedProject,
+) -> Result<(), StartRindexerError> {
     info!(
         "🚀 start_rindexer called with indexing_details.is_some() = {}",
         details.indexing_details.is_some()
@@ -155,7 +222,8 @@ pub async fn start_rindexer(details: StartDetails<'_>) -> Result<(), StartRindex
                 handle_shutdown("Ctrl+C").await
             });
 
-            let manifest = Arc::new(read_manifest(details.manifest_path)?);
+            let manifest = Arc::clone(&prepared.manifest);
+            let schema = prepared.schema();
 
             if manifest.project_type != ProjectType::NoCode {
                 setup_info_logger();
@@ -258,22 +326,16 @@ pub async fn start_rindexer(details: StartDetails<'_>) -> Result<(), StartRindex
 
                 // setup postgres is already called in no-code startup
                 if manifest.project_type != ProjectType::NoCode && *postgres_enabled {
-                    setup_postgres(project_path, &manifest).await?;
+                    setup_postgres_prepared(project_path, &manifest, schema).await?;
                 }
 
                 // setup clickhouse is already called in no-code startup
                 if manifest.project_type != ProjectType::NoCode && *clickhouse_enabled {
-                    setup_clickhouse(project_path, &manifest).await?;
+                    setup_clickhouse_prepared(project_path, &manifest, schema).await?;
                 }
 
-                let (relationships, postgres_indexes) = manifest
-                    .storage
-                    .create_relationships_and_indexes(
-                        project_path,
-                        &manifest.name,
-                        &manifest.all_contracts(),
-                    )
-                    .await?;
+                let (relationships, postgres_indexes) =
+                    manifest.storage.create_prepared_relationships_and_indexes(schema).await?;
 
                 let mut dependencies: Vec<ContractEventDependencies> =
                     ContractEventDependencies::parse(&manifest);
@@ -296,9 +358,10 @@ pub async fn start_rindexer(details: StartDetails<'_>) -> Result<(), StartRindex
                 )
                 .await;
 
-                let processed_network_contracts = start_historical_indexing(
+                let processed_network_contracts = start_historical_indexing_prepared(
                     &manifest,
                     project_path,
+                    schema,
                     &dependencies,
                     historical_registry,
                     trace_registry,
@@ -360,9 +423,10 @@ pub async fn start_rindexer(details: StartDetails<'_>) -> Result<(), StartRindex
                         info!("Manual dependency_events found, skipping auto-applying the dependency_events with the relationships");
                     }
 
-                    start_live_indexing(
+                    start_live_indexing_prepared(
                         &manifest,
                         project_path,
+                        schema,
                         &dependencies,
                         indexing_details
                             .registry
@@ -377,13 +441,21 @@ pub async fn start_rindexer(details: StartDetails<'_>) -> Result<(), StartRindex
             }
 
             if graphql_server_handle.is_none() && !manifest.has_any_live_indexing() {
-                // Wait for cron scheduler to complete if it's running
+                // In an indexer-only bounded run, the scheduler is part of the
+                // job's success condition. An inner Err is not a successful join.
                 if let Some(cron_handle) = details.cron_scheduler_handle {
                     info!("Waiting for cron scheduler to complete...");
-                    if let Err(e) = cron_handle.await {
-                        error!("Cron scheduler task failed: {:?}", e);
+                    match cron_handle.await {
+                        Ok(Ok(())) => info!("Cron scheduler completed"),
+                        Ok(Err(error)) => {
+                            return Err(StartRindexerError::CronSchedulerFailed(error));
+                        }
+                        Err(error) => {
+                            return Err(StartRindexerError::CronSchedulerFailed(format!(
+                                "Cron scheduler task failed to join: {error}"
+                            )));
+                        }
                     }
-                    info!("Cron scheduler completed");
                 }
                 return Ok(());
             }
@@ -481,7 +553,23 @@ pub enum StartRindexerNoCode {
 pub async fn start_rindexer_no_code(
     details: StartNoCodeDetails<'_>,
 ) -> Result<(), StartRindexerNoCode> {
-    let start_details = setup_no_code(details).await?;
-
-    start_rindexer(start_details).await.map_err(StartRindexerNoCode::StartRindexerError)
+    let prepared = PreparedProject::read(details.manifest_path)?;
+    start_rindexer_no_code_prepared(details, prepared).await
 }
+
+/// Share one prepared schema between no-code setup and both indexing phases.
+#[allow(clippy::result_large_err, reason = "preserve existing error API")]
+pub async fn start_rindexer_no_code_prepared(
+    details: StartNoCodeDetails<'_>,
+    prepared: PreparedProject,
+) -> Result<(), StartRindexerNoCode> {
+    let start_details = setup_no_code_prepared(details, &prepared).await?;
+
+    start_rindexer_prepared(start_details, prepared)
+        .await
+        .map_err(StartRindexerNoCode::StartRindexerError)
+}
+
+#[cfg(test)]
+#[path = "start_cron_failure_tests.rs"]
+mod start_cron_failure_tests;

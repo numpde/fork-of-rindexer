@@ -7,6 +7,9 @@ pub use webhook::{Webhook, WebhookError};
 mod rabbitmq;
 pub use rabbitmq::{RabbitMQ, RabbitMQError};
 
+#[cfg(test)]
+pub(crate) mod rabbitmq_test_broker;
+
 #[cfg(feature = "kafka")]
 mod kafka;
 

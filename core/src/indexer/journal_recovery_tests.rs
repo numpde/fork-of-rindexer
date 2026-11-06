@@ -79,6 +79,7 @@ async fn rollback(fixture: &Fixture, action: SetAction, cross_chain: bool) {
             vec![DerivedColumnJournal::try_new("amount".into(), action, {
                 let mut keys = fixture.params.tables[0]
                     .table
+                    .definition()
                     .primary_key_columns()
                     .into_iter()
                     .map(String::from)
@@ -322,7 +323,7 @@ async fn postgres_cross_chain_journal_rollback_keeps_the_unaffected_network_cont
         .query_one(
             &format!(
                 "SELECT count(*) FROM {} WHERE network = 'other'",
-                fixture.params.sql_event_table_name
+                fixture.params.stored_table()
             ),
             &[],
         )
@@ -370,7 +371,7 @@ async fn postgres_cross_chain_recalculation_waits_for_another_networks_in_flight
         "CREATE FUNCTION pause_other_application() RETURNS trigger LANGUAGE plpgsql AS $$
          BEGIN IF NEW.network = 'other' THEN PERFORM pg_advisory_xact_lock(8675309); END IF; RETURN NEW; END $$;
          CREATE TRIGGER pause_other BEFORE INSERT ON {} FOR EACH ROW EXECUTE FUNCTION pause_other_application()",
-        fixture.params.sql_event_table_name)).await.unwrap();
+        fixture.params.stored_table())).await.unwrap();
     let other = at(&fixture, "other", 200, B256::repeat_byte(200), 20);
     let other_callback = callback.clone();
     let application = tokio::spawn(async move { other_callback(vec![other]).await });
@@ -531,10 +532,7 @@ async fn postgres_reserved_journal_column_restores_set_max_and_min() {
         assert_eq!(restored, snapshot, "{action} must restore value and complete provenance");
         let raw: i64 = fixture
             .client
-            .query_one(
-                &format!("SELECT count(*) FROM {}", fixture.params.sql_event_table_name),
-                &[],
-            )
+            .query_one(&format!("SELECT count(*) FROM {}", fixture.params.stored_table()), &[])
             .await
             .unwrap()
             .get(0);

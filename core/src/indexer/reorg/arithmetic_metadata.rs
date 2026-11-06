@@ -53,6 +53,7 @@ impl ReorgTask {
                 let source = ReversalSource {
                     dialect: SqlDialect::Postgres,
                     iterate: metadata.map_or(&[], |metadata| metadata.iterate.as_slice()),
+                    storage_names: metadata.and_then(|m| m.storage_names.as_deref()),
                     source_column_types: metadata
                         .map_or(&empty_types, |metadata| &metadata.source_column_types),
                 };
@@ -60,13 +61,11 @@ impl ReorgTask {
                     .where_columns
                     .iter()
                     .map(|(derived, event)| {
-                        let value = source.operand(event)?;
-                        let value = match metadata
-                            .and_then(|metadata| metadata.derived_column_types.get(derived))
-                        {
-                            Some(column_type) => SqlDialect::Postgres.cast(value, column_type),
-                            None => value,
-                        };
+                        let value = source.operand_as(
+                            event,
+                            metadata
+                                .and_then(|metadata| metadata.derived_column_types.get(derived)),
+                        )?;
                         Ok(format!("'{derived}', {value}"))
                     })
                     .collect::<anyhow::Result<Vec<_>>>()?

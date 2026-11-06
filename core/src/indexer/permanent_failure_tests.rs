@@ -73,10 +73,11 @@ impl PostgresCase {
             generate_indexer_contract_schema_name(&params.indexer_name, &params.contract_name);
         let cursor = generate_internal_event_table_name(&schema, &params.event_info.name);
         params.postgres = Some(client.clone());
-        params.sql_event_table_name = format!("{schema}.value");
+        params.set_test_raw_table(&schema);
         let columns = generate_columns_with_data_types(&params.event_info.inputs).join(", ");
+        let raw_table = params.stored_table();
         client.batch_execute(&format!("CREATE SCHEMA {schema}; CREATE SCHEMA IF NOT EXISTS rindexer_internal;
-            CREATE TABLE {schema}.value (contract_address CHAR(42), {columns}, tx_hash CHAR(66), block_number NUMERIC, block_timestamp TIMESTAMPTZ, block_hash CHAR(66), network VARCHAR(50), tx_index NUMERIC, log_index VARCHAR(78));
+            CREATE TABLE {raw_table} (contract_address CHAR(42), {columns}, tx_hash CHAR(66), block_number NUMERIC, block_timestamp TIMESTAMPTZ, block_hash CHAR(66), network VARCHAR(50), tx_index NUMERIC, log_index VARCHAR(78));
             CREATE TABLE rindexer_internal.{cursor} (network TEXT NOT NULL, cursor_key TEXT NOT NULL, last_synced_block NUMERIC, PRIMARY KEY (network,cursor_key));
             INSERT INTO rindexer_internal.{cursor} VALUES ('ethereum', '{cursor_key}', 1);", cursor_key=crate::event::cursor::NETWORK_CURSOR_KEY)).await.expect("create owned event/cursor fixture");
         Self { params, client, schema, cursor, _container: container }
@@ -102,7 +103,7 @@ impl PostgresCase {
     async fn position(&self) -> (i64, String) {
         let rows = self
             .client
-            .query_one(&format!("SELECT count(*) FROM {}", self.params.sql_event_table_name), &[])
+            .query_one(&format!("SELECT count(*) FROM {}", self.params.stored_table()), &[])
             .await
             .unwrap()
             .get(0);
@@ -210,7 +211,7 @@ async fn postgres_binary_nul_remains_storable() {
     let position = fixture.position().await;
     let stored: Vec<u8> = fixture
         .client
-        .query_one(&format!("SELECT value FROM {}", fixture.params.sql_event_table_name), &[])
+        .query_one(&format!("SELECT value FROM {}", fixture.params.stored_table()), &[])
         .await
         .expect("binary event stored")
         .get(0);

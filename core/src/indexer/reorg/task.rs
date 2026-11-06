@@ -1,5 +1,8 @@
 #[path = "arithmetic_metadata.rs"]
 mod arithmetic_metadata;
+#[path = "declarations.rs"]
+mod declarations;
+pub(crate) use declarations::RollbackEventSource;
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -14,6 +17,7 @@ use crate::event::{
     VariableSource,
 };
 use crate::helpers::{camel_to_snake, generate_random_id};
+use crate::indexer::tables::scalar::ScalarConversion;
 use crate::manifest::contract::{ColumnType, IterateBinding, SetAction};
 use crate::metrics::indexing as metrics;
 use crate::provider::ChainProvider;
@@ -159,8 +163,9 @@ pub struct DerivedTableRollbackPlan {
 #[derive(Clone, Debug)]
 pub(crate) struct DerivedTableRollbackMetadata {
     pub(crate) iterate: Vec<RollbackIterateBinding>,
-    pub(crate) source_column_types: HashMap<String, ColumnType>,
-    pub(crate) derived_column_types: HashMap<String, ColumnType>,
+    pub(crate) source_column_types: Arc<HashMap<String, ColumnType>>,
+    storage_names: Option<Arc<HashMap<String, String>>>,
+    pub(crate) derived_column_types: Arc<HashMap<String, ColumnType>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,13 +176,16 @@ enum IterateStorage {
 
 #[derive(Clone, Debug)]
 pub(crate) struct RollbackIterateBinding {
+    declared_alias: String,
     pub(crate) array_field: String,
     pub(crate) alias: String,
     storage: IterateStorage,
 }
 
 impl DerivedTableRollbackPlan {
-    /// Add metadata for one rollback operation.
+    /// Register internal metadata for an already resolved operation. Public callers
+    /// use [`Self::try_add_table_event`] or [`Self::try_add_table_events`] so names,
+    /// types and operation indexes are derived together from declarations.
     /// Tuple-array element types use dotted keys such as `accounts.owner`;
     /// their raw PostgreSQL column is represented as JSONB. Conditional arithmetic
     /// recovery requires the source types of every referenced event scalar; ABI
@@ -187,13 +195,33 @@ impl DerivedTableRollbackPlan {
     ///
     /// Returns an error when the table name or iterate bindings are invalid,
     /// or when metadata was already registered for the same operation index.
-    pub fn try_add_operation(
+    #[cfg(test)]
+    pub(crate) fn try_add_operation(
         &mut self,
         derived_table: String,
         operation_index: usize,
         bindings: Vec<IterateBinding>,
-        mut source_column_types: HashMap<String, ColumnType>,
+        source_column_types: HashMap<String, ColumnType>,
         derived_column_types: HashMap<String, ColumnType>,
+    ) -> anyhow::Result<()> {
+        self.add_operation(
+            derived_table,
+            operation_index,
+            bindings,
+            Arc::new(source_column_types),
+            Arc::new(derived_column_types),
+            None,
+        )
+    }
+
+    fn add_operation(
+        &mut self,
+        derived_table: String,
+        operation_index: usize,
+        bindings: Vec<IterateBinding>,
+        source_column_types: Arc<HashMap<String, ColumnType>>,
+        derived_column_types: Arc<HashMap<String, ColumnType>>,
+        storage_names: Option<Arc<HashMap<String, String>>>,
     ) -> anyhow::Result<()> {
         if let Some((schema, table)) = derived_table.split_once('.') {
             super::validate_sql_identifier(schema, "rollback plan derived table schema")?;
@@ -204,10 +232,15 @@ impl DerivedTableRollbackPlan {
 
         let mut iterate: Vec<RollbackIterateBinding> = Vec::with_capacity(bindings.len());
         for binding in bindings {
-            let binding = IterateBinding {
-                array_field: event_field_to_db_column(&binding.array_field),
-                alias: normalize_event_field(&binding.alias),
+            let declared_alias = binding.alias.clone();
+            let array_field = match &storage_names {
+                Some(names) => names.get(&binding.array_field).cloned().with_context(|| {
+                    format!("no declared ABI array at '{}'", binding.array_field)
+                })?,
+                None => event_field_to_db_column(&binding.array_field),
             };
+            let binding =
+                IterateBinding { array_field, alias: normalize_event_field(&binding.alias) };
             super::validate_sql_identifier(&binding.array_field, "rollback iterate array column")?;
             super::validate_sql_identifier(&binding.alias, "rollback iterate alias")?;
             anyhow::ensure!(
@@ -216,33 +249,26 @@ impl DerivedTableRollbackPlan {
                 binding.alias
             );
             let jsonb_prefix = format!("{}.", binding.array_field);
-            let jsonb_element_types = source_column_types
-                .iter()
-                .filter_map(|(field, column_type)| {
-                    field
-                        .strip_prefix(&jsonb_prefix)
-                        .map(|path| (path.to_string(), column_type.clone()))
-                })
-                .collect::<Vec<_>>();
-            let nested_array = matches!(source_column_types.get(&binding.array_field), Some(ColumnType::Array(inner)) if matches!(inner.as_ref(), ColumnType::Array(_)));
-            let storage = if jsonb_element_types.is_empty() {
-                if let Some(ColumnType::Array(inner)) =
-                    source_column_types.get(&binding.array_field).cloned()
-                {
-                    source_column_types.insert(binding.alias.clone(), *inner);
-                }
-                if nested_array {
-                    IterateStorage::PostgresJsonb
-                } else {
-                    IterateStorage::NativeArray
-                }
-            } else {
-                for (path, column_type) in jsonb_element_types {
-                    source_column_types.insert(format!("{}.{}", binding.alias, path), column_type);
-                }
+            let tuple_elements =
+                source_column_types.keys().any(|field| field.starts_with(&jsonb_prefix));
+            let element_type = match source_column_types.get(&binding.array_field) {
+                Some(ColumnType::Array(inner)) => Some(inner.as_ref()),
+                _ => None,
+            };
+            if storage_names.is_some() {
+                anyhow::ensure!(
+                    tuple_elements || element_type.is_some(),
+                    "iteration requires a stored array at '{}'",
+                    binding.array_field
+                );
+            }
+            let storage = if tuple_elements || matches!(element_type, Some(ColumnType::Array(_))) {
                 IterateStorage::PostgresJsonb
+            } else {
+                IterateStorage::NativeArray
             };
             iterate.push(RollbackIterateBinding {
+                declared_alias,
                 array_field: binding.array_field,
                 alias: binding.alias,
                 storage,
@@ -258,32 +284,81 @@ impl DerivedTableRollbackPlan {
         );
         table_operations.insert(
             operation_index,
-            DerivedTableRollbackMetadata { iterate, source_column_types, derived_column_types },
+            DerivedTableRollbackMetadata {
+                iterate,
+                source_column_types,
+                derived_column_types,
+                storage_names,
+            },
         );
         Ok(())
     }
 
-    /// Check the same predicate renderer at startup that execution uses for snapshots.
-    pub(crate) fn validate_conditions(&self, table: &DerivedTableInfo) -> anyhow::Result<()> {
+    /// Startup and execution share predicate and operand-conversion admission.
+    pub(crate) fn validate_operations(&self, table: &DerivedTableInfo) -> anyhow::Result<()> {
         let empty_types = HashMap::new();
         for (index, operation) in table.rollback_ops.iter().enumerate() {
-            let Some(condition) = &operation.condition else {
-                continue;
-            };
             let metadata = self.operation(&table.full_table_name, index);
             let source = ReversalSource {
                 dialect: SqlDialect::Postgres,
                 iterate: metadata.map(|metadata| metadata.iterate.as_slice()).unwrap_or(&[]),
+                storage_names: metadata.and_then(|m| m.storage_names.as_deref()),
                 source_column_types: metadata
-                    .map(|metadata| &metadata.source_column_types)
+                    .map(|metadata| metadata.source_column_types.as_ref())
                     .unwrap_or(&empty_types),
             };
-            render_reorg_condition(condition, &source).with_context(|| {
-                format!(
-                    "Cannot prepare recovery predicate for {} operation {}",
-                    table.full_table_name, index
-                )
-            })?;
+            if let Some(condition) = &operation.condition {
+                render_reorg_condition(condition, &source).with_context(|| {
+                    format!(
+                        "Cannot prepare recovery predicate for {} operation {}",
+                        table.full_table_name, index
+                    )
+                })?;
+            }
+            let targets = metadata
+                .map(|metadata| metadata.derived_column_types.as_ref())
+                .unwrap_or(&empty_types);
+            for (derived, event) in &operation.where_columns {
+                source.operand_as(event, targets.get(derived)).with_context(|| {
+                    format!("Cannot prepare recovery key {}.{}", table.full_table_name, derived)
+                })?;
+            }
+            for column in &operation.columns {
+                let target = targets.get(&column.derived_column).ok_or_else(|| anyhow::anyhow!(
+                    "Arithmetic recovery requires source/target type metadata for {}.{}; build a typed plan with DerivedTableRollbackPlan::try_add_table_event and use execute_with_rollback_plan",
+                    table.full_table_name, column.derived_column
+                ))?;
+                anyhow::ensure!(
+                    matches!(
+                        target,
+                        ColumnType::Uint8
+                            | ColumnType::Uint16
+                            | ColumnType::Uint32
+                            | ColumnType::Uint64
+                            | ColumnType::Uint128
+                            | ColumnType::Uint256
+                            | ColumnType::Int8
+                            | ColumnType::Int16
+                            | ColumnType::Int32
+                            | ColumnType::Int64
+                            | ColumnType::Int128
+                            | ColumnType::Int256
+                    ),
+                    "Cannot prepare recovery for {}.{}: arithmetic requires a numeric destination",
+                    table.full_table_name,
+                    column.derived_column
+                );
+                if !column.action.is_counter_action() {
+                    source
+                        .operand_as(&column.event_column, targets.get(&column.derived_column))
+                        .with_context(|| {
+                            format!(
+                                "Cannot prepare recovery operand {}.{}",
+                                table.full_table_name, column.derived_column
+                            )
+                        })?;
+                }
+            }
         }
         Ok(())
     }
@@ -489,20 +564,14 @@ struct ReversalSource<'a> {
     dialect: SqlDialect,
     iterate: &'a [RollbackIterateBinding],
     source_column_types: &'a HashMap<String, ColumnType>,
+    storage_names: Option<&'a HashMap<String, String>>,
 }
 
 impl ReversalSource<'_> {
+    // System metadata is never an iterate alias or ABI leaf.
     fn column(&self, field: &str) -> String {
-        let alias = normalize_event_field(field);
-        if let Some(index) = self.iterate.iter().position(|binding| binding.alias == alias) {
-            match self.dialect {
-                SqlDialect::Postgres => format!("_rindexer_iter.{}", self.dialect.quote(&alias)),
-                SqlDialect::Clickhouse => format!("tupleElement(_rindexer_iter, {})", index + 1),
-            }
-        } else {
-            let column = event_field_to_db_column(field);
-            format!("_rindexer_event.{}", self.dialect.quote(&column))
-        }
+        let column = event_field_to_db_column(field);
+        format!("_rindexer_event.{}", self.dialect.quote(&column))
     }
 
     fn variable_expression(&self, variable: &ConditionLeft<'_>) -> String {
@@ -512,9 +581,15 @@ impl ReversalSource<'_> {
 
     /// Resolve a scalar SQL expression together with its declared source type.
     fn resolve_variable(&self, variable: &ConditionLeft<'_>) -> (String, Option<ColumnType>) {
-        let base = normalize_event_field(variable.base_name());
-        if let Some(binding) = self.iterate.iter().find(|binding| binding.alias == base) {
-            return self.resolve_iterate_variable(variable, binding);
+        let base = variable.base_name();
+        if let Some((index, binding)) = self.iterate.iter().enumerate().find(|(_, binding)| {
+            if self.storage_names.is_some() {
+                binding.declared_alias == base
+            } else {
+                binding.alias == normalize_event_field(base)
+            }
+        }) {
+            return self.resolve_iterate_variable(variable, index, binding);
         }
 
         let mut field_parts = vec![variable.base_name()];
@@ -525,13 +600,19 @@ impl ReversalSource<'_> {
             accessors.next();
         }
         let field = field_parts.join(".");
-        let db_column = event_field_to_db_column(&field);
-        let mut expression = self.column(&field);
-        let mut column_type = self
-            .source_column_types
-            .get(&db_column)
-            .cloned()
-            .or_else(|| ColumnType::from_tx_metadata_field(variable.base_name()));
+        // With declarations, a guessed spelling that happens to normalize to the
+        // same SQL column is not a valid ABI operand. The decoder uses exact paths.
+        let metadata_type = ColumnType::from_tx_metadata_field(&field);
+        let db_column = if self.storage_names.is_none() || metadata_type.is_some() {
+            event_field_to_db_column(&field)
+        } else if let Some(column) = self.storage_names.and_then(|names| names.get(&field)) {
+            column.clone()
+        } else {
+            return (String::new(), None);
+        };
+        let mut expression = format!("_rindexer_event.{}", self.dialect.quote(&db_column));
+        let mut column_type =
+            metadata_type.or_else(|| self.source_column_types.get(&db_column).cloned());
         let mut json_field = db_column;
         let mut json_path = Vec::new();
         let nested_array = matches!(&column_type, Some(ColumnType::Array(inner)) if matches!(inner.as_ref(), ColumnType::Array(_)));
@@ -579,6 +660,7 @@ impl ReversalSource<'_> {
             expression = format!("jsonb_extract_path_text({}, {})", expression, path);
         }
         let expression = match &column_type {
+            Some(kind) if !json_path.is_empty() => source_json_cast(self.dialect, expression, kind),
             Some(kind) => source_cast(self.dialect, expression, kind),
             None => expression,
         };
@@ -588,13 +670,22 @@ impl ReversalSource<'_> {
     fn resolve_iterate_variable(
         &self,
         variable: &ConditionLeft<'_>,
+        index: usize,
         binding: &RollbackIterateBinding,
     ) -> (String, Option<ColumnType>) {
-        let mut expression = self.column(&binding.alias);
-        let mut column_type = self.source_column_types.get(&binding.alias).cloned();
+        let mut expression = match self.dialect {
+            SqlDialect::Postgres => {
+                format!("_rindexer_iter.{}", self.dialect.quote(&binding.alias))
+            }
+            SqlDialect::Clickhouse => format!("tupleElement(_rindexer_iter, {})", index + 1),
+        };
+        let mut column_type = match self.source_column_types.get(&binding.array_field) {
+            Some(ColumnType::Array(inner)) => Some((**inner).clone()),
+            _ => None,
+        };
 
         if binding.storage == IterateStorage::PostgresJsonb {
-            let mut field = binding.alias.clone();
+            let mut field = binding.array_field.clone();
             let path = variable
                 .accessors()
                 .iter()
@@ -638,15 +729,38 @@ impl ReversalSource<'_> {
         }
 
         let expression = match &column_type {
+            Some(kind) if binding.storage == IterateStorage::PostgresJsonb => {
+                source_json_cast(self.dialect, expression, kind)
+            }
             Some(kind) => source_cast(self.dialect, expression, kind),
             None => expression,
         };
         (expression, column_type)
     }
 
+    #[cfg(test)]
     fn operand(&self, operand: &str) -> anyhow::Result<String> {
         let variable = parse_event_operand(operand, "rollback operand")?;
         Ok(self.variable_expression(&variable))
+    }
+
+    /// Normalize values before grouping, summing, or matching surviving keys.
+    /// A target type is required even for legacy public callers: the raw storage
+    /// representation alone cannot prove the forward conversion.
+    fn operand_as(&self, operand: &str, target: Option<&ColumnType>) -> anyhow::Result<String> {
+        let variable = parse_event_operand(operand, "rollback operand")?;
+        let (expression, source) = self.resolve_variable(&variable);
+        let target = target.ok_or_else(|| anyhow::anyhow!(
+            "Arithmetic recovery requires source/target type metadata for operand {operand:?}; build a typed plan with DerivedTableRollbackPlan::try_add_table_event and use execute_with_rollback_plan"
+        ))?;
+        let source = source.ok_or_else(|| anyhow::anyhow!(
+            "source type metadata is missing for arithmetic operand {operand:?}; check the path and supply source types in DerivedTableRollbackPlan"
+        ))?;
+        let conversion = ScalarConversion::new(&source, target).map_err(anyhow::Error::msg)?;
+        Ok(match self.dialect {
+            SqlDialect::Postgres => conversion.postgres_sql(expression),
+            SqlDialect::Clickhouse => self.dialect.cast(expression, target),
+        })
     }
 
     fn iterate_length_mismatch(&self) -> Option<String> {
@@ -729,6 +843,19 @@ impl ReversalSource<'_> {
     }
 }
 
+// ABI JSON serializes byte values as 0x-prefixed hexadecimal strings.
+fn source_json_cast(dialect: SqlDialect, expression: String, kind: &ColumnType) -> String {
+    match (dialect, kind) {
+        (SqlDialect::Postgres, ColumnType::Bytes | ColumnType::Bytes32) => {
+            format!("DECODE(SUBSTRING({expression} FROM 3), 'hex')")
+        }
+        (SqlDialect::Postgres, ColumnType::Array(inner)) if **inner == ColumnType::Address => {
+            format!("NULLIF(ARRAY(SELECT jsonb_array_elements_text(CAST({expression} AS JSONB))), ARRAY[]::TEXT[])")
+        }
+        _ => source_cast(dialect, expression, kind),
+    }
+}
+
 // Raw source domains differ from custom-table storage: uint64 needs all 64 bits.
 fn source_cast(dialect: SqlDialect, expression: String, kind: &ColumnType) -> String {
     if matches!(kind, ColumnType::Uint64) {
@@ -807,7 +934,7 @@ fn render_reorg_condition(condition: &str, source: &ReversalSource<'_>) -> anyho
             Some(ColumnType::String) => Some(format!("ABI string input {variable:?} uses value-dependent numeric conversion and Unicode case folding in forward filters; raw-history recovery cannot reproduce those semantics in SQL. Use a verified numeric/boolean admission field or maintain this aggregation outside raw-history recovery")),
             Some(ColumnType::Address | ColumnType::Bytes | ColumnType::Bytes32) => Some(format!("ABI address/bytes input {variable:?} is evaluated as a string with value-dependent numeric conversion in forward filters; raw-history recovery cannot reproduce those semantics with SQL address/byte comparisons. Use a verified numeric/boolean admission field or maintain this aggregation outside raw-history recovery")),
             Some(ColumnType::Array(_)) => Some(format!("input {variable:?} is an array; select a supported scalar leaf for recovery")),
-            None => Some(format!("source type metadata is missing for {variable:?}; check the field path and supply source types through DerivedTableRollbackPlan::try_add_operation and execute_with_rollback_plan")),
+            None => Some(format!("source type metadata is missing for {variable:?}; check the field path and supply source types through DerivedTableRollbackPlan::try_add_table_event and execute_with_rollback_plan")),
             Some(_) => None,
         };
     });
@@ -877,21 +1004,24 @@ impl ReorgTask {
                     let source = ReversalSource {
                         dialect,
                         iterate: &metadata.iterate,
+                        storage_names: metadata.storage_names.as_deref(),
                         source_column_types: &metadata.source_column_types,
                     };
                     let Some(mismatch) = source.iterate_length_mismatch() else {
                         continue;
                     };
+                    let network = if dt.cross_chain {
+                        String::new()
+                    } else {
+                        format!(
+                            "_rindexer_event.{} = '{}' AND ",
+                            dialect.quote("network"),
+                            self.network
+                        )
+                    };
                     let query = format!(
-                        "SELECT count(*) FROM {} AS _rindexer_event WHERE _rindexer_event.{} >= {} AND _rindexer_event.{} <= {} AND _rindexer_event.{} = '{}' AND ({})",
-                        op.event_table,
-                        dialect.quote("block_number"),
-                        self.fork_point,
-                        dialect.quote("block_number"),
-                        self.detection_point,
-                        dialect.quote("network"),
-                        self.network,
-                        mismatch,
+                        "SELECT count(*) FROM {} AS _rindexer_event WHERE {}({})",
+                        op.event_table, network, mismatch,
                     );
 
                     let mismatch_count = match (dialect, pg, ch) {
@@ -909,12 +1039,84 @@ impl ReorgTask {
                     };
                     anyhow::ensure!(
                         mismatch_count == 0,
-                        "rollback iterate arrays have unequal lengths in {} between blocks {} and {}; aborting before event deletion",
+                        "rollback iterate arrays have unequal lengths in contributing history for {}; aborting before event deletion",
                         op.event_table,
-                        self.fork_point,
-                        self.detection_point,
                     );
                 }
+            }
+        }
+        Ok(())
+    }
+
+    async fn validate_required_arithmetic_inputs(
+        &self,
+        pg: &PgTransaction<'_>,
+        rollback_plan: &DerivedTableRollbackPlan,
+    ) -> anyhow::Result<()> {
+        let empty_types = HashMap::new();
+        for table in &self.derived_tables {
+            for (index, operation) in table.rollback_ops.iter().enumerate() {
+                let metadata = rollback_plan.operation(&table.full_table_name, index);
+                let source = ReversalSource {
+                    dialect: SqlDialect::Postgres,
+                    iterate: metadata.map_or(&[], |metadata| metadata.iterate.as_slice()),
+                    storage_names: metadata.and_then(|m| m.storage_names.as_deref()),
+                    source_column_types: metadata
+                        .map_or(&empty_types, |metadata| metadata.source_column_types.as_ref()),
+                };
+                let targets = metadata
+                    .map_or(&empty_types, |metadata| metadata.derived_column_types.as_ref());
+                let operands =
+                    operation.where_columns.iter().map(|(derived, event)| (derived, event)).chain(
+                        operation
+                            .columns
+                            .iter()
+                            .filter(|column| !column.action.is_counter_action())
+                            .map(|column| (&column.derived_column, &column.event_column)),
+                    );
+                let missing = operands
+                    .map(|(derived, operand)| {
+                        source
+                            .operand_as(operand, targets.get(derived))
+                            .map(|value| format!("({value}) IS NULL"))
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                if missing.is_empty() {
+                    continue;
+                }
+                let missing = missing.join(" OR ");
+                // The predicate is evaluated first, as in forward preparation;
+                // absent operands in unselected rows are not required inputs.
+                let missing = match &operation.condition {
+                    Some(condition) => format!(
+                        "CASE WHEN ({}) THEN ({missing}) ELSE FALSE END",
+                        render_reorg_condition(condition, &source)?
+                    ),
+                    None => missing,
+                };
+                // Canonical metadata reconstruction also consumes retained raw
+                // history, including other contributing networks for shared rows.
+                // A legacy defaulted key cannot identify its affected row, so
+                // validating only the orphan suffix would miss an unsafe baseline.
+                let network = if table.cross_chain {
+                    String::new()
+                } else {
+                    format!("_rindexer_event.network = '{}' AND ", self.network)
+                };
+                let query = format!(
+                    "SELECT EXISTS(SELECT 1 FROM {} WHERE {}({}))",
+                    source.from(&operation.event_table),
+                    network,
+                    missing
+                );
+                let missing: bool = pg
+                    .query_one(&query, &[])
+                    .await
+                    .context("Cannot validate required arithmetic recovery inputs")?
+                    .get(0);
+                anyhow::ensure!(!missing,
+                    "Cannot recover {}: raw history contains an unresolved required arithmetic key or operand. Earlier versions may have substituted a default; rebuild affected derived state, receipts and cursors from canonical history before retrying",
+                    table.full_table_name);
             }
         }
         Ok(())
@@ -931,6 +1133,9 @@ impl ReorgTask {
         rollback_plan: &DerivedTableRollbackPlan,
     ) -> anyhow::Result<ReversalSnapshots> {
         self.validate_iterate_lengths(pg, ch, rollback_plan).await?;
+        if let Some(pg) = pg {
+            self.validate_required_arithmetic_inputs(pg, rollback_plan).await?;
+        }
 
         let (attempt_id, clickhouse_marker, resumed) = match ch {
             Some(ch) => {
@@ -1033,10 +1238,10 @@ impl ReorgTask {
                 let metadata = rollback_plan.operation(&dt.full_table_name, op_index);
                 let iterate = metadata.map_or(&[][..], |metadata| metadata.iterate.as_slice());
                 let source_column_types = metadata
-                    .map(|metadata| &metadata.source_column_types)
+                    .map(|metadata| metadata.source_column_types.as_ref())
                     .unwrap_or(&empty_column_types);
                 let derived_column_types = metadata
-                    .map(|metadata| &metadata.derived_column_types)
+                    .map(|metadata| metadata.derived_column_types.as_ref())
                     .unwrap_or(&empty_column_types);
 
                 // (is_counter, source event column, derived column, agg alias) per reversible
@@ -1105,16 +1310,18 @@ impl ReorgTask {
                 // reserved words (e.g. `to`, `from`), so each backend quotes them with
                 // its own convention (Postgres double quotes, ClickHouse backticks).
                 let build_select = |dialect: SqlDialect| -> anyhow::Result<String> {
-                    let source = ReversalSource { dialect, iterate, source_column_types };
+                    let source = ReversalSource {
+                        dialect,
+                        iterate,
+                        source_column_types,
+                        storage_names: metadata.and_then(|m| m.storage_names.as_deref()),
+                    };
                     let group_expressions = op
                         .where_columns
                         .iter()
                         .map(|(derived_column, event_column)| {
-                            let expression = source.operand(event_column)?;
-                            Ok(match derived_column_types.get(derived_column) {
-                                Some(column_type) => dialect.cast(expression, column_type),
-                                None => expression,
-                            })
+                            source
+                                .operand_as(event_column, derived_column_types.get(derived_column))
                         })
                         .collect::<anyhow::Result<Vec<_>>>()?;
                     let group = group_expressions.join(", ");
@@ -1143,11 +1350,10 @@ impl ReorgTask {
                             if *is_counter {
                                 Ok(format!("COUNT(*) AS {}", alias))
                             } else {
-                                let expression = source.operand(event_column)?;
-                                let expression = match derived_column_types.get(derived_column) {
-                                    Some(column_type) => dialect.cast(expression, column_type),
-                                    None => expression,
-                                };
+                                let expression = source.operand_as(
+                                    event_column,
+                                    derived_column_types.get(derived_column),
+                                )?;
                                 Ok(format!("SUM({}) AS {}", expression, alias))
                             }
                         })
@@ -1778,11 +1984,13 @@ impl ReorgTask {
             .await
     }
 
-    /// Execute a reorg with optional iterate and type metadata for derived-table rollback.
+    /// Execute a reorg with iterate and type metadata for derived-table rollback.
     ///
-    /// Existing callers can continue using [`Self::execute`]. This additive entry point
-    /// is used by the runtime-generated coordinator plan and by integrations that need
-    /// custom-table iterate rollback without changing `ReorgTask` struct literals.
+    /// Arithmetic operations require source and destination types registered with
+    /// [`DerivedTableRollbackPlan::try_add_table_event`], including unconditional
+    /// operations. [`Self::execute`] remains suitable for raw, insert-only and
+    /// journal-only recovery. Runtime coordinators construct the typed plan from
+    /// the ABI and table definitions.
     pub async fn execute_with_rollback_plan(
         &self,
         window: &mut BlockChainWindow,
@@ -1794,19 +2002,22 @@ impl ReorgTask {
         let providers = provider
             .map(|provider| HashMap::from([(self.network.clone(), provider.clone())]))
             .unwrap_or_default();
-        self.execute_with_deliveries(window, postgres, clickhouse, &providers, rollback_plan, &[])
-            .await
+        let ctx =
+            super::ReorgContext { postgres, clickhouse, registry: None, trace_registry: None };
+        self.execute_with_deliveries(window, &ctx, &providers, rollback_plan, &[], &[]).await
     }
 
     pub(super) async fn execute_with_deliveries(
         &self,
         window: &mut BlockChainWindow,
-        postgres: Option<&PostgresClient>,
-        clickhouse: Option<&Arc<ClickhouseClient>>,
+        ctx: &super::ReorgContext<'_>,
         providers: &HashMap<String, Arc<dyn ChainProvider>>,
         rollback_plan: &DerivedTableRollbackPlan,
         deliveries: &[Arc<Option<crate::streams::StreamsClients>>],
+        checkpoint_only: &[String],
     ) -> anyhow::Result<ReorgTaskResult> {
+        let postgres = ctx.postgres;
+        let clickhouse = ctx.clickhouse;
         anyhow::ensure!(
             postgres.is_some()
                 || !deliveries
@@ -1819,7 +2030,7 @@ impl ReorgTask {
         super::validate_sql_value(&self.network, "reorg task network")?;
         // A retained snapshot cannot bypass current predicate admission.
         for table in &self.derived_tables {
-            rollback_plan.validate_conditions(table)?;
+            rollback_plan.validate_operations(table)?;
         }
 
         let start = std::time::Instant::now();
@@ -1916,6 +2127,7 @@ impl ReorgTask {
                     .event_tables
                     .iter()
                     .map(|t| t.checkpoint_table.as_str())
+                    .chain(checkpoint_only.iter().map(String::as_str))
                     .collect::<Vec<_>>();
                 let (deleted, tx_hashes) = PostgresClient::reorg_rollback_in_transaction(
                     pg,
@@ -1942,6 +2154,7 @@ impl ReorgTask {
                     .event_tables
                     .iter()
                     .map(|t| t.checkpoint_table.clone())
+                    .chain(checkpoint_only.iter().cloned())
                     .collect::<Vec<_>>();
                 let (ch_deleted, ch_tx_hashes) = ch
                     .reorg_rollback(
@@ -2097,6 +2310,7 @@ mod tests {
         let source = ReversalSource {
             dialect: SqlDialect::Postgres,
             iterate: &[],
+            storage_names: None,
             source_column_types: &types,
         };
         for condition in ["$gate != -1", "$amount > 0.5", "$flag > false"] {
@@ -2118,6 +2332,7 @@ mod tests {
         let source = ReversalSource {
             dialect: SqlDialect::Postgres,
             iterate: &[],
+            storage_names: None,
             source_column_types: &types,
         };
         let sql = source.operand("amount").unwrap();
@@ -2133,6 +2348,7 @@ mod tests {
         let source = ReversalSource {
             dialect: SqlDialect::Postgres,
             iterate: &[],
+            storage_names: None,
             source_column_types: &types,
         };
         let sql = source.operand("values[0]").unwrap();
@@ -2358,6 +2574,7 @@ mod tests {
         let pg_source = ReversalSource {
             dialect: SqlDialect::Postgres,
             iterate: &[],
+            storage_names: None,
             source_column_types: &source_column_types,
         };
         assert_eq!(
@@ -2372,6 +2589,7 @@ mod tests {
         let ch_source = ReversalSource {
             dialect: SqlDialect::Clickhouse,
             iterate: &[],
+            storage_names: None,
             source_column_types: &source_column_types,
         };
         assert_eq!(
@@ -2429,8 +2647,12 @@ mod tests {
     fn test_reorg_condition_rejects_legacy_sql_parser_bypass() {
         let source_column_types = HashMap::from([("value".to_string(), ColumnType::Uint256)]);
         for dialect in [SqlDialect::Postgres, SqlDialect::Clickhouse] {
-            let source =
-                ReversalSource { dialect, iterate: &[], source_column_types: &source_column_types };
+            let source = ReversalSource {
+                dialect,
+                iterate: &[],
+                storage_names: None,
+                source_column_types: &source_column_types,
+            };
             for condition in ["value / 1000 = 1", "value = 1", "value::NUMERIC > 7"] {
                 // These are safe SQL tokens but lack a supported filter AST.
                 crate::indexer::reorg::validate_sql_condition(condition).unwrap();
@@ -2449,8 +2671,12 @@ mod tests {
     fn test_reorg_condition_rejects_unquoted_hex_literals() {
         let source_column_types = HashMap::from([("value".to_string(), ColumnType::Uint256)]);
         for dialect in [SqlDialect::Postgres, SqlDialect::Clickhouse] {
-            let source =
-                ReversalSource { dialect, iterate: &[], source_column_types: &source_column_types };
+            let source = ReversalSource {
+                dialect,
+                iterate: &[],
+                storage_names: None,
+                source_column_types: &source_column_types,
+            };
             for condition in [
                 "$value > 0 && 0x00 == 0x0",
                 "0x00 == 0x0 && $value > 0",
@@ -2491,6 +2717,7 @@ mod tests {
                 let source = ReversalSource {
                     dialect,
                     iterate: &[],
+                    storage_names: None,
                     source_column_types: &source_column_types,
                 };
                 // No literal or quote characters: checking only literal syntax

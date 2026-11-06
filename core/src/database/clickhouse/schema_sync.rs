@@ -9,9 +9,10 @@ use clickhouse::Row;
 use serde::Deserialize;
 
 use crate::database::clickhouse::client::ClickhouseClient;
-use crate::database::generate::generate_indexer_contract_schema_name;
+use crate::database::generate::{check_legacy_column_names, generate_indexer_contract_schema_name};
 use crate::helpers::camel_to_snake;
-use crate::manifest::contract::{injected_columns, Table};
+use crate::indexer::schema::PreparedSchema;
+use crate::manifest::contract::{injected_columns, ResolvedTable, Table};
 use crate::manifest::core::Manifest;
 
 /// Represents a detected schema change that may need to be applied.
@@ -234,120 +235,153 @@ pub async fn detect_schema_changes(
     client: &ClickhouseClient,
     manifest: &Manifest,
 ) -> Result<Vec<SchemaChange>, String> {
-    let mut changes: Vec<SchemaChange> = vec![];
+    let tables = manifest
+        .custom_table_groups()
+        .flat_map(|(owner, tables)| {
+            tables.iter().map(move |table| {
+                table.try_resolve_storage_columns().map(|resolved| (owner, table, resolved))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let tables: Vec<_> =
+        tables.iter().map(|(owner, table, resolved)| (*owner, *table, resolved)).collect();
+    detect_resolved_schema_changes(client, &manifest.name, &tables).await
+}
 
-    for contract in &manifest.contracts {
-        let Some(tables) = &contract.tables else {
+/// Compare catalogs against the frozen startup schema without resolving declarations again.
+pub async fn detect_prepared_schema_changes(
+    client: &ClickhouseClient,
+    schema: &PreparedSchema,
+) -> Result<Vec<SchemaChange>, String> {
+    let tables: Vec<_> = schema
+        .contracts()
+        .iter()
+        .chain(schema.native())
+        .flat_map(|contract| {
+            contract.declaration.tables.iter().flatten().zip(contract.tables.iter()).map(
+                move |(declaration, runtime)| (contract.name.as_str(), declaration, &runtime.table),
+            )
+        })
+        .collect();
+    detect_resolved_schema_changes(client, &schema.indexer().name, &tables).await
+}
+
+async fn detect_resolved_schema_changes(
+    client: &ClickhouseClient,
+    indexer_name: &str,
+    tables: &[(&str, &Table, &ResolvedTable)],
+) -> Result<Vec<SchemaChange>, String> {
+    let mut changes = Vec::new();
+    for &(owner, declaration, resolved) in tables {
+        let default_schema = generate_indexer_contract_schema_name(indexer_name, owner);
+        let table = resolved.definition();
+        let database = table.database.as_deref().unwrap_or(&default_schema);
+        if table.database.is_some() {
+            crate::indexer::reorg::validate_sql_identifier(database, "custom table database")
+                .map_err(|error| error.to_string())?;
+        }
+        let table_name = camel_to_snake(&table.name);
+        let table_full_name = format!("{}.{}", database, table_name);
+
+        // Check if table exists
+        if !table_exists(client, database, &table_name).await? {
+            // Table doesn't exist yet, will be created normally
             continue;
-        };
+        }
 
-        let database = generate_indexer_contract_schema_name(&manifest.name, &contract.name);
+        // Get existing columns
+        let existing_columns = get_existing_columns(client, database, &table_name).await?;
+        let existing_col_names: HashSet<String> =
+            existing_columns.iter().map(|c| c.name.clone()).collect();
+        check_legacy_column_names(declaration, resolved, &existing_col_names, |name| name)?;
+        let existing_col_types: HashMap<String, String> =
+            existing_columns.iter().map(|c| (c.name.clone(), c.data_type.clone())).collect();
 
-        for table in tables {
-            let table_name = camel_to_snake(&table.name);
-            let table_full_name = format!("{}.{}", database, table_name);
+        // Get expected columns from YAML
+        let expected_columns = get_expected_columns(table);
+        let expected_col_names: HashSet<String> = expected_columns.keys().cloned().collect();
 
-            // Check if table exists
-            if !table_exists(client, &database, &table_name).await? {
-                // Table doesn't exist yet, will be created normally
+        // Find new columns (in YAML but not in DB)
+        for col_name in expected_col_names.difference(&existing_col_names) {
+            let col_type = expected_columns.get(col_name).unwrap();
+
+            // Skip columns with unknown types (not yet resolved from ABI)
+            if col_type == "unknown" {
                 continue;
             }
 
-            // Get existing columns
-            let existing_columns = get_existing_columns(client, &database, &table_name).await?;
-            let existing_col_names: HashSet<String> =
-                existing_columns.iter().map(|c| c.name.clone()).collect();
-            let existing_col_types: HashMap<String, String> =
-                existing_columns.iter().map(|c| (c.name.clone(), c.data_type.clone())).collect();
+            // Look up the default value from the column definition
+            let default_value = table
+                .columns
+                .iter()
+                .find(|c| &c.name == col_name)
+                .and_then(|c| c.default.clone())
+                .map(|d| {
+                    // ClickHouse needs proper quoting for string defaults
+                    if col_type == "String" || col_type.starts_with("FixedString") {
+                        format!("'{}'", d.replace('\'', "\\'"))
+                    } else {
+                        d
+                    }
+                });
 
-            // Get expected columns from YAML
-            let expected_columns = get_expected_columns(table);
-            let expected_col_names: HashSet<String> = expected_columns.keys().cloned().collect();
+            changes.push(SchemaChange::AddColumn {
+                table_full_name: table_full_name.clone(),
+                column_name: col_name.clone(),
+                column_type: col_type.clone(),
+                default_value,
+            });
+        }
 
-            // Find new columns (in YAML but not in DB)
-            for col_name in expected_col_names.difference(&existing_col_names) {
-                let col_type = expected_columns.get(col_name).unwrap();
+        // Find removed columns (in DB but not in YAML)
+        // Exclude internal columns that are auto-managed
+        let internal_columns: HashSet<&str> = ["rindexer_id"].into_iter().collect();
 
-                // Skip columns with unknown types (not yet resolved from ABI)
-                if col_type == "unknown" {
-                    continue;
-                }
-
-                // Look up the default value from the column definition
-                let default_value = table
-                    .columns
-                    .iter()
-                    .find(|c| &c.name == col_name)
-                    .and_then(|c| c.default.clone())
-                    .map(|d| {
-                        // ClickHouse needs proper quoting for string defaults
-                        if col_type == "String" || col_type.starts_with("FixedString") {
-                            format!("'{}'", d.replace('\'', "\\'"))
-                        } else {
-                            d
-                        }
-                    });
-
-                changes.push(SchemaChange::AddColumn {
+        for col_name in existing_col_names.difference(&expected_col_names) {
+            if !internal_columns.contains(col_name.as_str()) {
+                changes.push(SchemaChange::RemoveColumn {
                     table_full_name: table_full_name.clone(),
                     column_name: col_name.clone(),
-                    column_type: col_type.clone(),
-                    default_value,
                 });
             }
+        }
 
-            // Find removed columns (in DB but not in YAML)
-            // Exclude internal columns that are auto-managed
-            let internal_columns: HashSet<&str> = ["rindexer_id"].into_iter().collect();
+        // Check for ORDER BY changes
+        if let Some(current_order_by) = get_order_by_columns(client, database, &table_name).await? {
+            let expected_order_by = get_expected_order_by_columns(table);
 
-            for col_name in existing_col_names.difference(&expected_col_names) {
-                if !internal_columns.contains(col_name.as_str()) {
-                    changes.push(SchemaChange::RemoveColumn {
-                        table_full_name: table_full_name.clone(),
-                        column_name: col_name.clone(),
-                    });
-                }
+            if current_order_by != expected_order_by {
+                changes.push(SchemaChange::ChangeOrderBy {
+                    table_full_name: table_full_name.clone(),
+                    current_order_by,
+                    new_order_by: expected_order_by,
+                });
+            }
+        }
+
+        // Check for type changes (only for user-defined columns with resolved types)
+        for column in &table.columns {
+            if column.column_type.is_none() {
+                continue;
             }
 
-            // Check for ORDER BY changes
-            if let Some(current_order_by) =
-                get_order_by_columns(client, &database, &table_name).await?
-            {
-                let expected_order_by = get_expected_order_by_columns(table);
-
-                if current_order_by != expected_order_by {
-                    changes.push(SchemaChange::ChangeOrderBy {
-                        table_full_name: table_full_name.clone(),
-                        current_order_by,
-                        new_order_by: expected_order_by,
-                    });
-                }
-            }
-
-            // Check for type changes (only for user-defined columns with resolved types)
-            for column in &table.columns {
-                if column.column_type.is_none() {
+            if let Some(existing_type) = existing_col_types.get(&column.name) {
+                let expected_type = expected_columns.get(&column.name).unwrap();
+                if expected_type == "unknown" {
                     continue;
                 }
 
-                if let Some(existing_type) = existing_col_types.get(&column.name) {
-                    let expected_type = expected_columns.get(&column.name).unwrap();
-                    if expected_type == "unknown" {
-                        continue;
-                    }
+                // Normalize types for comparison
+                let normalized_existing = normalize_ch_type(existing_type);
+                let normalized_expected = normalize_ch_type(expected_type);
 
-                    // Normalize types for comparison
-                    let normalized_existing = normalize_ch_type(existing_type);
-                    let normalized_expected = normalize_ch_type(expected_type);
-
-                    if normalized_existing != normalized_expected {
-                        changes.push(SchemaChange::ColumnTypeChanged {
-                            table_full_name: table_full_name.clone(),
-                            column_name: column.name.clone(),
-                            current_type: existing_type.clone(),
-                            new_type: expected_type.clone(),
-                        });
-                    }
+                if normalized_existing != normalized_expected {
+                    changes.push(SchemaChange::ColumnTypeChanged {
+                        table_full_name: table_full_name.clone(),
+                        column_name: column.name.clone(),
+                        current_type: existing_type.clone(),
+                        new_type: expected_type.clone(),
+                    });
                 }
             }
         }

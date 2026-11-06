@@ -15,6 +15,7 @@ use crate::{
     abi::ABIItem,
     event::{parse_arithmetic_expression, parse_filter_expression, VariableSource},
     helpers::{load_env_from_full_path, replace_env_variable_to_raw_name},
+    indexer::schema::PreparedSchema,
     manifest::{
         core::{Manifest, ProjectType},
         network::Network,
@@ -24,6 +25,10 @@ use crate::{
 
 #[path = "recovery_validation.rs"]
 mod recovery_validation;
+
+#[cfg(test)]
+#[path = "cron_condition_tests.rs"]
+mod cron_condition_tests;
 
 pub const YAML_CONFIG_NAME: &str = "rindexer.yaml";
 
@@ -221,7 +226,16 @@ pub enum ValidateManifestError {
 fn validate_manifest(
     project_path: &Path,
     manifest: &Manifest,
+    prepared: Option<&PreparedSchema>,
 ) -> Result<(), ValidateManifestError> {
+    if let Some(schema) = prepared.filter(|_| manifest.storage.postgres_enabled()) {
+        schema.validate_postgres_identities().map_err(|error| {
+            ValidateManifestError::CustomIndexingValidationError(
+                error.to_string(),
+                manifest.name.clone(),
+            )
+        })?;
+    }
     let mut seen = HashSet::new();
     let duplicates_contract_names: Vec<String> = manifest
         .contracts
@@ -246,7 +260,50 @@ fn validate_manifest(
     }
 
     let contracts = manifest.all_contracts();
-    recovery_validation::validate(manifest, &contracts)?;
+    for contract in &contracts {
+        for table in contract.tables.iter().flatten() {
+            table.validate_event_mappings().map_err(|error| {
+                ValidateManifestError::CustomIndexingValidationError(error, contract.name.clone())
+            })?;
+        }
+    }
+    if manifest.native_transfers.enabled {
+        for table in manifest.native_transfers.tables.iter().flatten() {
+            table.validate_event_mappings().map_err(|error| {
+                ValidateManifestError::CustomIndexingValidationError(
+                    error,
+                    "native_transfers".to_string(),
+                )
+            })?;
+        }
+    }
+    // Neither historical nor live cron evaluates operation conditions. Reject
+    // them before schema synchronization rather than performing the mutation
+    // unconditionally. This also covers enabled native-transfer tables.
+    for (owner, tables) in manifest.custom_table_groups() {
+        for table in tables {
+            for (cron_index, cron) in table.cron.iter().flatten().enumerate() {
+                for (operation_index, operation) in cron.operations.iter().enumerate() {
+                    let conditional_fields =
+                        match (operation.if_condition.as_ref(), operation.filter.as_ref()) {
+                            (Some(_), Some(_)) => "`if` and `filter`",
+                            (Some(_), None) => "`if`",
+                            (None, Some(_)) => "`filter`",
+                            (None, None) => continue,
+                        };
+                    return Err(ValidateManifestError::CustomIndexingValidationError(
+                        format!(
+                            "Table {owner}.{} cron[{cron_index}].operations[{operation_index}] declares {conditional_fields}, but historical and live cron do not evaluate operation conditions. Remove the cron condition; event operations can use conditions.",
+                            table.name
+                        ),
+                        owner.to_owned(),
+                    ));
+                }
+            }
+        }
+    }
+
+    recovery_validation::validate(manifest, &contracts, prepared)?;
 
     for contract in &contracts {
         if contract.name.to_lowercase().contains("filter") {
@@ -255,8 +312,16 @@ fn validate_manifest(
             ));
         }
 
-        let events = ABIItem::read_abi_items(project_path, contract)
-            .map_err(|e| ValidateManifestError::InvalidABI(contract.name.clone(), e.to_string()))?;
+        let events = match prepared {
+            Some(schema) => schema
+                .contract(&contract.name)
+                .map_err(|error| ValidateManifestError::InvalidABI(contract.name.clone(), error))?
+                .items
+                .clone(),
+            None => ABIItem::read_abi_items(project_path, contract).map_err(|e| {
+                ValidateManifestError::InvalidABI(contract.name.clone(), e.to_string())
+            })?,
+        };
 
         for detail in &contract.details {
             let has_network = manifest.networks.iter().any(|n| n.name == detail.network);
@@ -846,11 +911,37 @@ fn validate_manifest(
         }
     }
 
+    if prepared.is_none() {
+        // Preserve logical declarations for manifest serialization and ABI inference.
+        // Validate the physical projection after the existing logical diagnostics.
+        for contract in &contracts {
+            for table in contract.tables.iter().flatten() {
+                table.try_resolve_storage_columns().map_err(|error| {
+                    ValidateManifestError::CustomIndexingValidationError(
+                        error,
+                        contract.name.clone(),
+                    )
+                })?;
+            }
+        }
+        if manifest.native_transfers.enabled {
+            for table in manifest.native_transfers.tables.iter().flatten() {
+                table.try_resolve_storage_columns().map_err(|error| {
+                    ValidateManifestError::CustomIndexingValidationError(
+                        error,
+                        "native_transfers".into(),
+                    )
+                })?;
+            }
+        }
+    }
     Ok(())
 }
 
 #[derive(thiserror::Error, Debug)]
 pub enum ReadManifestError {
+    #[error("Could not prepare storage schema: {0}")]
+    CouldNotPrepareSchema(String),
     #[error("Could not open file: {0}")]
     CouldNotOpenFile(#[from] std::io::Error),
 
@@ -880,7 +971,7 @@ pub fn read_manifest_raw(file_path: &PathBuf) -> Result<Manifest, ReadManifestEr
     match project_path {
         None => Err(ReadManifestError::NoProjectPathFoundUsingParentOfManifestPath),
         Some(project_path) => {
-            validate_manifest(project_path, &manifest)?;
+            validate_manifest(project_path, &manifest, None)?;
             Ok(manifest)
         }
     }
@@ -902,7 +993,7 @@ fn extract_environment_path(contents: &str, file_path: &Path) -> Option<PathBuf>
 }
 
 #[allow(clippy::result_large_err)]
-pub fn read_manifest(file_path: &PathBuf) -> Result<Manifest, ReadManifestError> {
+fn parse_manifest(file_path: &PathBuf) -> Result<Manifest, ReadManifestError> {
     let mut file = File::open(file_path)?;
     let mut contents = String::new();
 
@@ -959,11 +1050,43 @@ pub fn read_manifest(file_path: &PathBuf) -> Result<Manifest, ReadManifestError>
     let project_path = file_path.parent();
     match project_path {
         None => Err(ReadManifestError::NoProjectPathFoundUsingParentOfManifestPath),
-        Some(project_path) => {
-            validate_manifest(project_path, &manifest_after_transform)?;
-            Ok(manifest_after_transform)
-        }
+        Some(_) => Ok(manifest_after_transform),
     }
+}
+
+/// Read and validate a logical manifest for editing and standalone callers.
+#[allow(clippy::result_large_err)]
+pub fn read_manifest(file_path: &PathBuf) -> Result<Manifest, ReadManifestError> {
+    let manifest = parse_manifest(file_path)?;
+    validate_manifest(
+        file_path.parent().expect("parse_manifest checked the parent"),
+        &manifest,
+        None,
+    )?;
+    Ok(manifest)
+}
+
+/// Read startup declarations once, then validate logical references against that
+/// exact snapshot. Later storage consumers must retain the returned schema.
+#[allow(clippy::result_large_err)]
+pub fn read_manifest_prepared(
+    file_path: &PathBuf,
+) -> Result<(Manifest, PreparedSchema), ReadManifestError> {
+    let manifest = parse_manifest(file_path)?;
+    let project_path = file_path.parent().expect("parse_manifest checked the parent");
+    let schema = PreparedSchema::try_new(project_path, &manifest.to_indexer())
+        .map_err(|error| ReadManifestError::CouldNotPrepareSchema(error.to_string()))?;
+    validate_manifest(project_path, &manifest, Some(&schema))?;
+    Ok((manifest, schema))
+}
+
+/// Validate caller-owned declarations against a schema already prepared from them.
+pub(crate) fn validate_prepared_manifest(
+    project_path: &Path,
+    manifest: &Manifest,
+    schema: &PreparedSchema,
+) -> Result<(), ValidateManifestError> {
+    validate_manifest(project_path, manifest, Some(schema))
 }
 
 #[derive(thiserror::Error, Debug)]

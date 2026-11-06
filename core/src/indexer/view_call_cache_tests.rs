@@ -179,10 +179,10 @@ async fn late_original_prefetch_cannot_overwrite_replacement_state() {
     rpc.state.hold_original.store(true, Ordering::SeqCst);
     let provider =
         create_client(&rpc.url, 1, None, None, None, Default::default(), None, None).await.unwrap();
-    let table = TableRuntime::new(serde_json::from_value(json!({
+    let table = TableRuntime::try_new(&serde_json::from_value(json!({
         "name":"totals", "global":true, "columns":[{"name":"amount","type":"uint256","default":"0"}],
         "events":[{"event":"Value", "operations":[{"type":"upsert", "set":[{"column":"amount","action":"set","value":CALL}]}]}]
-    })).unwrap(), "Cache", "Contract");
+    })).unwrap(), "Cache", "Contract").unwrap();
     let original_provider: Arc<dyn ChainProvider> = provider.clone();
     let prefetch = tokio::spawn(async move {
         prefetch_view_calls(

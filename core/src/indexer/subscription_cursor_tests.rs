@@ -300,7 +300,7 @@ async fn postgres_restart_without_start_block_recovers_downtime_exactly_once() {
         .query(
             &format!(
                 "SELECT block_number::text FROM {} ORDER BY block_number",
-                fixture.params.sql_event_table_name
+                fixture.params.stored_table()
             ),
             &[],
         )
@@ -329,8 +329,8 @@ async fn postgres_restart_without_start_block_recovers_downtime_exactly_once() {
 #[tokio::test]
 async fn postgres_non_reorg_literal_arithmetic_survives_startup_and_restart() {
     let mut fixture = Fixture::new().await;
-    Arc::make_mut(&mut fixture.params.tables)[0].table.events[0].operations[0].set[0].value =
-        Some("1".into());
+    fixture.params.tables = fixture
+        .runtime_tables_with(|table| table.events[0].operations[0].set[0].value = Some("1".into()));
     run_tip_subscription(&fixture, 100).await;
     assert_eq!(fixture.position().await, (1, "1".into(), "100".into()));
     run_tip_subscription(&fixture, 102).await;

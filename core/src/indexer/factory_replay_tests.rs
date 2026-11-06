@@ -162,3 +162,102 @@ async fn assert_factory_replay(size: u16) {
         "raw PG receipts protect events while factory completion keeps the cursor deferred"
     );
 }
+
+#[tokio::test]
+async fn postgres_factory_cron_samples_the_child_from_its_birth_block() {
+    use crate::{
+        database::generate::generate_prepared_tables_sql,
+        indexer::{cron_scheduler::CronScheduler, no_code::process_events_prepared},
+        provider::{ChainProvider, CreateNetworkProvider},
+        PreparedProject,
+    };
+    use std::collections::HashMap;
+
+    let fixture = Fixture::new().await;
+    let directory = fixture._directory.path();
+    let emitter = Address::repeat_byte(0xaa);
+    let child = Address::repeat_byte(0xbb);
+    // contractAddress and contract_address have different owners: the first is
+    // the decoded child, the second is metadata naming the emitting factory.
+    std::fs::write(
+        directory.join("factory.json"),
+        serde_json::to_vec(&json!([{
+            "name":"Created","type":"event","anonymous":false,
+            "inputs":[{"name":"contractAddress","type":"address","indexed":false}]
+        }]))
+        .unwrap(),
+    )
+    .unwrap();
+    let project = PreparedProject::try_new(
+        directory,
+        serde_json::from_value(json!({
+            "name":"FactoryCron","project_type":"no-code","storage":{"postgres":{"enabled":true}},
+            "networks":[{"name":"ethereum","chain_id":1,"rpc":"http://unused.invalid"}],
+            "contracts":[{"name":"Child","abi":"abi.json","include_events":["Value"],
+                "details":[{"network":"ethereum","factory":{"name":"Factory","abi":"factory.json",
+                    "event_name":"Created","input_name":"contractAddress","address":emitter}}],
+                "tables":[{"name":"samples","columns":[{"name":"sampled","type":"address"}],
+                    "cron":[{"start_block":"1","end_block":"2","operations":[{"type":"insert",
+                        "set":[{"column":"sampled","action":"set","value":"$contract"}]}]}]}]}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fixture
+        .client
+        .batch_execute(generate_prepared_tables_sql(project.schema(), false).unwrap().as_str())
+        .await
+        .unwrap();
+    let provider = Arc::new(MockChainProvider::new(1));
+    let callbacks = process_events_prepared(
+        directory,
+        project.manifest(),
+        project.schema(),
+        Some(fixture.client.clone()),
+        None,
+        &[CreateNetworkProvider {
+            network_name: "ethereum".into(),
+            disable_logs_bloom_checks: true,
+            client: provider.clone(),
+        }],
+    )
+    .await
+    .unwrap();
+    let discovery = callbacks.iter().find(|event| event.event_name == "Created").unwrap();
+    let mut log = fixture.events(&[1]).pop().unwrap();
+    assert_eq!(log.tx_information.block_number, 2);
+    log.log.inner.address = emitter;
+    log.tx_information.address = emitter;
+    log.log.inner.data = LogData::new_unchecked(
+        vec![discovery.topic_id],
+        DynSolValue::Tuple(vec![DynSolValue::Address(child)]).abi_encode_params().into(),
+    );
+    (discovery.callback)(vec![log]).await.unwrap();
+    let scheduler = CronScheduler::try_new_prepared(
+        project.schema(),
+        Some(fixture.client.clone()),
+        None,
+        Arc::new(HashMap::from([("ethereum".into(), provider as Arc<dyn ChainProvider>)])),
+    )
+    .unwrap();
+    let addresses = scheduler.sample_factory_for_test(&[1, 2]).await;
+    let rows = fixture.client.query(
+        "SELECT sampled, rindexer_contract_address, rindexer_block_number::text FROM factory_cron_child.samples", &[]
+    ).await.unwrap();
+    drop(scheduler);
+    drop(callbacks);
+    fixture.finish().await;
+    assert_eq!(
+        addresses.expect("look up the admitted discovery source"),
+        HashMap::from([(child, 2)])
+    );
+    let unprepared =
+        CronScheduler::try_new(project.manifest(), None, None, Arc::new(HashMap::new()));
+    let error =
+        unprepared.err().expect("an unprepared factory cron cannot resolve the discovery ABI");
+    assert!(error.contains("try_new_prepared"), "{error}");
+    assert_eq!(rows.len(), 1, "no pre-birth row or emitter sample");
+    assert_eq!(rows[0].get::<_, String>(0), format!("{child:#x}"));
+    assert_eq!(rows[0].get::<_, String>(1), format!("{child:#x}"));
+    assert_eq!(rows[0].get::<_, String>(2), "2");
+}

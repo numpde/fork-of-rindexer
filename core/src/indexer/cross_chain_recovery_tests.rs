@@ -9,7 +9,6 @@ use crate::{
     indexer::reorg::{
         BlockChainWindow, EventTableInfo, ReorgBlockHashPersistence, ReorgContext, ReorgCoordinator,
     },
-    manifest::contract::ColumnType,
     provider::{mock::MockChainProvider, ChainProvider},
 };
 
@@ -32,7 +31,11 @@ async fn rollback(fixture: &Fixture) -> anyhow::Result<()> {
         &fixture.params.indexer_name,
         "Contract",
         "ethereum",
-        &[("value".into(), ColumnType::Uint256)].into(),
+        &crate::indexer::reorg::task::RollbackEventSource::new(
+            "Value",
+            &fixture.params.event_info.inputs,
+        )
+        .unwrap(),
         &fixture.params.tables,
         &mut derived,
         &mut plans,
@@ -85,7 +88,7 @@ async fn rollback(fixture: &Fixture) -> anyhow::Result<()> {
 #[tokio::test]
 async fn postgres_cross_chain_insert_rollback_preserves_other_network_rows() {
     let fixture = fixture("insert", "set", false).await;
-    fixture.params.tables[0].table.validate_reorg_operations().unwrap();
+    fixture.params.tables[0].table.definition().validate_reorg_operations().unwrap();
     let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
     for (network, block, value) in [("ethereum", 99, 10), ("ethereum", 100, 20), ("other", 150, 30)]
     {
@@ -110,7 +113,7 @@ async fn postgres_cross_chain_insert_rollback_preserves_other_network_rows() {
         ["10", "30"],
         "A's fork must not delete B's append-only row at an unrelated higher height"
     );
-    let surviving = fixture.client.query_one(&format!("SELECT (SELECT count(*) FROM {} WHERE network = 'other'), (SELECT count(*) FROM rindexer_internal.event_applications WHERE network = 'other')",fixture.params.sql_event_table_name),&[]).await.unwrap();
+    let surviving = fixture.client.query_one(&format!("SELECT (SELECT count(*) FROM {} WHERE network = 'other'), (SELECT count(*) FROM rindexer_internal.event_applications WHERE network = 'other')",fixture.params.stored_table()),&[]).await.unwrap();
     assert_eq!((surviving.get::<_, i64>(0), surviving.get::<_, i64>(1)), (1, 1));
     drop(callback);
     fixture.finish().await;
@@ -185,7 +188,7 @@ async fn shared_state(fixture: &Fixture) -> (String, serde_json::Value) {
 
 async fn equal_position_case(other_first: bool) {
     let fixture = fixture("upsert", "set", false).await;
-    fixture.params.tables[0].table.validate_reorg_operations().unwrap();
+    fixture.params.tables[0].table.definition().validate_reorg_operations().unwrap();
     let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
     let mut updates = [("ethereum", 10), ("other", 20)];
     if other_first {
@@ -285,7 +288,7 @@ async fn remove_other_raw_timestamp(fixture: &Fixture) {
         .client
         .batch_execute(&format!(
             "UPDATE {} SET block_timestamp = NULL WHERE network = 'other'",
-            fixture.params.sql_event_table_name
+            fixture.params.stored_table()
         ))
         .await
         .unwrap();
@@ -294,7 +297,7 @@ async fn remove_other_raw_timestamp(fixture: &Fixture) {
 #[tokio::test]
 async fn postgres_cross_chain_timestamp_recovery_uses_the_contributors_network() {
     let fixture = timestamp_fixture(Some(22)).await;
-    fixture.params.tables[0].table.validate_reorg_operations().unwrap();
+    fixture.params.tables[0].table.definition().validate_reorg_operations().unwrap();
     let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
     callback(vec![timestamped_input(&fixture, "other", 99, 22, 10, 2099)]).await.unwrap();
     let canonical = shared_state(&fixture).await;

@@ -1300,7 +1300,7 @@ enum TipWindowFetch {
 }
 
 /// Keep the observed head as the authority even when an RPC call falls back to heights.
-async fn fetch_logs_against_observed_head(
+pub(super) async fn fetch_logs_against_observed_head(
     provider: &dyn ChainProvider,
     filter: &RindexerEventFilter,
     head_number: u64,

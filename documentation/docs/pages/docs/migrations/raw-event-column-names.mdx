@@ -13,7 +13,8 @@ The metadata columns retain their names: `contract_address`, `tx_hash`,
 `log_index`. PostgreSQL also generates the `rindexer_id` primary key.
 
 ABI names are normalized and scalar tuple paths flattened as before. A resulting
-ABI column that matches any of those metadata names gets the `rindexer_abi_`
+ABI column that matches any of those names, or a PostgreSQL system column
+(`ctid`, `tableoid`, `xmin`, `xmax`, `cmin`, `cmax`), gets the `rindexer_abi_`
 prefix. That prefix is reserved: ABI column names already starting with it get
 another prefix, so they cannot occupy an escaped column belonging to another
 field. Escaped names exceeding PostgreSQL's 63-byte identifier limit use
@@ -29,8 +30,9 @@ suffixes through PostgreSQL truncation.
 | `block.number` | `rindexer_abi_block_number` |
 | `rindexer_abi_block_number` | `rindexer_abi_rindexer_abi_block_number` |
 
-The `blockNumber` and `block.number` rows are alternative examples; they do not
-establish support for two ABI leaves that flatten to the same column name.
+The `blockNumber` and `block.number` rows are alternative examples. If both
+are present in the same stored event, admission rejects the collision and names
+both source paths. The check includes PostgreSQL’s 63-byte catalog boundary.
 
 Decoded event names and JSON fields keep their ABI identity. Custom-table
 expressions use the event field, for example `$block_number`, while

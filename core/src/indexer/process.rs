@@ -20,6 +20,10 @@ use callback_checkpoint::{CallbackCheckpoints, CheckpointTurn};
 #[path = "checkpoint_order_tests.rs"]
 pub(crate) mod checkpoint_order_tests;
 
+#[cfg(test)]
+#[path = "dependency_live_tests.rs"]
+mod dependency_live_tests;
+
 use crate::helpers::is_relevant_block;
 use crate::indexer::heartbeat::{HeartbeatAction, HeartbeatTracker};
 use crate::indexer::reorg::{
@@ -36,7 +40,7 @@ use crate::{
     },
     indexer::{
         dependency::{ContractEventsDependenciesConfig, EventDependencies},
-        fetch_logs::{fetch_logs_stream, FetchLogsResult},
+        fetch_logs::{fetch_logs_against_observed_head, fetch_logs_stream, FetchLogsResult},
         last_synced::update_progress_and_last_synced_task,
         progress::IndexingEventProgressStatus,
         task_tracker::ActiveCallback,
@@ -867,8 +871,70 @@ async fn live_indexing_for_contract_event_dependencies(
                 ordering_live_indexing_details.filter
             );
 
-            match cached_provider.get_logs(&ordering_live_indexing_details.filter).await {
+            match fetch_logs_against_observed_head(
+                cached_provider.as_ref(),
+                &ordering_live_indexing_details.filter,
+                latest_block.header.number,
+                latest_block.header.hash,
+            )
+            .await
+            {
                 Ok(logs) => {
+                    // A removal notification invalidates the complete response. Use the
+                    // same network recovery path as ordinary live fetching, then refetch
+                    // instead of admitting the canonical-looking remainder of this batch.
+                    if logs.iter().any(|log| log.removed) {
+                        let fork_block = logs
+                            .iter()
+                            .filter(|log| log.removed)
+                            .filter_map(|log| log.block_number)
+                            .min()
+                            .unwrap_or(from_block.to::<u64>());
+                        let depth = from_block.to::<u64>().saturating_sub(fork_block);
+                        metrics::record_reorg(&network, depth);
+                        warn!(
+                            "{} - REORG (removed logs): fork_block={}, depth={}",
+                            config.info_log_name(),
+                            fork_block,
+                            depth
+                        );
+                        if let Some(tip_logs) = cached_provider.shared_tip_logs() {
+                            tip_logs.invalidate_from(fork_block);
+                        }
+                        if let Some(coordinator) = reorg_coordinator.as_ref() {
+                            let mut guard = coordinator.lock().await;
+                            match guard.try_create_reorg_task_for_block_range(
+                                fork_block,
+                                to_block.to::<u64>(),
+                            ) {
+                                Ok(task) => {
+                                    let reorg_ctx = ReorgContext {
+                                        postgres: pg_client.as_deref(),
+                                        clickhouse: ch_client.as_ref(),
+                                        registry: Some(&event_registry),
+                                        trace_registry: trace_registry.as_deref(),
+                                    };
+                                    if let Err(error) = guard.handle_reorg(task, &reorg_ctx).await {
+                                        error!(
+                                            "{} - Failed to handle removed-logs reorg: {}",
+                                            config.info_log_name(),
+                                            error
+                                        );
+                                    }
+                                }
+                                Err(error) => {
+                                    error!(
+                                        "{} - Invalid removed-logs reorg range: {:?}",
+                                        config.info_log_name(),
+                                        error
+                                    );
+                                }
+                            }
+                        }
+                        // Successful recovery publishes a rewind to every subscription.
+                        // Without a coordinator, retry this same uncommitted range.
+                        break;
+                    }
                     debug!(
                         "{} - {} - Live id {} topic_id {}, Logs: {} from {} to {}",
                         &config.info_log_name(),
@@ -888,9 +954,6 @@ async fn live_indexing_for_contract_event_dependencies(
                         from_block,
                         to_block
                     );
-
-                    // Filter out removed logs — the coordinator handles reorg detection.
-                    let logs: Vec<_> = logs.into_iter().filter(|l| !l.removed).collect();
 
                     let logs_empty = logs.is_empty();
                     // clone here over the full logs way less overhead

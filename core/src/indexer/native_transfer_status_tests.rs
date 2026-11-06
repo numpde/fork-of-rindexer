@@ -185,7 +185,7 @@ async fn postgres_native_transfer_execution_status_on_anvil() {
     );
     let stored_hash: String = fixture
         .client
-        .query_one(&format!("SELECT tx_hash FROM {}", fixture.params.sql_event_table_name), &[])
+        .query_one(&format!("SELECT tx_hash FROM {}", fixture.params.stored_table()), &[])
         .await
         .unwrap()
         .get(0);
@@ -443,7 +443,7 @@ async fn postgres_native_queue_recovery_preserves_replacement_prefix_on_anvil() 
             totals,
             false,
             vec![DerivedTableRollbackOp::try_new(
-                fixture.params.sql_event_table_name.clone(),
+                fixture.params.stored_table().to_owned(),
                 vec![],
                 vec![DerivedColumnRollback::try_new(
                     "amount".to_string(),
@@ -523,7 +523,7 @@ async fn postgres_native_queue_recovery_preserves_replacement_prefix_on_anvil() 
         .await
         .unwrap();
     assert_eq!(fixture.position().await, (13, "260".to_string(), "110".to_string()));
-    let row = fixture.client.query_one(&format!("SELECT count(DISTINCT block_number), min(block_number)::text, max(block_number)::text FROM {}", fixture.params.sql_event_table_name), &[]).await.unwrap();
+    let row = fixture.client.query_one(&format!("SELECT count(DISTINCT block_number), min(block_number)::text, max(block_number)::text FROM {}", fixture.params.stored_table()), &[]).await.unwrap();
     assert_eq!(row.get::<_, i64>(0), 13);
     assert_eq!(row.get::<_, String>(1), "98");
     assert_eq!(row.get::<_, String>(2), "110");

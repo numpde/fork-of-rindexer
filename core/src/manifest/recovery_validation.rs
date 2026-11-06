@@ -7,7 +7,10 @@ use std::collections::{BTreeMap, HashSet};
 use super::ValidateManifestError;
 use crate::{
     database::generate::generate_table_full_name,
-    indexer::native_transfer::NATIVE_TRANSFER_CONTRACT_NAME,
+    indexer::{
+        native_transfer::NATIVE_TRANSFER_CONTRACT_NAME,
+        schema::{PreparedContract, PreparedSchema},
+    },
     manifest::{
         contract::{Contract, Table},
         core::Manifest,
@@ -39,29 +42,87 @@ fn register<'a>(
         return Err(invalid("expected one schema.table destination; database must name a single schema, without database qualification".into()));
     }
     if declaration.recovery_enabled {
-        for part in &parts {
-            crate::indexer::reorg::validate_sql_identifier(part, "recovered table identifier")
-                .map_err(|error| invalid(error.to_string()))?;
-        }
-        if target != target.to_ascii_lowercase() {
-            return Err(invalid("use lowercase identifiers, including the database schema override, so quoted forward writes and bare recovery SQL address the same table".into()));
-        }
+        crate::indexer::reorg::validate_recovered_table_name(&target)
+            .map_err(|error| invalid(error.to_string()))?;
     }
-    let identity = parts
-        .iter()
-        .map(|part| {
-            let identifier = part.trim_matches('"');
-            let mut end = identifier.len().min(63);
-            // PostgreSQL drops a character crossing its byte limit entirely.
-            while !identifier.is_char_boundary(end) {
-                end -= 1;
-            }
-            &identifier[..end]
-        })
-        .collect::<Vec<_>>()
-        .join(".");
+    let identity = crate::indexer::reorg::recovery_table_identity(&target);
     targets.entry(identity).or_default().push(declaration);
     Ok(())
+}
+
+fn prepared_tables(prepared: &PreparedContract) -> impl Iterator<Item = (&Table, String)> {
+    // Keep the logical columns for validation/diagnostics and the writer's resolved destination.
+    prepared
+        .declaration
+        .tables
+        .iter()
+        .flatten()
+        .zip(prepared.tables.iter())
+        .map(|(table, runtime)| (table, runtime.full_table_name.clone()))
+}
+
+fn declared_tables<'a>(
+    indexer: &'a str,
+    contract: &'a str,
+    tables: &'a Option<Vec<Table>>,
+) -> impl Iterator<Item = (&'a Table, String)> {
+    tables.iter().flatten().map(move |table| {
+        (table, generate_table_full_name(indexer, contract, &table.name, table.database.as_deref()))
+    })
+}
+
+struct RecoveryScope<'a> {
+    postgres: bool,
+    recovered: HashSet<&'a str>,
+}
+
+impl RecoveryScope<'_> {
+    fn register_tables<'a>(
+        &self,
+        targets: &mut BTreeMap<String, Vec<Declaration<'a>>>,
+        owner: &'a str,
+        networks: &[&str],
+        tables: impl Iterator<Item = (&'a Table, String)>,
+    ) -> Result<(), ValidateManifestError> {
+        let recovered = networks.iter().copied().find(|network| self.recovered.contains(network));
+        for (table, target) in tables {
+            if self.postgres {
+                for (index, cron) in table.cron.iter().flatten().enumerate() {
+                    if cron.operations.is_empty() {
+                        continue;
+                    }
+                    let cron_networks = match cron.network.as_deref() {
+                        Some(network) => vec![network],
+                        None => networks.to_vec(),
+                    };
+                    for network in cron_networks {
+                        let reason = if self.recovered.contains(network) {
+                            format!("its network {network:?} has reorg recovery enabled")
+                        } else if let Some(other) =
+                            recovered.filter(|_| table.cross_chain && !table.events.is_empty())
+                        {
+                            format!("its network {network:?} shares cross_chain rows with recovered event writes on {other:?}")
+                        } else {
+                            continue;
+                        };
+                        return Err(ValidateManifestError::CustomIndexingValidationError(
+                            format!(
+                                "Table {owner}.{} cron[{index}] writes to PostgreSQL table {target:?}, but {reason}. Recovery cannot undo scheduled writes. Remove this cron writer or keep its rows on a network without reorg recovery.",
+                                table.name
+                            ),
+                            owner.to_owned(),
+                        ));
+                    }
+                }
+            }
+            register(
+                targets,
+                target,
+                Declaration { owner, table, recovery_enabled: recovered.is_some() },
+            )?;
+        }
+        Ok(())
+    }
 }
 
 /// Validate all recovery restrictions once the runtime-expanded destinations are known.
@@ -70,54 +131,67 @@ fn register<'a>(
 pub(super) fn validate(
     manifest: &Manifest,
     contracts: &[Contract],
+    schema: Option<&PreparedSchema>,
 ) -> Result<(), ValidateManifestError> {
-    let recovered_networks = manifest
-        .networks
-        .iter()
-        .filter(|network| network.reorg_handling.as_ref().is_some_and(|config| config.enabled))
-        .map(|network| network.name.as_str())
-        .collect::<HashSet<_>>();
-    if recovered_networks.is_empty() {
+    let scope = RecoveryScope {
+        postgres: manifest.storage.postgres_enabled(),
+        recovered: manifest
+            .networks
+            .iter()
+            .filter(|network| network.reorg_handling.as_ref().is_some_and(|config| config.enabled))
+            .map(|network| network.name.as_str())
+            .collect(),
+    };
+    if scope.recovered.is_empty() {
         return Ok(());
     }
+
+    let native_networks = || {
+        manifest.native_transfers.networks.as_ref().map_or_else(
+            || manifest.networks.iter().map(|n| n.name.as_str()).collect::<Vec<_>>(),
+            |details| details.iter().map(|d| d.network.as_str()).collect(),
+        )
+    };
     let mut targets = BTreeMap::new();
-    for contract in contracts {
-        let recovery_enabled = contract
-            .details
-            .iter()
-            .any(|detail| recovered_networks.contains(detail.network.as_str()));
-        for table in contract.tables.iter().flatten() {
-            let target = generate_table_full_name(
-                &manifest.name,
-                &contract.name,
-                &table.name,
-                table.database.as_deref(),
-            );
-            register(
+    if let Some(schema) = schema {
+        for prepared in schema.contracts() {
+            let contract = &prepared.declaration;
+            let networks: Vec<_> = contract.details.iter().map(|d| d.network.as_str()).collect();
+            scope.register_tables(
                 &mut targets,
-                target,
-                Declaration { owner: &contract.name, table, recovery_enabled },
+                &contract.name,
+                &networks,
+                prepared_tables(prepared),
             )?;
         }
-    }
-    if manifest.native_transfers.enabled {
-        let recovery_enabled = manifest.native_transfers.networks.as_ref().map_or(
-            !recovered_networks.is_empty(),
-            |networks| {
-                networks.iter().any(|network| recovered_networks.contains(network.network.as_str()))
-            },
-        );
-        for table in manifest.native_transfers.tables.iter().flatten() {
-            let target = generate_table_full_name(
-                &manifest.name,
-                NATIVE_TRANSFER_CONTRACT_NAME,
-                &table.name,
-                table.database.as_deref(),
-            );
-            register(
+        if let Some(native) = schema.native() {
+            scope.register_tables(
                 &mut targets,
-                target,
-                Declaration { owner: "native_transfers", table, recovery_enabled },
+                "native_transfers",
+                &native_networks(),
+                prepared_tables(native),
+            )?;
+        }
+    } else {
+        for contract in contracts {
+            let networks: Vec<_> = contract.details.iter().map(|d| d.network.as_str()).collect();
+            scope.register_tables(
+                &mut targets,
+                &contract.name,
+                &networks,
+                declared_tables(&manifest.name, &contract.name, &contract.tables),
+            )?;
+        }
+        if manifest.native_transfers.enabled {
+            scope.register_tables(
+                &mut targets,
+                "native_transfers",
+                &native_networks(),
+                declared_tables(
+                    &manifest.name,
+                    NATIVE_TRANSFER_CONTRACT_NAME,
+                    &manifest.native_transfers.tables,
+                ),
             )?;
         }
     }
@@ -146,3 +220,76 @@ pub(super) fn validate(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn prepared_recovery_checks_filter_runtime_destinations() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("abi.json"),
+            r#"[{"type":"event","name":"Value","anonymous":false,"inputs":[]}]"#,
+        )
+        .unwrap();
+        let table = json!({
+            "name":"totals", "global":true,
+            "columns":[{"name":"total","type":"uint256","default":"0"}],
+            "events":[{"event":"Value","operations":[{
+                "type":"upsert","set":[{"column":"total","action":"increment"}]
+            }]}]
+        });
+        for (database, shared) in [("names_token_filter", true), ("names_token", false)] {
+            let mut second_table = table.clone();
+            second_table["database"] = json!(database);
+            let manifest: Manifest = serde_json::from_value(json!({
+                "name":"Names", "project_type":"no-code",
+                "storage":{"postgres":{"enabled":true}},
+                "networks":[{
+                    "name":"test","chain_id":1,"rpc":"http://unused.invalid",
+                    "reorg_handling":{"enabled":true}
+                }],
+                "contracts":[
+                    {
+                        "name":"Token","abi":"abi.json",
+                        "details":[{"network":"test","filter":{"event_name":"Value"}}],
+                        "tables":[table.clone()]
+                    },
+                    {
+                        "name":"Second","abi":"abi.json",
+                        "details":[{"network":"test","address":"0x0000000000000000000000000000000000000001"}],
+                        "tables":[second_table]
+                    }
+                ]
+            }))
+            .unwrap();
+            let indexer = manifest.to_indexer();
+            let schema = PreparedSchema::try_new(dir.path(), &indexer).unwrap();
+            let first_target = &schema.contract("Token").unwrap().tables[0].full_table_name;
+            let second_target = &schema.contract("Second").unwrap().tables[0].full_table_name;
+            assert_eq!(first_target, "names_token_filter.totals");
+            assert_eq!(first_target == second_target, shared);
+            let result = validate(&manifest, &indexer.contracts, Some(&schema));
+            if shared {
+                let error =
+                    result.expect_err("two writers share the filter's physical table").to_string();
+                for expected in [
+                    "names_token_filter.totals",
+                    "Token.totals",
+                    "Second.totals",
+                    "multiple manifest declarations",
+                ] {
+                    assert!(error.contains(expected), "missing {expected:?}: {error}");
+                }
+            } else {
+                result.expect("the logical unsuffixed schema is a separate destination");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "cron_recovery_tests.rs"]
+mod cron_recovery_tests;

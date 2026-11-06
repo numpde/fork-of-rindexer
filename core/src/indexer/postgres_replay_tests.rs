@@ -92,10 +92,7 @@ async fn postgres_nested_tuple_callback_stores_rows_and_delivers_webhook_json() 
         }
         let row = fixture
             .client
-            .query_one(
-                &format!("SELECT value_inner_x FROM {}", fixture.params.sql_event_table_name),
-                &[],
-            )
+            .query_one(&format!("SELECT value_inner_x FROM {}", fixture.params.stored_table()), &[])
             .await
             .unwrap();
         assert_eq!(row.get::<_, String>(0), "7");
@@ -105,7 +102,7 @@ async fn postgres_nested_tuple_callback_stores_rows_and_delivers_webhook_json() 
                 .query_one(
                     &format!(
                         "SELECT value_label, \"after\" FROM {}",
-                        fixture.params.sql_event_table_name
+                        fixture.params.stored_table()
                     ),
                     &[],
                 )
@@ -221,18 +218,33 @@ impl Fixture {
     }
 
     async fn new_trace() -> Self {
+        use crate::indexer::native_transfer::{NATIVE_TRANSFER_ABI, NATIVE_TRANSFER_CONTRACT_NAME};
+
         let mut definitions: Vec<serde_json::Value> =
-            serde_json::from_str(crate::indexer::native_transfer::NATIVE_TRANSFER_ABI).unwrap();
-        let mut fixture = Self::with_event(definitions.remove(0), "EvmTraces").await;
+            serde_json::from_str(NATIVE_TRANSFER_ABI).unwrap();
+        let definition = definitions.remove(0);
+        let manifest = serde_json::from_value(json!({
+            "name":"Replay","project_type":"no-code","networks":[],"contracts":[],
+            "native_transfers":{"enabled":true,"networks":[{"network":"ethereum"}],
+                "tables":[Self::totals_table(definition["name"].as_str().unwrap())]}
+        }))
+        .unwrap();
+        let mut fixture =
+            Self::with_manifest(definition, NATIVE_TRANSFER_CONTRACT_NAME, manifest).await;
         fixture.params.atomic_safe_concurrency = false;
         fixture
     }
 
+    fn totals_table(event_name: &str) -> serde_json::Value {
+        json!({"name":"totals","global":true,
+            "columns":[{"name":"amount","type":"uint256","default":"0"}],
+            "events":[{"event":event_name,"operations":[{"type":"upsert",
+                "set":[{"column":"amount","action":"add","value":"$value"}]}]}]})
+    }
+
     async fn with_event(definition: serde_json::Value, contract: &str) -> Self {
-        Self::with_table(definition.clone(), contract, json!({"name": "totals", "global": true,
-            "columns": [{"name": "amount", "type": "uint256", "default": "0"}],
-            "events": [{"event": definition["name"], "operations": [{"type": "upsert", "set": [{"column": "amount", "action": "add", "value": "$value"}]}]}]
-        })).await
+        let table = Self::totals_table(definition["name"].as_str().unwrap());
+        Self::with_table(definition, contract, table).await
     }
 
     async fn with_table(
@@ -248,6 +260,20 @@ impl Fixture {
         contract: &str,
         table: serde_json::Value,
         networks: &[&str],
+    ) -> Self {
+        let manifest = serde_json::from_value(json!({
+            "name":"Replay","project_type":"no-code","networks":[],
+            "contracts":[{"name":contract,"abi":"abi.json","include_events":[definition["name"]],
+                "details":networks.iter().map(|network| json!({"network":network,"address":"0x0000000000000000000000000000000000000000"})).collect::<Vec<_>>(),
+                "tables":[table]}]
+        })).unwrap();
+        Self::with_manifest(definition, contract, manifest).await
+    }
+
+    async fn with_manifest(
+        definition: serde_json::Value,
+        contract: &str,
+        manifest: crate::manifest::core::Manifest,
     ) -> Self {
         let (admin, container) = postgres_client().await;
         let mut url: url::Url = match container.as_ref() {
@@ -276,32 +302,27 @@ impl Fixture {
                 &params.event_info.inputs,
             );
         params.contract_name = contract.to_string();
-        let abi = definition;
-        std::fs::write(directory.path().join("abi.json"), serde_json::to_vec(&vec![abi]).unwrap())
+        if !manifest.contracts.is_empty() {
+            std::fs::write(
+                directory.path().join("abi.json"),
+                serde_json::to_vec(&vec![definition]).unwrap(),
+            )
             .unwrap();
-        let manifest: crate::manifest::core::Manifest = serde_json::from_value(json!({
-            "name": "Replay", "project_type": "no-code", "networks": [],
-            "contracts": [{"name": contract, "abi": "abi.json", "include_events": [params.event_info.name],
-                "details": networks.iter().map(|network| json!({"network":network,"address":"0x0000000000000000000000000000000000000000"})).collect::<Vec<_>>(),
-                "tables": [table]
-            }]
-        })).unwrap();
+        }
         let indexer = manifest.to_indexer();
         let ddl = generate_tables_for_indexer_sql(directory.path(), &indexer, false).unwrap();
         client.batch_execute(ddl.as_str()).await.unwrap();
         params.indexer_name = manifest.name.clone();
         let schema =
             generate_indexer_contract_schema_name(&params.indexer_name, &params.contract_name);
-        params.sql_event_table_name =
-            format!("{schema}.{}", crate::helpers::camel_to_snake(&params.event_info.name));
+        params.set_test_raw_table(&schema);
         params.tables = Arc::new(
-            manifest.contracts[0]
-                .tables
-                .as_ref()
-                .unwrap()
+            Self::source_tables(&indexer, contract)
                 .iter()
-                .cloned()
-                .map(|table| TableRuntime::new(table, &params.indexer_name, &params.contract_name))
+                .map(|table| {
+                    TableRuntime::try_new(table, &params.indexer_name, &params.contract_name)
+                        .unwrap()
+                })
                 .collect(),
         );
         params.postgres = Some(client.clone());
@@ -315,6 +336,38 @@ impl Fixture {
             _directory: directory,
             _container: container,
         }
+    }
+
+    fn source_tables<'a>(
+        indexer: &'a crate::indexer::Indexer,
+        contract: &str,
+    ) -> &'a [crate::manifest::contract::Table] {
+        let tables = if contract == crate::indexer::native_transfer::NATIVE_TRANSFER_CONTRACT_NAME {
+            indexer.native_transfers.tables.as_deref()
+        } else {
+            indexer
+                .contracts
+                .iter()
+                .find(|declaration| declaration.name == contract)
+                .and_then(|declaration| declaration.tables.as_deref())
+        };
+        tables.expect("fixture source declares its custom tables")
+    }
+
+    /// Vary the logical declaration and run it through the production constructor.
+    fn runtime_tables_with(
+        &self,
+        edit: impl FnOnce(&mut crate::manifest::contract::Table),
+    ) -> Arc<Vec<TableRuntime>> {
+        let mut declaration =
+            Self::source_tables(&self.indexer, &self.params.contract_name)[0].clone();
+        edit(&mut declaration);
+        Arc::new(vec![TableRuntime::try_new(
+            &declaration,
+            &self.params.indexer_name,
+            &self.params.contract_name,
+        )
+        .unwrap()])
     }
 
     fn events(&self, values: &[u64]) -> Vec<EventResult> {
@@ -337,7 +390,7 @@ impl Fixture {
         let cursor = generate_internal_event_table_name(&schema, &self.params.event_info.name);
         let count = self
             .client
-            .query_one(&format!("SELECT count(*) FROM {}", self.params.sql_event_table_name), &[])
+            .query_one(&format!("SELECT count(*) FROM {}", self.params.stored_table()), &[])
             .await
             .unwrap()
             .get(0);
@@ -567,25 +620,28 @@ async fn postgres_derived_constant_nul_stops_once_without_effects_and_allows_cor
 
     let fixture = Fixture::new().await;
     let mut params = fixture.params.clone();
-    let mut tables = params.tables.as_ref().clone();
-    tables[0].table.columns.push(
-        serde_json::from_value(json!({
-            "name": "note", "type": "string", "nullable": true
-        }))
-        .unwrap(),
-    );
-    tables[0].table.events[0].operations[0].set.push(
-        serde_json::from_value(json!({
-            "column": "note", "action": "set", "value": "$constant(private_note)"
-        }))
-        .unwrap(),
-    );
     fixture
         .client
-        .batch_execute(&format!("ALTER TABLE {} ADD COLUMN note TEXT", tables[0].full_table_name))
+        .batch_execute(&format!(
+            "ALTER TABLE {} ADD COLUMN note TEXT",
+            params.tables[0].full_table_name
+        ))
         .await
         .unwrap();
-    params.tables = Arc::new(tables);
+    params.tables = fixture.runtime_tables_with(|table| {
+        table.columns.push(
+            serde_json::from_value(json!({
+                "name": "note", "type": "string", "nullable": true
+            }))
+            .unwrap(),
+        );
+        table.events[0].operations[0].set.push(
+            serde_json::from_value(json!({
+                "column": "note", "action": "set", "value": "$constant(private_note)"
+            }))
+            .unwrap(),
+        );
+    });
     params.constants = Arc::new(
         [("private_note".to_string(), ConstantValue::Simple("private\0payload".to_string()))]
             .into(),
@@ -982,7 +1038,7 @@ async fn postgres_failed_write_rolls_back_receipts_with_all_effects() {
         .client
         .batch_execute(&format!(
             "ALTER TABLE {} ADD CONSTRAINT reject_second CHECK (value <> '2')",
-            fixture.params.sql_event_table_name
+            fixture.params.stored_table()
         ))
         .await
         .unwrap();
@@ -997,7 +1053,7 @@ async fn postgres_failed_write_rolls_back_receipts_with_all_effects() {
         .client
         .batch_execute(&format!(
             "ALTER TABLE {} DROP CONSTRAINT reject_second",
-            fixture.params.sql_event_table_name
+            fixture.params.stored_table()
         ))
         .await
         .unwrap();
@@ -1030,7 +1086,7 @@ async fn postgres_duplicates_within_one_batch_apply_once() {
 #[tokio::test]
 async fn postgres_existing_untracked_history_requires_reviewed_migration() {
     let fixture = Fixture::new().await;
-    fixture.client.batch_execute(&format!("INSERT INTO {} (contract_address, value, tx_hash, block_number, block_hash, network, tx_index, log_index) VALUES ('0x{:040x}', '99', '0x{:064x}', 2, '0x{:064x}', 'ethereum', 0, '0')", fixture.params.sql_event_table_name, 0, 99, 99)).await.unwrap();
+    fixture.client.batch_execute(&format!("INSERT INTO {} (contract_address, value, tx_hash, block_number, block_hash, network, tx_index, log_index) VALUES ('0x{:040x}', '99', '0x{:064x}', 2, '0x{:064x}', 'ethereum', 0, '0')", fixture.params.stored_table(), 0, 99, 99)).await.unwrap();
     let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
     let outcome = callback(fixture.events(&[1, 2])).await;
     let position = fixture.position().await;
@@ -1110,7 +1166,7 @@ async fn assert_reorg_replay(kind: ReplayKind) {
             totals,
             false,
             vec![DerivedTableRollbackOp::try_new(
-                fixture.params.sql_event_table_name.clone(),
+                fixture.params.stored_table().to_owned(),
                 vec![],
                 vec![DerivedColumnRollback::try_new(
                     "amount".to_string(),
@@ -1585,10 +1641,10 @@ async fn postgres_sequence_positions_choose_the_later_block_in_combined_and_sepa
     for tx_index in [1000, 1001] {
         for separate in [false, true] {
             let mut fixture = Fixture::new().await;
-            let mut tables = fixture.params.tables.as_ref().clone();
-            tables[0].table.events[0].operations[0].set[0].action =
-                crate::manifest::contract::SetAction::Set;
-            fixture.params.tables = Arc::new(tables);
+            fixture.params.tables = fixture.runtime_tables_with(|table| {
+                table.events[0].operations[0].set[0].action =
+                    crate::manifest::contract::SetAction::Set;
+            });
             let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
             let mut events = fixture.events(&[11, 22]);
             for (event, (block, tx)) in events.iter_mut().zip([(100, tx_index), (101, 0)]) {
@@ -1661,6 +1717,9 @@ mod journal_recovery_tests;
 #[path = "table_condition_tests.rs"]
 mod table_condition_tests;
 
+#[path = "upsert_guard_column_tests.rs"]
+mod upsert_guard_column_tests;
+
 #[path = "subscription_cursor_tests.rs"]
 mod subscription_cursor_tests;
 
@@ -1693,3 +1752,12 @@ mod recovery_boundary_tests;
 
 #[path = "predicate_recovery_tests.rs"]
 mod predicate_recovery_tests;
+
+#[path = "operand_recovery_tests.rs"]
+mod operand_recovery_tests;
+
+#[path = "prepared_schema_tests.rs"]
+mod prepared_schema_tests;
+
+#[path = "checkpoint_only_recovery_tests.rs"]
+mod checkpoint_only_recovery_tests;

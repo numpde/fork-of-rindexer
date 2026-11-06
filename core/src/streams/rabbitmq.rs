@@ -1,7 +1,8 @@
 use bb8::{Pool, RunError};
 use bb8_lapin::LapinConnectionManager;
 use lapin::{
-    options::*, types::FieldTable, BasicProperties, DefaultConnectionBuilder, ExchangeKind,
+    options::*, types::FieldTable, BasicProperties, Confirmation, DefaultConnectionBuilder,
+    ExchangeKind,
 };
 use serde_json::Value;
 
@@ -18,6 +19,12 @@ pub enum RabbitMQError {
 
     #[error("Connection pool timed out")]
     PoolTimedOut,
+
+    #[error("RabbitMQ broker rejected the publication")]
+    BrokerNack,
+
+    #[error("RabbitMQ publisher confirmation was not requested")]
+    ConfirmationNotRequested,
 }
 
 impl From<RunError<lapin::ErrorKind>> for RabbitMQError {
@@ -86,6 +93,7 @@ impl RabbitMQ {
 
         let conn = self.pool.get().await?;
         let channel = conn.create_channel().await?;
+        channel.confirm_select(ConfirmSelectOptions::default()).await?;
 
         channel
             .exchange_declare(
@@ -101,7 +109,7 @@ impl RabbitMQ {
             _ => routing_key.as_deref().expect("Routing key should be defined"),
         };
 
-        channel
+        let confirmation = channel
             .basic_publish(
                 exchange.into(),
                 routing_key.into(),
@@ -111,8 +119,86 @@ impl RabbitMQ {
                     .with_message_id(id.into())
                     .with_content_type("application/json".into()),
             )
+            .await?
             .await?;
 
-        Ok(())
+        // The first await only writes the frames. Retiring a required outbox
+        // record also needs the broker's positive publisher confirmation.
+        match confirmation {
+            Confirmation::Ack(_) => Ok(()),
+            Confirmation::Nack(_) => Err(RabbitMQError::BrokerNack),
+            Confirmation::NotRequested => Err(RabbitMQError::ConfirmationNotRequested),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::streams::rabbitmq_test_broker::{BrokerReply, TestBroker};
+    use std::time::Duration;
+
+    async fn publish_once(
+        broker: &TestBroker,
+    ) -> tokio::task::JoinHandle<Result<(), RabbitMQError>> {
+        let client = RabbitMQ::new(&broker.url).await.unwrap();
+        tokio::spawn(async move {
+            client
+                .publish_once(
+                    "durable-delivery-id",
+                    "events",
+                    &ExchangeKindWrapper(ExchangeKind::Direct),
+                    &Some("values".into()),
+                    &serde_json::json!({"value": 7}),
+                )
+                .await
+        })
+    }
+
+    #[tokio::test]
+    async fn rabbitmq_publish_waits_for_broker_ack() {
+        let mut broker = TestBroker::start().await;
+        let mut publishing = publish_once(&broker).await;
+        let pending = tokio::time::timeout(Duration::from_secs(5), broker.publishes.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&pending.body).unwrap()["value"], 7);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut publishing).await.is_err(),
+            "a socket write must not acknowledge a delivery before the broker confirms it"
+        );
+        assert!(pending.confirms_selected, "publisher confirmations must be enabled");
+        pending.reply.send(BrokerReply::Ack).unwrap_or_else(|_| panic!("broker stopped"));
+        tokio::time::timeout(Duration::from_secs(5), publishing).await.unwrap().unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn rabbitmq_publish_rejects_broker_nack() {
+        let mut broker = TestBroker::start().await;
+        let publishing = publish_once(&broker).await;
+        let pending = tokio::time::timeout(Duration::from_secs(5), broker.publishes.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        pending.reply.send(BrokerReply::Nack).unwrap_or_else(|_| panic!("broker stopped"));
+        let result =
+            tokio::time::timeout(Duration::from_secs(5), publishing).await.unwrap().unwrap();
+        let error = result.expect_err("a broker rejection must retain the delivery for retry");
+        assert_eq!(error.to_string(), "RabbitMQ broker rejected the publication");
+    }
+
+    #[tokio::test]
+    async fn rabbitmq_publish_rejects_disconnect_before_confirmation() {
+        let mut broker = TestBroker::start().await;
+        let publishing = publish_once(&broker).await;
+        let pending = tokio::time::timeout(Duration::from_secs(5), broker.publishes.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        pending.reply.send(BrokerReply::Disconnect).unwrap_or_else(|_| panic!("broker stopped"));
+        let result =
+            tokio::time::timeout(Duration::from_secs(5), publishing).await.unwrap().unwrap();
+        assert!(result.is_err(), "a write without a broker confirmation is an uncertain delivery");
     }
 }

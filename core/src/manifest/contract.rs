@@ -284,6 +284,10 @@ pub fn compute_sequence_id(block_number: u64, tx_index: u32, log_index: u32) -> 
     ((block_number as u128) << 64) | ((tx_index as u128) << 32) | log_index as u128
 }
 
+#[path = "storage_columns.rs"]
+mod storage_columns;
+pub use storage_columns::ResolvedTable;
+
 /// Defines a custom table for aggregated indexing.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Table {
@@ -334,6 +338,22 @@ pub struct Table {
 }
 
 impl Table {
+    /// Require one mapping per event so forward execution and recovery agree.
+    pub(crate) fn validate_event_mappings(&self) -> Result<(), String> {
+        let mut events = HashSet::with_capacity(self.events.len());
+        for mapping in &self.events {
+            if !events.insert(mapping.event.as_str()) {
+                return Err(format!(
+                    "Table '{}' has duplicate event mapping '{}'. Combine its operations into \
+                     one mapping; mappings with different iterate scopes must be redesigned \
+                     or use separate tables.",
+                    self.name, mapping.event
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Returns true if this table has at least one trigger (event or cron).
     pub fn has_triggers(&self) -> bool {
         !self.events.is_empty() || self.has_cron()
@@ -2727,3 +2747,7 @@ mod array_type_roundtrip_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "destination_column_resolution_tests.rs"]
+mod destination_column_resolution_tests;

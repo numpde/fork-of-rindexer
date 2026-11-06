@@ -1,10 +1,7 @@
-use crate::database::generate::{
-    generate_indexer_contract_schema_name, GenerateTablesForIndexerSqlError,
-};
+use crate::database::generate::GenerateTablesForIndexerSqlError;
 use crate::helpers::camel_to_snake;
-use crate::indexer::Indexer;
-use crate::{ABIItem, PostgresClient};
-use std::path::Path;
+use crate::indexer::schema::PreparedSchema;
+use crate::PostgresClient;
 
 /// Atomically incrementing version number for migrations.
 ///
@@ -50,12 +47,12 @@ impl Migration {
 /// 2. Get the migrations that have not yet been applied
 /// 3. Generate the migration SQL and apply them
 /// 4. Insert new rows reflecting that these migrations have been applied
-pub async fn execute_migrations_for_indexer_sql(
+pub async fn execute_prepared_migrations(
     client: &PostgresClient,
-    project_path: &Path,
-    indexer: &Indexer,
+    schema: &PreparedSchema,
     disable_event_tables: bool,
 ) -> Result<Vec<Migration>, GenerateTablesForIndexerSqlError> {
+    let indexer = schema.indexer();
     if disable_event_tables {
         return Ok(vec![]);
     }
@@ -86,20 +83,10 @@ pub async fn execute_migrations_for_indexer_sql(
     let mut statements = String::new();
 
     for version in &unapplied {
-        for contract in &indexer.contracts {
-            let contract_name = contract.before_modify_name_if_filter_readonly();
-            let abi_items = ABIItem::read_abi_items(project_path, contract)?;
-            let events = ABIItem::extract_event_names_and_signatures_from_abi(abi_items)?;
-            let schema_name = generate_indexer_contract_schema_name(&indexer.name, &contract_name);
-
-            // Run migrations on every raw event table that exists — the same
-            // predicate DDL creation uses (include_events plus table events)
-            let raw_events: Vec<_> =
-                events.iter().filter(|e| contract.stores_raw_events(&e.name)).collect();
-
-            for event_info in raw_events {
-                let table_name = format!("{}.{}", schema_name, camel_to_snake(&event_info.name));
-                statements.push_str(&version.generate_table_migration_sql(&table_name));
+        for prepared in schema.contracts().iter().chain(schema.native()) {
+            for table_name in prepared.events.iter().filter_map(|event| event.raw_table.as_deref())
+            {
+                statements.push_str(&version.generate_table_migration_sql(table_name));
             }
         }
     }

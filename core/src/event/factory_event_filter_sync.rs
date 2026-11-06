@@ -407,30 +407,50 @@ pub struct GetFactoryAddressesWithBirthBlocksParams {
 pub async fn get_factory_addresses_with_birth_blocks(
     params: &GetFactoryAddressesWithBirthBlocksParams,
 ) -> Result<std::collections::HashMap<Address, u64>, GetKnownFactoryDeployedAddressesError> {
-    use crate::database::generate::generate_indexer_contract_schema_name;
-    use crate::helpers::camel_to_snake;
+    use crate::{
+        abi::raw_event_abi_column_name, database::generate::generate_event_table_full_name,
+        helpers::camel_to_snake,
+    };
+
+    // Standalone callers provide the runtime contract identity and an ABI input
+    // name. Managed cron receives both storage identifiers from preparation.
+    let table = generate_event_table_full_name(
+        &params.indexer_name,
+        &params.contract_name,
+        &params.event_name,
+    );
+    let input = params.input_names.first().map(String::as_str).unwrap_or("pool");
+    let column = raw_event_abi_column_name(&camel_to_snake(input));
+    read_factory_addresses_from_event(
+        &table,
+        &column,
+        &params.network,
+        params.postgres.as_deref(),
+        params.clickhouse.as_deref(),
+    )
+    .await
+}
+
+pub(crate) async fn read_factory_addresses_from_event(
+    event_table: &str,
+    address_column: &str,
+    network: &str,
+    postgres: Option<&PostgresClient>,
+    clickhouse: Option<&ClickhouseClient>,
+) -> Result<std::collections::HashMap<Address, u64>, GetKnownFactoryDeployedAddressesError> {
     use std::collections::HashMap;
 
-    // Generate schema name: {indexer_name}_{contract_name}
-    let schema_name =
-        generate_indexer_contract_schema_name(&params.indexer_name, &params.contract_name);
-    // Event table name is snake_case of event name
-    let table_name = camel_to_snake(&params.event_name);
-    // Column for the address is snake_case of first input_name
-    let address_column =
-        params.input_names.first().map(|n| camel_to_snake(n)).unwrap_or_else(|| "pool".to_string());
-
-    if let Some(database) = &params.postgres {
+    if let Some(database) = postgres {
         let query = format!(
-            r#"SELECT "{address_column}", block_number FROM {schema_name}.{table_name} WHERE network = $1"#
+            r#"SELECT "{address_column}", block_number FROM {event_table} WHERE network = $1"#
         );
         tracing::info!(
             "get_factory_addresses_with_birth_blocks query: {} (network={})",
             query,
-            params.network
+            network
         );
         let result = match database
-            .query(&query, &[&EthereumSqlTypeWrapper::String(params.network.clone())])
+            .query(&query, &[&EthereumSqlTypeWrapper::String(network.to_string())])
             .await
         {
             Ok(r) => r,
@@ -443,7 +463,7 @@ pub async fn get_factory_addresses_with_birth_blocks(
         let values: HashMap<Address, u64> = result
             .into_iter()
             .filter_map(|row| {
-                let addr_str: &str = row.get(&*address_column);
+                let addr_str: &str = row.get(address_column);
                 let block: rust_decimal::Decimal = row.get("block_number");
                 let block_u64 = block.to_string().parse::<u64>().ok()?;
                 Address::from_str(addr_str).ok().map(|addr| (addr, block_u64))
@@ -453,7 +473,7 @@ pub async fn get_factory_addresses_with_birth_blocks(
         return Ok(values);
     }
 
-    if let Some(database) = &params.clickhouse {
+    if let Some(database) = clickhouse {
         #[derive(Debug, clickhouse::Row, Deserialize)]
         struct AddressWithBlock {
             address: ClickhouseAddress,
@@ -461,11 +481,11 @@ pub async fn get_factory_addresses_with_birth_blocks(
         }
 
         let query = format!(
-            r#"SELECT {address_column} AS address, block_number FROM {schema_name}.{table_name} FINAL WHERE network = ?"#
+            r#"SELECT {address_column} AS address, block_number FROM {event_table} FINAL WHERE network = ?"#
         );
 
         let result: Vec<AddressWithBlock> =
-            database.conn.query(&query).bind(params.network.clone()).fetch_all().await?;
+            database.conn.query(&query).bind(network.to_string()).fetch_all().await?;
 
         let values: HashMap<Address, u64> =
             result.into_iter().map(|row| (Address::from(row.address), row.block_number)).collect();

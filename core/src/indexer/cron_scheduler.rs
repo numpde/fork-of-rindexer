@@ -16,20 +16,20 @@ use tracing::{debug, error, info, warn};
 use crate::database::clickhouse::client::ClickhouseClient;
 use crate::database::postgres::client::PostgresClient;
 use crate::database::sql_type_wrapper::EthereumSqlTypeWrapper;
-use crate::event::{
-    get_factory_addresses_with_birth_blocks, GetFactoryAddressesWithBirthBlocksParams,
-};
-use crate::helpers::to_pascal_case;
+use crate::event::read_factory_addresses_from_event;
 use crate::indexer::last_synced::{
     get_last_synced_cron_block, update_last_synced_cron_block, CronSyncConfig,
 };
+use crate::indexer::schema::PreparedSchema;
 use crate::is_running;
-use crate::manifest::contract::{parse_interval, ColumnType, Table, TableCronMapping};
+use crate::manifest::contract::{
+    parse_interval, ColumnType, Contract, FactoryDetailsYaml, ResolvedTable, TableCronMapping,
+};
 use crate::manifest::core::Manifest;
 use crate::provider::ChainProvider;
 use alloy::primitives::U64;
 
-use super::tables::{TableRowData, TxMetadata};
+use super::tables::{TableRowData, TableRuntime, TxMetadata};
 
 // ============================================================================
 // Adaptive Rate Limiter - Scales both concurrency AND batch size
@@ -212,19 +212,42 @@ pub enum CronSchedule {
 /// Factory configuration for cron tasks that operate on factory-indexed contracts.
 #[derive(Debug, Clone)]
 pub struct FactoryCronConfig {
-    /// The factory contract name (e.g., "UniswapV3Factory")
-    pub factory_name: String,
-    /// The factory event name (e.g., "PoolCreated")
-    pub event_name: String,
-    /// The input names from the factory event (e.g., ["pool"] or ["token0", "token1"])
-    pub input_names: Vec<String>,
+    event_table: String,
+    address_column: String,
+}
+
+impl FactoryCronConfig {
+    fn from_prepared(
+        schema: &PreparedSchema,
+        factory: &FactoryDetailsYaml,
+    ) -> Result<Self, String> {
+        let contract = schema.contract(&factory.name)?;
+        let event =
+            contract.events.iter().find(|event| event.info.name == factory.event_name).ok_or_else(
+                || format!("Unknown factory event {}::{}", factory.name, factory.event_name),
+            )?;
+        let event_table = event.raw_table.clone().ok_or_else(|| {
+            format!("Factory event {}::{} has no raw storage", factory.name, factory.event_name)
+        })?;
+        let inputs = factory.input_names();
+        let input = inputs.first().ok_or_else(|| {
+            format!("Factory event {}::{} has no address input", factory.name, factory.event_name)
+        })?;
+        let (_, address_column) = event.columns.storage_column(input).ok_or_else(|| {
+            format!(
+                "No stored address input {input:?} in factory event {}::{}",
+                factory.name, factory.event_name
+            )
+        })?;
+        Ok(Self { event_table, address_column: address_column.to_string() })
+    }
 }
 
 /// A single cron task configuration
 #[derive(Debug, Clone)]
 pub struct CronTask {
     pub contract_name: String,
-    pub table: Table,
+    pub table: ResolvedTable,
     pub full_table_name: String,
     pub cron_entry: TableCronMapping,
     pub cron_index: usize,
@@ -243,7 +266,7 @@ pub struct CronScheduler {
     pub postgres: Option<Arc<PostgresClient>>,
     pub clickhouse: Option<Arc<ClickhouseClient>>,
     pub providers: Arc<HashMap<String, Arc<dyn ChainProvider>>>,
-    /// Indexer name for factory address lookup
+    /// Manifest indexer name.
     pub indexer_name: String,
 }
 
@@ -251,24 +274,73 @@ impl CronScheduler {
     /// Create a new cron scheduler from the manifest.
     ///
     /// This scans all contracts and tables for cron configurations and
-    /// builds a list of tasks to execute.
-    pub fn new(
+    /// builds a list of tasks to execute. Factory-backed tasks need their
+    /// admitted discovery ABI; use [`Self::try_new_prepared`] for those.
+    pub fn try_new(
         manifest: &Manifest,
         postgres: Option<Arc<PostgresClient>>,
         clickhouse: Option<Arc<ClickhouseClient>>,
         providers: Arc<HashMap<String, Arc<dyn ChainProvider>>>,
-    ) -> Self {
+    ) -> Result<Self, String> {
+        let contracts = manifest
+            .all_contracts()
+            .into_iter()
+            .map(|contract| {
+                let tables = contract
+                    .tables
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|table| TableRuntime::try_new(table, &manifest.name, &contract.name))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok((contract, tables))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Self::from_resolved_tables(
+            &manifest.name,
+            None,
+            contracts.iter().map(|(contract, tables)| (contract, tables.as_slice())),
+            postgres,
+            clickhouse,
+            providers,
+        )
+    }
+
+    /// Reuse the tables prepared for event writes, schema creation and recovery.
+    pub fn try_new_prepared(
+        schema: &PreparedSchema,
+        postgres: Option<Arc<PostgresClient>>,
+        clickhouse: Option<Arc<ClickhouseClient>>,
+        providers: Arc<HashMap<String, Arc<dyn ChainProvider>>>,
+    ) -> Result<Self, String> {
+        Self::from_resolved_tables(
+            &schema.indexer().name,
+            Some(schema),
+            schema
+                .contracts()
+                .iter()
+                .chain(schema.native())
+                .map(|contract| (&contract.declaration, contract.tables.as_slice())),
+            postgres,
+            clickhouse,
+            providers,
+        )
+    }
+
+    fn from_resolved_tables<'a>(
+        indexer_name: &str,
+        schema: Option<&PreparedSchema>,
+        contracts: impl IntoIterator<Item = (&'a Contract, &'a [TableRuntime])>,
+        postgres: Option<Arc<PostgresClient>>,
+        clickhouse: Option<Arc<ClickhouseClient>>,
+        providers: Arc<HashMap<String, Arc<dyn ChainProvider>>>,
+    ) -> Result<Self, String> {
         let mut tasks = Vec::new();
 
-        for contract in &manifest.contracts {
-            let Some(tables) = &contract.tables else {
-                continue;
-            };
-
-            for table in tables {
-                let Some(cron_entries) = &table.cron else {
-                    continue;
-                };
+        for (contract, tables) in contracts {
+            for runtime in tables.iter().filter(|runtime| runtime.table.definition().has_cron()) {
+                let table = &runtime.table;
+                let cron_entries = table.cron_mappings();
 
                 for (cron_index, cron_entry) in cron_entries.iter().enumerate() {
                     // Determine which networks to run on
@@ -292,7 +364,9 @@ impl CronScheduler {
                             Err(e) => {
                                 error!(
                                     "Invalid interval '{}' for table '{}': {}",
-                                    interval_str, table.name, e
+                                    interval_str,
+                                    table.name(),
+                                    e
                                 );
                                 continue;
                             }
@@ -303,7 +377,9 @@ impl CronScheduler {
                             Err(e) => {
                                 error!(
                                     "Invalid cron expression '{}' for table '{}': {}",
-                                    cron_expr, table.name, e
+                                    cron_expr,
+                                    table.name(),
+                                    e
                                 );
                                 continue;
                             }
@@ -311,7 +387,7 @@ impl CronScheduler {
                     } else {
                         error!(
                             "Cron entry for table '{}' has neither interval nor schedule",
-                            table.name
+                            table.name()
                         );
                         continue;
                     };
@@ -321,45 +397,42 @@ impl CronScheduler {
                         let detail = contract.details.iter().find(|d| d.network == network);
 
                         // Check if this is a factory-indexed contract
-                        let (contract_address, factory_config) =
-                            if let Some(factory) = detail.and_then(|d| d.factory.as_ref()) {
-                                // Factory contract - use Address::ZERO as sentinel
-                                let config = FactoryCronConfig {
-                                    factory_name: factory.name.clone(),
-                                    event_name: factory.event_name.clone(),
-                                    input_names: factory.input_names(),
-                                };
-                                (Address::ZERO, Some(config))
-                            } else {
-                                // Static address contract
-                                let addr = detail
-                                    .and_then(|d| d.address.as_ref())
-                                    .and_then(|addr| match addr {
-                                        alloy::rpc::types::ValueOrArray::Value(a) => Some(*a),
-                                        alloy::rpc::types::ValueOrArray::Array(arr) => {
-                                            arr.first().copied()
-                                        }
-                                    })
-                                    .unwrap_or_default();
-                                (addr, None)
-                            };
+                        let (contract_address, factory_config) = if let Some(factory) =
+                            detail.and_then(|d| d.factory.as_ref())
+                        {
+                            // Factory contract - use Address::ZERO as sentinel
+                            let schema = schema.ok_or_else(|| format!(
+                                    "Factory cron on {}.{} requires its discovery ABI; use CronScheduler::try_new_prepared with a PreparedProject",
+                                    contract.name, table.name()
+                                ))?;
+                            let config = FactoryCronConfig::from_prepared(schema, factory)?;
+                            (Address::ZERO, Some(config))
+                        } else {
+                            // Static address contract
+                            let addr = detail
+                                .and_then(|d| d.address.as_ref())
+                                .and_then(|addr| match addr {
+                                    alloy::rpc::types::ValueOrArray::Value(a) => Some(*a),
+                                    alloy::rpc::types::ValueOrArray::Array(arr) => {
+                                        arr.first().copied()
+                                    }
+                                })
+                                .unwrap_or_default();
+                            (addr, None)
+                        };
 
-                        let full_table_name = crate::database::generate::generate_table_full_name(
-                            &manifest.name,
-                            &contract.name,
-                            &table.name,
-                            table.database.as_deref(),
-                        );
+                        let full_table_name = runtime.full_table_name.clone();
 
                         if factory_config.is_some() {
                             info!(
                                 "Cron task for table '{}' on network '{}' uses factory indexing",
-                                table.name, network
+                                table.name(),
+                                network
                             );
                         }
 
                         tasks.push(CronTask {
-                            contract_name: contract.name.clone(),
+                            contract_name: runtime.contract_name.clone(),
                             table: table.clone(),
                             full_table_name,
                             cron_entry: cron_entry.clone(),
@@ -367,7 +440,7 @@ impl CronScheduler {
                             network,
                             contract_address,
                             schedule: schedule.clone(),
-                            indexer_name: manifest.name.clone(),
+                            indexer_name: indexer_name.to_string(),
                             factory_config,
                         });
                     }
@@ -377,7 +450,7 @@ impl CronScheduler {
 
         info!("Cron scheduler initialized with {} tasks", tasks.len());
 
-        Self { tasks, postgres, clickhouse, providers, indexer_name: manifest.name.clone() }
+        Ok(Self { tasks, postgres, clickhouse, providers, indexer_name: indexer_name.to_string() })
     }
 
     /// Check if there are any cron tasks to run.
@@ -398,26 +471,26 @@ impl CronScheduler {
         let clickhouse = self.clickhouse;
         let providers = self.providers;
 
-        // Create shared context for factory address lookup
-        let context = CronContext { indexer_name: self.indexer_name };
-
-        let mut handles = Vec::new();
+        // A detached worker can fail while another keeps running forever.
+        // JoinSet aborts the other workers when a terminal error is returned.
+        let mut workers = tokio::task::JoinSet::new();
 
         for task in self.tasks {
             let postgres = postgres.clone();
             let clickhouse = clickhouse.clone();
             let providers = providers.clone();
-            let context = context.clone();
-
-            let handle = tokio::spawn(async move {
-                run_cron_task(task, postgres, clickhouse, providers, context).await;
-            });
-
-            handles.push(handle);
+            workers.spawn(run_cron_task(task, postgres, clickhouse, providers));
         }
 
-        // Wait for all tasks (they run until shutdown)
-        futures::future::join_all(handles).await;
+        while let Some(joined) = workers.join_next().await {
+            let outcome = joined.map_err(|error| {
+                std::io::Error::other(format!("Cron worker failed to join: {error}"))
+            })?;
+            if let Err(error) = outcome {
+                workers.abort_all();
+                return Err(Box::new(std::io::Error::other(error)));
+            }
+        }
 
         info!("Cron scheduler stopped");
         Ok(())
@@ -430,19 +503,12 @@ const MAX_RETRIES: u32 = 3;
 /// Initial backoff delay for retries (doubles each attempt).
 const INITIAL_BACKOFF_SECS: u64 = 2;
 
-/// Shared context for cron task execution (needed for factory address lookup).
-#[derive(Clone)]
-struct CronContext {
-    indexer_name: String,
-}
-
 /// Get all discovered factory addresses with their birth blocks for a factory-indexed contract.
 /// Returns HashMap<Address, u64> where the value is the birth block (0 for static contracts).
 async fn get_factory_addresses_with_blocks(
     task: &CronTask,
     postgres: &Option<Arc<PostgresClient>>,
     clickhouse: &Option<Arc<ClickhouseClient>>,
-    context: &CronContext,
 ) -> Result<HashMap<Address, u64>, Box<dyn std::error::Error + Send + Sync>> {
     let Some(factory_config) = &task.factory_config else {
         // Not a factory contract - return the static address with birth block 0
@@ -451,27 +517,15 @@ async fn get_factory_addresses_with_blocks(
         return Ok(result);
     };
 
-    // Generate the wrapper contract name used by the factory indexing system
-    // Pattern: {factory_name}{event_name_pascal}{input_names_pascal_joined}
-    // e.g., "UniswapV3Factory" + "PoolCreated" + "Pool" = "UniswapV3FactoryPoolCreatedPool"
-    let wrapper_contract_name = format!(
-        "{}{}{}",
-        factory_config.factory_name,
-        to_pascal_case(&factory_config.event_name),
-        factory_config.input_names.iter().map(|v| to_pascal_case(v)).collect::<Vec<_>>().join("")
-    );
-
-    let params = GetFactoryAddressesWithBirthBlocksParams {
-        indexer_name: context.indexer_name.clone(),
-        contract_name: wrapper_contract_name.clone(),
-        event_name: factory_config.event_name.clone(),
-        input_names: factory_config.input_names.clone(),
-        network: task.network.clone(),
-        postgres: postgres.clone(),
-        clickhouse: clickhouse.clone(),
-    };
-
-    match get_factory_addresses_with_birth_blocks(&params).await {
+    match read_factory_addresses_from_event(
+        &factory_config.event_table,
+        &factory_config.address_column,
+        &task.network,
+        postgres.as_deref(),
+        clickhouse.as_deref(),
+    )
+    .await
+    {
         Ok(addresses) => {
             if addresses.is_empty() {
                 warn!(
@@ -503,10 +557,9 @@ async fn get_factory_addresses(
     task: &CronTask,
     postgres: &Option<Arc<PostgresClient>>,
     clickhouse: &Option<Arc<ClickhouseClient>>,
-    context: &CronContext,
 ) -> Result<Vec<Address>, Box<dyn std::error::Error + Send + Sync>> {
     let addresses_with_blocks =
-        get_factory_addresses_with_blocks(task, postgres, clickhouse, context).await?;
+        get_factory_addresses_with_blocks(task, postgres, clickhouse).await?;
     Ok(addresses_with_blocks.keys().copied().collect())
 }
 
@@ -519,7 +572,6 @@ async fn wait_for_factory_sync(
     task: &CronTask,
     postgres: &Option<Arc<PostgresClient>>,
     clickhouse: &Option<Arc<ClickhouseClient>>,
-    context: &CronContext,
     _start_block: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if task.factory_config.is_none() {
@@ -541,7 +593,7 @@ async fn wait_for_factory_sync(
 
         // Check if any factory addresses have been discovered
         // DB errors are expected early on (tables may not exist yet), so treat them as "not ready"
-        let addresses = match get_factory_addresses(task, postgres, clickhouse, context).await {
+        let addresses = match get_factory_addresses(task, postgres, clickhouse).await {
             Ok(addrs) => addrs,
             Err(e) => {
                 if !logged_db_error {
@@ -591,13 +643,12 @@ async fn run_cron_task(
     postgres: Option<Arc<PostgresClient>>,
     clickhouse: Option<Arc<ClickhouseClient>>,
     providers: Arc<HashMap<String, Arc<dyn ChainProvider>>>,
-    context: CronContext,
-) {
+) -> Result<(), String> {
     let is_factory = task.factory_config.is_some();
 
     info!(
         "Starting cron task for table '{}' on network '{}' with schedule {:?}{}",
-        task.table.name,
+        task.table.name(),
         task.network,
         task.cron_entry.interval.as_ref().or(task.cron_entry.schedule.as_ref()),
         if is_factory { " (factory-indexed)" } else { "" }
@@ -608,87 +659,103 @@ async fn run_cron_task(
         // For factory contracts, wait for factory event indexing to discover addresses
         if is_factory {
             let start_block = start_block_value.to::<u64>();
-            if let Err(e) =
-                wait_for_factory_sync(&task, &postgres, &clickhouse, &context, start_block).await
+            if let Err(e) = wait_for_factory_sync(&task, &postgres, &clickhouse, start_block).await
             {
-                error!(
-                    "Failed waiting for factory sync for table '{}' on network '{}': {}",
-                    task.table.name, task.network, e
-                );
-                return;
+                if !is_running() {
+                    return Ok(());
+                }
+                return Err(format!(
+                    "Factory sync for historical cron {}.{} on network {:?} failed: {e}",
+                    task.contract_name,
+                    task.table.name(),
+                    task.network,
+                ));
             }
         }
 
-        let historical_completed = run_historical_sync(
-            &task,
-            postgres.clone(),
-            clickhouse.clone(),
-            providers.clone(),
-            &context,
-        )
-        .await;
+        let historical_completed =
+            run_historical_sync(&task, postgres.clone(), clickhouse.clone(), providers.clone())
+                .await?;
 
         if !historical_completed {
             debug!(
                 "Historical sync for table '{}' on network '{}' interrupted by shutdown",
-                task.table.name, task.network
+                task.table.name(),
+                task.network
             );
-            return;
+            return Ok(());
         }
 
         // If end_block was specified, stop here (no live cron)
         if task.cron_entry.end_block.is_some() {
             info!(
                 "Historical cron sync completed for table '{}' on network '{}' - end_block reached, stopping",
-                task.table.name, task.network
+                task.table.name(), task.network
             );
-            return;
+            return Ok(());
         }
 
         info!(
             "Historical cron sync completed for table '{}' on network '{}' - switching to live mode",
-            task.table.name, task.network
+            task.table.name(), task.network
         );
     }
 
     // Live cron mode
-    run_live_cron_loop(&task, postgres, clickhouse, providers, &context).await;
+    run_live_cron_loop(&task, postgres, clickhouse, providers).await;
+    Ok(())
 }
 
 /// Run historical sync for a cron task using batched operations.
 ///
 /// This batches multiple blocks together for efficient RPC calls via multicall3
-/// and batched database writes. Returns true if completed successfully, false if interrupted.
+/// and batched database writes. Returns Ok(false) on shutdown; a missing
+/// required sample is an error, never a successful live-mode handoff.
 async fn run_historical_sync(
     task: &CronTask,
     postgres: Option<Arc<PostgresClient>>,
     clickhouse: Option<Arc<ClickhouseClient>>,
     providers: Arc<HashMap<String, Arc<dyn ChainProvider>>>,
-    context: &CronContext,
-) -> bool {
+) -> Result<bool, String> {
     let start_block = task.cron_entry.start_block.unwrap().to::<u64>();
     let block_interval = task.cron_entry.block_interval.map(|b| b.to::<u64>()).unwrap_or(1); // Default to every block
+    if block_interval == 0 {
+        return Err(format!(
+            "Historical cron {}.{} on {:?} has zero block_interval",
+            task.contract_name,
+            task.table.name(),
+            task.network,
+        ));
+    }
 
     // Get contract addresses (1 for static, N for factory)
     // Get addresses with their birth blocks (for factory contracts, only process blocks >= birth)
     let addresses_with_blocks =
-        match get_factory_addresses_with_blocks(task, &postgres, &clickhouse, context).await {
+        match get_factory_addresses_with_blocks(task, &postgres, &clickhouse).await {
             Ok(addrs) => addrs,
             Err(e) => {
                 error!(
                     "Failed to get contract addresses for table '{}' on network '{}': {}",
-                    task.table.name, task.network, e
+                    task.table.name(),
+                    task.network,
+                    e
                 );
-                return false;
+                return Err(format!(
+                    "Historical cron {}.{} on network {:?} cannot discover addresses: {e}",
+                    task.contract_name,
+                    task.table.name(),
+                    task.network,
+                ));
             }
         };
 
     if addresses_with_blocks.is_empty() {
-        warn!(
-            "No contract addresses for table '{}' on network '{}', skipping historical sync",
-            task.table.name, task.network
-        );
-        return true; // Not a failure, just nothing to do yet
+        return Err(format!(
+            "Historical cron {}.{} on network {:?} has no discovered addresses",
+            task.contract_name,
+            task.table.name(),
+            task.network,
+        ));
     }
 
     let is_factory = task.factory_config.is_some();
@@ -704,9 +771,24 @@ async fn run_historical_sync(
     let end_block = if let Some(end) = task.cron_entry.end_block {
         end.to::<u64>()
     } else if let Some(p) = provider {
-        p.get_block_number().await.ok().map(|b| b.to::<u64>()).unwrap_or(start_block)
+        p.get_block_number()
+            .await
+            .map_err(|error| {
+                format!(
+                    "Historical cron {}.{} on network {:?} cannot read head height: {error}",
+                    task.contract_name,
+                    task.table.name(),
+                    task.network,
+                )
+            })?
+            .to::<u64>()
     } else {
-        start_block
+        return Err(format!(
+            "Historical cron {}.{} on network {:?} has no provider for head height",
+            task.contract_name,
+            task.table.name(),
+            task.network,
+        ));
     };
 
     // Get last synced block from database
@@ -715,7 +797,7 @@ async fn run_historical_sync(
         clickhouse: &clickhouse,
         indexer_name: &task.indexer_name,
         contract_name: &task.contract_name,
-        table_name: &task.table.name,
+        table_name: task.table.name(),
         cron_index: task.cron_index,
         network: &task.network,
     };
@@ -726,13 +808,15 @@ async fn run_historical_sync(
     let mut current_block = match last_synced {
         Some(last) => {
             // Resume from last synced block + interval
-            let next = last.to::<u64>() + block_interval;
+            let Some(next) = last.to::<u64>().checked_add(block_interval) else {
+                return Ok(true);
+            };
             if next > end_block {
                 info!(
                     "Historical cron sync for table '{}' on network '{}' already complete (last synced: {}, end: {})",
-                    task.table.name, task.network, last, end_block
+                    task.table.name(), task.network, last, end_block
                 );
-                return true;
+                return Ok(true);
             }
             next
         }
@@ -741,7 +825,7 @@ async fn run_historical_sync(
 
     info!(
         "Starting historical cron sync for table '{}' on network '{}' from block {} to {} (interval: {})",
-        task.table.name, task.network, current_block, end_block, block_interval
+        task.table.name(), task.network, current_block, end_block, block_interval
     );
 
     let start_time = std::time::Instant::now();
@@ -752,7 +836,7 @@ async fn run_historical_sync(
     // Process blocks in batches
     while current_block <= end_block {
         if !is_running() {
-            return false;
+            return Ok(false);
         }
 
         // Collect blocks for this batch (batch size is dynamic based on rate limiting)
@@ -761,7 +845,10 @@ async fn run_historical_sync(
         let mut block = current_block;
         while block <= end_block && batch_blocks.len() < current_batch_size {
             batch_blocks.push(block);
-            block += block_interval;
+            let Some(next) = block.checked_add(block_interval) else {
+                break;
+            };
+            block = next;
         }
 
         if batch_blocks.is_empty() {
@@ -789,38 +876,44 @@ async fn run_historical_sync(
         let batch_duration = batch_start_time.elapsed();
 
         match result {
-            Ok(last_block) => {
-                // Save progress after batch
-                if let Some(b) = last_block {
-                    let concurrency = rate_limiter.concurrency();
-                    let batch_sz = rate_limiter.batch_size();
-                    let addr_info = if is_factory {
-                        format!(", {} addresses", addresses_with_blocks.len())
-                    } else {
-                        String::new()
-                    };
-                    info!(
-                        "Cron batch complete: table='{}', blocks {}-{} ({} ops{}), concurrency={}, batch_size={}, {:.1}s, saved at block {}",
-                        task.table.name, batch_start, batch_end, batch_blocks.len(), addr_info, concurrency, batch_sz, batch_duration.as_secs_f64(), b
-                    );
-                    update_last_synced_cron_block(
-                        &postgres,
-                        &clickhouse,
-                        &task.indexer_name,
-                        &task.contract_name,
-                        &task.table.name,
-                        task.cron_index,
-                        &task.network,
-                        U64::from(b),
-                    )
-                    .await;
-                }
-            }
-            Err(e) => {
-                error!(
-                    "Historical cron batch failed for table '{}' on network '{}' blocks {}-{}: {}",
-                    task.table.name, task.network, batch_start, batch_end, e
+            Ok(Some(b)) if b == batch_end => {
+                let concurrency = rate_limiter.concurrency();
+                let batch_sz = rate_limiter.batch_size();
+                let addr_info = if is_factory {
+                    format!(", {} addresses", addresses_with_blocks.len())
+                } else {
+                    String::new()
+                };
+                info!(
+                    "Cron batch complete: table='{}', blocks {}-{} ({} ops{}), concurrency={}, batch_size={}, {:.1}s, saved at block {}",
+                    task.table.name(), batch_start, batch_end, batch_blocks.len(), addr_info, concurrency, batch_sz, batch_duration.as_secs_f64(), b
                 );
+                // The checkpoint update is not transactional with table writes yet.
+                // The next pair will make both operations one PostgreSQL commit.
+                update_last_synced_cron_block(
+                    &postgres,
+                    &clickhouse,
+                    &task.indexer_name,
+                    &task.contract_name,
+                    task.table.name(),
+                    task.cron_index,
+                    &task.network,
+                    U64::from(b),
+                )
+                .await;
+            }
+            Ok(None) if !is_running() => return Ok(false),
+            Ok(last) => {
+                return Err(format!(
+                    "Historical cron {}.{} network {:?} blocks {batch_start}-{batch_end} did not finish: last completed {last:?}",
+                    task.contract_name, task.table.name(), task.network,
+                ));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Historical cron {}.{} network {:?} blocks {batch_start}-{batch_end} failed: {error}",
+                    task.contract_name, task.table.name(), task.network,
+                ));
             }
         }
 
@@ -831,16 +924,21 @@ async fn run_historical_sync(
             tokio::time::sleep(delay).await;
         }
 
-        current_block = batch_end + block_interval;
+        let Some(next_block) = batch_end.checked_add(block_interval) else {
+            break;
+        };
+        current_block = next_block;
     }
 
     let elapsed = start_time.elapsed();
     info!(
         "Historical cron sync completed for table '{}' on network '{}' in {:?}",
-        task.table.name, task.network, elapsed
+        task.table.name(),
+        task.network,
+        elapsed
     );
 
-    true
+    Ok(true)
 }
 
 /// Execute cron operations for a batch of blocks with parallel RPC calls.
@@ -877,7 +975,7 @@ async fn execute_cron_operations_batch(
     for operation in &task.cron_entry.operations {
         for (column_name, value_ref) in &operation.where_clause {
             if value_ref.starts_with("$call(") {
-                if let Some(col) = task.table.columns.iter().find(|c| &c.name == column_name) {
+                if let Some(col) = task.table.columns().iter().find(|c| &c.name == column_name) {
                     call_patterns.push((
                         value_ref.clone(),
                         column_name.clone(),
@@ -889,7 +987,7 @@ async fn execute_cron_operations_batch(
         for set_col in &operation.set {
             let val = set_col.effective_value();
             if val.starts_with("$call(") {
-                if let Some(col) = task.table.columns.iter().find(|c| c.name == set_col.column) {
+                if let Some(col) = task.table.columns().iter().find(|c| c.name == set_col.column) {
                     call_patterns.push((
                         val.to_string(),
                         set_col.column.clone(),
@@ -1015,6 +1113,9 @@ async fn execute_cron_operations_batch(
         }
     }
     info!("All RPC calls completed: {}", completed_calls);
+    if !is_running() {
+        return Ok(None);
+    }
 
     // Step 3: Build all rows using cached results (one row per block per address)
     let cache = call_cache.read().await;
@@ -1028,13 +1129,40 @@ async fn execute_cron_operations_batch(
         total_calls,
         (successful_calls * 100).checked_div(total_calls).unwrap_or(0)
     );
+    // Every required view call must resolve for every eligible sample before
+    // the first database write. Collecting later samples cannot fill a gap.
+    for &block_number in blocks {
+        for (&address, &birth_block) in addresses_with_blocks {
+            if block_number < birth_block {
+                continue;
+            }
+            for call in &unique_calls {
+                if cache
+                    .get(&(block_number, address, call.clone()))
+                    .and_then(Option::as_ref)
+                    .is_none()
+                {
+                    let columns = call_patterns
+                        .iter()
+                        .filter(|(pattern, _, _)| pattern == call)
+                        .map(|(_, column, _)| column.as_str())
+                        .collect::<Vec<_>>();
+                    return Err(format!(
+                        "Required cron view call {call:?} for {}.{} on network {:?} at block {block_number}, address {address:?}, columns {columns:?} returned no value",
+                        task.contract_name, task.table.name(), task.network,
+                    ));
+                }
+            }
+        }
+    }
+
     let mut all_rows: Vec<TableRowData> =
         Vec::with_capacity(blocks.len() * addresses_with_blocks.len());
     let mut last_successful_block: Option<u64> = None;
 
     for &block_number in blocks {
         if !is_running() {
-            break;
+            return Ok(None);
         }
 
         for (&contract_address, &birth_block) in addresses_with_blocks {
@@ -1067,7 +1195,8 @@ async fn execute_cron_operations_batch(
                         }
                     } else {
                         // Handle non-$call values
-                        let column_def = task.table.columns.iter().find(|c| &c.name == column_name);
+                        let column_def =
+                            task.table.columns().iter().find(|c| &c.name == column_name);
                         if let Some(column_def) = column_def {
                             if let Some(value) = extract_cron_value_sync(
                                 value_ref,
@@ -1094,7 +1223,7 @@ async fn execute_cron_operations_batch(
                     } else {
                         // Handle non-$call values
                         let column_def =
-                            task.table.columns.iter().find(|c| c.name == set_col.column);
+                            task.table.columns().iter().find(|c| c.name == set_col.column);
                         if let Some(column_def) = column_def {
                             if let Some(value) = extract_cron_value_sync(
                                 val,
@@ -1106,14 +1235,6 @@ async fn execute_cron_operations_batch(
                             }
                         }
                     }
-                }
-
-                if columns.is_empty() {
-                    debug!(
-                        "No columns extracted for block {} address {:?} - skipping row",
-                        block_number, contract_address
-                    );
-                    continue;
                 }
 
                 // Check that all required user columns are present (where clause + set columns)
@@ -1130,9 +1251,19 @@ async fn execute_cron_operations_batch(
                     required_columns.iter().filter(|col| !columns.contains_key(*col)).collect();
 
                 if !missing_columns.is_empty() {
-                    warn!(
-                        "Skipping row for block {} address {:?} - missing columns: {:?} (have: {:?})",
-                        block_number, contract_address, missing_columns, columns.keys().collect::<Vec<_>>()
+                    return Err(format!(
+                        "Historical cron {}.{} network {:?} block {block_number} address {contract_address:?} operation {:?} requires columns {missing_columns:?}, but only {:?} were resolved",
+                        task.contract_name,
+                        task.table.name(),
+                        task.network,
+                        operation.operation_type,
+                        columns.keys().collect::<Vec<_>>(),
+                    ));
+                }
+                if columns.is_empty() {
+                    debug!(
+                        "No user columns for cron operation at block {} address {:?} - skipping",
+                        block_number, contract_address
                     );
                     continue;
                 }
@@ -1149,7 +1280,7 @@ async fn execute_cron_operations_batch(
                     EthereumSqlTypeWrapper::U64BigInt(block_number),
                 );
 
-                if task.table.timestamp {
+                if task.table.definition().timestamp {
                     if let Some(ts) = tx_metadata.block_timestamp {
                         if let Some(dt) = DateTime::from_timestamp(ts.to::<i64>(), 0) {
                             columns.insert(
@@ -1190,7 +1321,12 @@ async fn execute_cron_operations_batch(
     // Step 4: Write all rows to database in batch
     let operation = &task.cron_entry.operations[0];
 
-    info!("Tables::{} - {:?} - {} rows", task.table.name, operation.operation_type, all_rows.len());
+    info!(
+        "Tables::{} - {:?} - {} rows",
+        task.table.name(),
+        operation.operation_type,
+        all_rows.len()
+    );
 
     if let Some(postgres) = &postgres {
         super::tables::execute_postgres_operation_internal(
@@ -1227,11 +1363,10 @@ async fn run_live_cron_loop(
     postgres: Option<Arc<PostgresClient>>,
     clickhouse: Option<Arc<ClickhouseClient>>,
     providers: Arc<HashMap<String, Arc<dyn ChainProvider>>>,
-    context: &CronContext,
 ) {
     loop {
         if !is_running() {
-            debug!("Cron task for table '{}' stopping due to shutdown", task.table.name);
+            debug!("Cron task for table '{}' stopping due to shutdown", task.table.name());
             break;
         }
 
@@ -1249,7 +1384,7 @@ async fn run_live_cron_loop(
                     Err(e) => {
                         warn!(
                             "Could not find next cron occurrence for table '{}': {}, using 60s default",
-                            task.table.name, e
+                            task.table.name(), e
                         );
                         Duration::from_secs(60)
                     }
@@ -1259,7 +1394,8 @@ async fn run_live_cron_loop(
 
         debug!(
             "Cron task for table '{}' waiting {:?} until next execution",
-            task.table.name, wait_duration
+            task.table.name(),
+            wait_duration
         );
 
         // Sleep in chunks to check for shutdown
@@ -1268,7 +1404,7 @@ async fn run_live_cron_loop(
 
         while remaining > Duration::ZERO {
             if !is_running() {
-                debug!("Cron task for table '{}' stopping due to shutdown", task.table.name);
+                debug!("Cron task for table '{}' stopping due to shutdown", task.table.name());
                 return;
             }
 
@@ -1284,12 +1420,14 @@ async fn run_live_cron_loop(
         // Get factory addresses (refreshed on each tick to pick up new contracts)
         // For live cron, birth blocks don't matter (latest block >= all birth blocks)
         let addresses_with_blocks =
-            match get_factory_addresses_with_blocks(task, &postgres, &clickhouse, context).await {
+            match get_factory_addresses_with_blocks(task, &postgres, &clickhouse).await {
                 Ok(addrs) => addrs,
                 Err(e) => {
                     error!(
                         "Failed to get contract addresses for table '{}' on network '{}': {}",
-                        task.table.name, task.network, e
+                        task.table.name(),
+                        task.network,
+                        e
                     );
                     continue; // Skip this tick, try again next time
                 }
@@ -1299,7 +1437,8 @@ async fn run_live_cron_loop(
         if addresses.is_empty() {
             debug!(
                 "No contract addresses for table '{}' on network '{}', skipping this tick",
-                task.table.name, task.network
+                task.table.name(),
+                task.network
             );
             continue;
         }
@@ -1327,7 +1466,8 @@ async fn run_live_cron_loop(
                     if retry_count > 0 {
                         info!(
                             "Cron task for table '{}' succeeded after {} retry attempt(s)",
-                            task.table.name, retry_count
+                            task.table.name(),
+                            retry_count
                         );
                     }
                     break;
@@ -1343,7 +1483,7 @@ async fn run_live_cron_loop(
 
                         warn!(
                             "Cron task failed for table '{}' on network '{}': {}. Retrying in {:?} (attempt {}/{})",
-                            task.table.name, task.network, e, backoff, retry_count, MAX_RETRIES
+                            task.table.name(), task.network, e, backoff, retry_count, MAX_RETRIES
                         );
 
                         // Sleep with shutdown check
@@ -1366,7 +1506,10 @@ async fn run_live_cron_loop(
             if let Some(e) = last_error {
                 error!(
                     "Cron task failed for table '{}' on network '{}' after {} retries: {}",
-                    task.table.name, task.network, MAX_RETRIES, e
+                    task.table.name(),
+                    task.network,
+                    MAX_RETRIES,
+                    e
                 );
             }
         }
@@ -1389,7 +1532,8 @@ async fn execute_cron_operations(
     } else {
         warn!(
             "No provider found for network '{}' in cron task for table '{}'",
-            task.network, task.table.name
+            task.network,
+            task.table.name()
         );
         0
     };
@@ -1400,7 +1544,7 @@ async fn execute_cron_operations(
     if is_factory {
         debug!(
             "Executing cron operations for table '{}' on network '{}' at block {} for {} addresses",
-            task.table.name,
+            task.table.name(),
             task.network,
             latest_block,
             addresses.len()
@@ -1408,7 +1552,9 @@ async fn execute_cron_operations(
     } else {
         debug!(
             "Executing cron operations for table '{}' on network '{}' at block {}",
-            task.table.name, task.network, latest_block
+            task.table.name(),
+            task.network,
+            latest_block
         );
     }
 
@@ -1436,7 +1582,7 @@ async fn execute_cron_operations(
 
             // Add where clause columns
             for (column_name, value_ref) in &operation.where_clause {
-                let column_def = task.table.columns.iter().find(|c| &c.name == column_name);
+                let column_def = task.table.columns().iter().find(|c| &c.name == column_name);
 
                 if let Some(column_def) = column_def {
                     if let Some(value) = extract_cron_value(
@@ -1456,7 +1602,7 @@ async fn execute_cron_operations(
 
             // Add set columns with their values
             for set_col in &operation.set {
-                let column_def = task.table.columns.iter().find(|c| c.name == set_col.column);
+                let column_def = task.table.columns().iter().find(|c| c.name == set_col.column);
 
                 if let Some(column_def) = column_def {
                     if let Some(value) = extract_cron_value(
@@ -1477,7 +1623,8 @@ async fn execute_cron_operations(
             if columns.is_empty() {
                 debug!(
                     "No columns extracted for cron operation on table '{}' address {}, skipping",
-                    task.table.name, contract_address
+                    task.table.name(),
+                    contract_address
                 );
                 continue;
             }
@@ -1486,7 +1633,7 @@ async fn execute_cron_operations(
             // For cron with multiple addresses, include addr_idx to ensure unique sequence_id
             let sequence_id = crate::manifest::contract::compute_sequence_id(
                 latest_block,
-                u32::try_from(addr_idx).map_err(|_| format!("Cannot order cron operations for table {:?}: address index {addr_idx} exceeds {}", task.table.name, u32::MAX))?,
+                u32::try_from(addr_idx).map_err(|_| format!("Cannot order cron operations for table {:?}: address index {addr_idx} exceeds {}", task.table.name(), u32::MAX))?,
                 0,
             );
 
@@ -1499,7 +1646,7 @@ async fn execute_cron_operations(
                 EthereumSqlTypeWrapper::U64BigInt(latest_block),
             );
             // Only add timestamp if table has timestamp: true
-            if task.table.timestamp {
+            if task.table.definition().timestamp {
                 columns.insert(
                     crate::manifest::contract::injected_columns::BLOCK_TIMESTAMP.to_string(),
                     EthereumSqlTypeWrapper::DateTime(now),
@@ -1522,7 +1669,10 @@ async fn execute_cron_operations(
         }
 
         if all_rows.is_empty() {
-            debug!("No rows extracted for cron operation on table '{}', skipping", task.table.name);
+            debug!(
+                "No rows extracted for cron operation on table '{}', skipping",
+                task.table.name()
+            );
             continue;
         }
 
@@ -1558,7 +1708,10 @@ async fn execute_cron_operations(
     };
     info!(
         "Cron operations completed for table '{}' on network '{}' at block {}{}",
-        task.table.name, task.network, latest_block, addr_info
+        task.table.name(),
+        task.network,
+        latest_block,
+        addr_info
     );
 
     Ok(())
@@ -1865,3 +2018,56 @@ mod cron_parsing_tests {
         assert_eq!(next, at(2027, 1, 1, 0, 0, 0));
     }
 }
+
+#[cfg(test)]
+mod column_name_tests {
+    use super::*;
+
+    #[test]
+    fn cron_column_identity_binds_tasks_to_the_stored_destination() {
+        let manifest: Manifest = serde_json::from_value(serde_json::json!({
+            "name":"Example","project_type":"no-code","networks":[],
+            "contracts":[{"name":"Token","abi":"unused.json","details":[],
+                "tables":[{"name":"stats","global":true,"columns":[{"name":"total32","type":"uint256"}],
+                    "cron":[{"interval":"1h","network":"test","operations":[
+                        {"type":"upsert","set":[{"column":"total32","action":"set","value":"1"}]}
+                    ]}]}]}]
+        })).unwrap();
+        let scheduler =
+            CronScheduler::try_new(&manifest, None, None, Arc::new(HashMap::new())).unwrap();
+        assert_eq!(scheduler.tasks.len(), 1);
+        let task = &scheduler.tasks[0];
+        assert_eq!(task.table.columns()[0].name, "total_32");
+        assert_eq!(task.cron_entry.operations[0].set[0].column, "total_32");
+    }
+}
+
+/// Drive the production address lookup and exactly one historical batch, without
+/// the polling loop that would keep retrying a missing discovery table.
+#[cfg(test)]
+impl CronScheduler {
+    pub(super) async fn sample_factory_for_test(
+        &self,
+        blocks: &[u64],
+    ) -> Result<HashMap<Address, u64>, String> {
+        let [task] = self.tasks.as_slice() else { return Err("expected one cron task".into()) };
+        let addresses = get_factory_addresses_with_blocks(task, &self.postgres, &self.clickhouse)
+            .await
+            .map_err(|error| error.to_string())?;
+        execute_cron_operations_batch(
+            task,
+            self.postgres.clone(),
+            self.clickhouse.clone(),
+            self.providers.clone(),
+            blocks,
+            &addresses,
+            Arc::new(AdaptiveRateLimiter::new()),
+        )
+        .await?;
+        Ok(addresses)
+    }
+}
+
+#[cfg(test)]
+#[path = "cron_historical_failure_tests.rs"]
+mod cron_historical_failure_tests;

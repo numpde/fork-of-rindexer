@@ -80,10 +80,11 @@ async fn postgres_same_event_continuation_does_not_admit_a_committed_equal_posit
 #[tokio::test]
 async fn postgres_same_event_operations_follow_event_order_across_a_batch() {
     let mut fixture = fixture().await;
-    let table = &mut Arc::make_mut(&mut fixture.params.tables)[0].table;
-    table.events[0].operations[1].if_condition = Some("value == 2".into());
-    table.events[0].operations[2].if_condition = Some("value == 1".into());
-    table.events[0].operations[2].set[0].value = Some("$value".into());
+    fixture.params.tables = fixture.runtime_tables_with(|table| {
+        table.events[0].operations[1].if_condition = Some("value == 2".into());
+        table.events[0].operations[2].if_condition = Some("value == 1".into());
+        table.events[0].operations[2].set[0].value = Some("$value".into());
+    });
     let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
     callback(vec![event(&fixture, 98, 98, 0)]).await.unwrap();
     callback(vec![event(&fixture, 99, 99, 1), event(&fixture, 100, 100, 2)]).await.unwrap();
@@ -101,11 +102,11 @@ async fn postgres_same_event_operations_follow_event_order_across_a_batch() {
 #[tokio::test]
 async fn postgres_same_event_upserts_apply_both_columns_and_replay_once() {
     let mut fixture = fixture().await;
-    for operation in
-        Arc::make_mut(&mut fixture.params.tables)[0].table.events[0].operations.iter_mut().skip(1)
-    {
-        operation.operation_type = crate::manifest::contract::OperationType::Upsert;
-    }
+    fixture.params.tables = fixture.runtime_tables_with(|table| {
+        for operation in table.events[0].operations.iter_mut().skip(1) {
+            operation.operation_type = crate::manifest::contract::OperationType::Upsert;
+        }
+    });
     let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
     callback(vec![event(&fixture, 98, 98, 0)]).await.unwrap();
     callback(vec![event(&fixture, 100, 100, 1)]).await.unwrap();
@@ -119,15 +120,16 @@ async fn postgres_same_event_upserts_apply_both_columns_and_replay_once() {
 #[tokio::test]
 async fn postgres_same_event_arithmetic_upsert_keeps_its_state_setting_fields() {
     let mut fixture = fixture().await;
-    let table = &mut Arc::make_mut(&mut fixture.params.tables)[0].table;
-    table.events[0].operations[0].set.retain(|column| column.column == "amount");
-    table.events[0].operations[2] =
-        serde_json::from_value(json!({"type":"upsert", "if":"value > 0", "set":[
-            {"column":"amount", "action":"set", "value":"$value * 2"},
-            {"column":"b", "action":"add", "value":"$value"}
-        ]}))
-        .unwrap();
-    table.validate_reorg_operations().unwrap();
+    fixture.params.tables = fixture.runtime_tables_with(|table| {
+        table.events[0].operations[0].set.retain(|column| column.column == "amount");
+        table.events[0].operations[2] =
+            serde_json::from_value(json!({"type":"upsert", "if":"value > 0", "set":[
+                {"column":"amount", "action":"set", "value":"$value * 2"},
+                {"column":"b", "action":"add", "value":"$value"}
+            ]}))
+            .unwrap();
+        table.validate_reorg_operations().unwrap();
+    });
     let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
     callback(vec![event(&fixture, 98, 98, 0)]).await.unwrap();
     callback(vec![event(&fixture, 100, 100, 1)]).await.unwrap();
@@ -151,7 +153,7 @@ async fn extrema_fixture(action: &str) -> Fixture {
             {"type":"upsert", "if":"value == 20", "set":[{"column":"amount", "action":action, "value":"$value"}]}
         ]}]
     })).await;
-    fixture.params.tables[0].table.validate_reorg_operations().unwrap();
+    fixture.params.tables[0].table.definition().validate_reorg_operations().unwrap();
     fixture
 }
 
@@ -256,8 +258,8 @@ async fn postgres_skipped_and_applied_updates_in_one_batch_keep_distinct_outcome
 #[tokio::test]
 async fn postgres_applied_same_event_set_order_survives_recovery() {
     let mut fixture = fixture().await;
-    Arc::make_mut(&mut fixture.params.tables)[0].table.events[0].operations[2].set[0].column =
-        "amount".into();
+    fixture.params.tables = fixture
+        .runtime_tables_with(|table| table.events[0].operations[2].set[0].column = "amount".into());
     let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
     callback(vec![event(&fixture, 98, 98, 0)]).await.unwrap();
     callback(vec![event(&fixture, 99, 99, 1)]).await.unwrap();
@@ -295,7 +297,7 @@ async fn assignment_fixture(condition: Option<&str>) -> Fixture {
 #[tokio::test]
 async fn postgres_superseded_upsert_retains_canonical_value_provenance_and_receipt() {
     let fixture = assignment_fixture(None).await;
-    fixture.params.tables[0].table.validate_reorg_operations().unwrap();
+    fixture.params.tables[0].table.definition().validate_reorg_operations().unwrap();
     let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
     callback(vec![event(&fixture, 100, 100, 30)]).await.unwrap();
     let canonical = event(&fixture, 99, 99, 20);
@@ -431,9 +433,9 @@ async fn postgres_arithmetic_update_recovery_requires_support_or_startup_rejecti
         arithmetic_update_table(),
     )
     .await;
-    if let Err(reason) = fixture.params.tables[0].table.validate_reorg_operations() {
+    if let Err(reason) = fixture.params.tables[0].table.definition().validate_reorg_operations() {
         assert!(reason.contains("arithmetic update") && reason.contains("reorg"), "{reason}");
-        let untouched = fixture.client.query_one(&format!("SELECT (SELECT count(*) FROM {}), (SELECT count(*) FROM {}), (SELECT count(*) FROM rindexer_internal.event_applications)", fixture.params.sql_event_table_name, fixture.params.tables[0].full_table_name), &[]).await.unwrap();
+        let untouched = fixture.client.query_one(&format!("SELECT (SELECT count(*) FROM {}), (SELECT count(*) FROM {}), (SELECT count(*) FROM rindexer_internal.event_applications)", fixture.params.stored_table(), fixture.params.tables[0].full_table_name), &[]).await.unwrap();
         assert_eq!(
             (untouched.get::<_, i64>(0), untouched.get::<_, i64>(1), untouched.get::<_, i64>(2)),
             (0, 0, 0),

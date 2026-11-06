@@ -305,7 +305,7 @@ events:
 /// metadata columns, and a primary key from the `where` columns (or `rindexer_id` for
 /// insert-only tables).
 fn create_table_sql(runtime: &TableRuntime) -> String {
-    let table = &runtime.table;
+    let table = runtime.table.definition();
     let mut columns = vec!["\"network\" VARCHAR(50) NOT NULL".to_string()];
 
     for column in &table.columns {
@@ -669,7 +669,7 @@ impl Harness {
     }
 
     fn runtime(&self, table: Table) -> TableRuntime {
-        TableRuntime::new(table, INDEXER, &self.contract)
+        TableRuntime::try_new(&table, INDEXER, &self.contract).unwrap()
     }
 
     async fn create_table(&self, runtime: &TableRuntime) {

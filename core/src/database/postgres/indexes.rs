@@ -1,13 +1,14 @@
-use std::{path::Path, sync::Arc};
+use std::sync::Arc;
 
 use futures::future::join_all;
 use tracing::info;
 
 use crate::{
-    abi::{get_abi_item_with_db_map, ABIItem, GetAbiItemWithDbMapError, ReadAbiError},
+    abi::{GetAbiItemWithDbMapError, ReadAbiError},
     database::postgres::client::{PostgresClient, PostgresConnectionError, PostgresError},
     helpers::camel_to_snake,
-    manifest::{contract::Contract, storage::PostgresIndexes},
+    indexer::schema::PreparedSchema,
+    manifest::storage::PostgresIndexes,
     types::code::Code,
 };
 
@@ -197,27 +198,24 @@ pub enum PrepareIndexesError {
 }
 
 pub async fn prepare_indexes(
-    project_path: &Path,
-    manifest_name: &str,
+    schema: &PreparedSchema,
     postgres_indexes: &PostgresIndexes,
-    contracts: &[Contract],
 ) -> Result<Vec<PostgresIndexResult>, PrepareIndexesError> {
+    let manifest_name = &schema.indexer().name;
     let mut index_results: Vec<PostgresIndexResult> = vec![];
     let mut dropping_sql: Vec<Code> = vec![];
     let client = Arc::new(PostgresClient::new().await?);
 
     // global first
     if let Some(global_injected_parameters) = &postgres_indexes.global_injected_parameters {
-        for contract in contracts {
-            let abi_items = ABIItem::read_abi_items(project_path, contract)?;
-
-            for abi_item in abi_items {
-                let contract_name = contract.before_modify_name_if_filter_readonly();
+        for contract in schema.contracts() {
+            for event in &contract.events {
+                let contract_name = &contract.name;
                 let db_table_name = format!(
                     "{}_{}.{}",
                     camel_to_snake(manifest_name),
-                    camel_to_snake(&contract_name),
-                    camel_to_snake(&abi_item.name)
+                    camel_to_snake(contract_name),
+                    camel_to_snake(&event.info.name)
                 );
 
                 for global_parameter_column_name in global_injected_parameters {
@@ -235,25 +233,23 @@ pub async fn prepare_indexes(
     // then contracts
     if let Some(contract_events_indexes) = &postgres_indexes.contracts {
         for contract_event_indexes in contract_events_indexes.iter() {
-            let contract = contracts.iter().find(|c| c.name == contract_event_indexes.name);
+            let contract = schema.contract(&contract_event_indexes.name);
 
             match contract {
-                None => {
+                Err(_) => {
                     return Err(PrepareIndexesError::ContractMissing(
                         contract_event_indexes.name.clone(),
                     ));
                 }
-                Some(contract) => {
-                    let abi_items = ABIItem::read_abi_items(project_path, contract)?;
-
+                Ok(contract) => {
                     if let Some(injected_parameters) = &contract_event_indexes.injected_parameters {
-                        for abi_item in &abi_items {
-                            let contract_name = contract.before_modify_name_if_filter_readonly();
+                        for event in &contract.events {
+                            let contract_name = &contract.name;
                             let db_table_name = format!(
                                 "{}_{}.{}",
                                 camel_to_snake(manifest_name),
-                                camel_to_snake(&contract_name),
-                                camel_to_snake(&abi_item.name)
+                                camel_to_snake(contract_name),
+                                camel_to_snake(&event.info.name)
                             );
 
                             for injected_parameter in injected_parameters {
@@ -268,11 +264,11 @@ pub async fn prepare_indexes(
                     }
 
                     for event_indexes in &contract_event_indexes.events {
-                        let contract_name = contract.before_modify_name_if_filter_readonly();
+                        let contract_name = &contract.name;
                         let db_table_name = format!(
                             "{}_{}.{}",
                             camel_to_snake(manifest_name),
-                            camel_to_snake(&contract_name),
+                            camel_to_snake(contract_name),
                             camel_to_snake(&event_indexes.name)
                         );
 
@@ -290,11 +286,8 @@ pub async fn prepare_indexes(
                         for index in &event_indexes.indexes {
                             let mut db_table_columns = vec![];
                             for parameter in &index.event_input_names {
-                                let abi_parameter = get_abi_item_with_db_map(
-                                    &abi_items,
-                                    &event_indexes.name,
-                                    &parameter.split('.').collect::<Vec<&str>>(),
-                                )?;
+                                let abi_parameter =
+                                    contract.storage_column(&event_indexes.name, parameter)?;
                                 db_table_columns.push(abi_parameter.db_column_name);
                             }
 
