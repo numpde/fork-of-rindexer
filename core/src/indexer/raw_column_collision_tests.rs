@@ -130,7 +130,7 @@ async fn postgres_abi_metadata_collisions_round_trip_through_insert_and_copy() {
         let columns = &fixture.params.sql_column_names[1..1 + names().len()];
         let selection =
             columns.iter().map(|name| format!("\"{name}\"::text")).collect::<Vec<_>>().join(",");
-        let rows=fixture.client.query(&format!("SELECT {selection},block_number::text,network,contract_address,rindexer_id,tx_hash,block_hash,tx_index::text,log_index::text,(block_timestamp IS NULL) FROM {} AS event_row ORDER BY event_row.value::numeric",fixture.params.sql_event_table_name),&[]).await.unwrap();
+        let rows=fixture.client.query(&format!("SELECT {selection},block_number::text,network,contract_address,rindexer_id,tx_hash,block_hash,tx_index::text,log_index::text,(block_timestamp IS NULL) FROM {} AS event_row ORDER BY event_row.value::numeric",fixture.params.stored_table()),&[]).await.unwrap();
         for (offset, row) in rows.iter().enumerate() {
             let id = offset as u64 + 1;
             for (index, value) in values(id).iter().enumerate() {
@@ -200,7 +200,7 @@ async fn rollback(
             totals,
             false,
             vec![DerivedTableRollbackOp::try_new(
-                fixture.params.sql_event_table_name.clone(),
+                fixture.params.stored_table().to_owned(),
                 vec![],
                 vec![DerivedColumnRollback::try_new(
                     "amount".into(),

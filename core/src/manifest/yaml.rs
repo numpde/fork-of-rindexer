@@ -224,6 +224,14 @@ fn validate_manifest(
     manifest: &Manifest,
     prepared: Option<&PreparedSchema>,
 ) -> Result<(), ValidateManifestError> {
+    if let Some(schema) = prepared.filter(|_| manifest.storage.postgres_enabled()) {
+        schema.validate_postgres_identities().map_err(|error| {
+            ValidateManifestError::CustomIndexingValidationError(
+                error.to_string(),
+                manifest.name.clone(),
+            )
+        })?;
+    }
     let mut seen = HashSet::new();
     let duplicates_contract_names: Vec<String> = manifest
         .contracts

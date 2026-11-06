@@ -717,7 +717,7 @@ async fn postgres_required_stream_rejects_unsupported_source_context_before_star
             params.postgres = None;
         }
         if mode == "no-raw-events" {
-            params.store_raw_events = false;
+            params.raw_table = None;
         }
         let callback: EventCallbackType = if mode == "rust-handler" {
             Arc::new(|_| Box::pin(async { Ok(()) }))

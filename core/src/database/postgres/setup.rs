@@ -38,6 +38,7 @@ pub async fn setup_postgres_prepared(
     manifest: &Manifest,
     schema: &PreparedSchema,
 ) -> Result<PostgresClient, SetupPostgresError> {
+    schema.validate_postgres_identities()?;
     info!("Setting up postgres");
 
     let client = PostgresClient::new().await?;

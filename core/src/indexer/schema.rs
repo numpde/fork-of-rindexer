@@ -4,7 +4,11 @@
 //! cron and recovery consume these same columns and types instead of re-reading
 //! ABI files or projecting logical names independently.
 
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{Arc, OnceLock},
+};
 
 use alloy::json_abi::{Event, JsonAbi};
 
@@ -13,7 +17,11 @@ use crate::{
         ABIItem, EventInfo, GetAbiItemWithDbMap, GetAbiItemWithDbMapError, RawEventColumns,
         ReadAbiError,
     },
-    database::generate::GenerateTablesForIndexerSqlError,
+    database::{
+        generate::{generate_indexer_contract_schema_name, GenerateTablesForIndexerSqlError},
+        postgres::generate::generate_internal_event_table_name,
+    },
+    helpers::camel_to_snake,
     indexer::{
         native_transfer::{NATIVE_TRANSFER_ABI, NATIVE_TRANSFER_CONTRACT_NAME},
         reorg::task::RollbackEventSource,
@@ -31,6 +39,7 @@ pub struct PreparedSchema {
     indexer: Indexer,
     contracts: Vec<PreparedContract>,
     native: Option<PreparedContract>,
+    postgres_admission: OnceLock<Result<(), String>>,
 }
 
 /// One logical contract declaration and its canonical runtime identity.
@@ -38,6 +47,7 @@ pub struct PreparedSchema {
 pub struct PreparedContract {
     pub(crate) declaration: Contract,
     pub(crate) name: String,
+    pub(crate) schema_name: String,
     pub(crate) events: Vec<PreparedEvent>,
     pub(crate) tables: Arc<Vec<TableRuntime>>,
     pub(crate) abi: JsonAbi,
@@ -51,7 +61,13 @@ pub struct PreparedEvent {
     pub(crate) event: Event,
     pub(crate) columns: Arc<RawEventColumns>,
     pub(crate) source: RollbackEventSource,
+    /// A subscription can own progress without storing raw rows.
+    pub(crate) raw_table: Option<String>,
+    pub(crate) checkpoint_table: String,
 }
+
+#[path = "postgres_identities.rs"]
+mod postgres_identities;
 
 impl PreparedSchema {
     /// Resolve ABI inputs and custom-table declarations before generating SQL.
@@ -93,7 +109,12 @@ impl PreparedSchema {
         } else {
             None
         };
-        let schema = Self { indexer: prepared_indexer, contracts, native };
+        let schema = Self {
+            indexer: prepared_indexer,
+            contracts,
+            native,
+            postgres_admission: OnceLock::new(),
+        };
         schema.validate_contract_identities()?;
         schema.validate_factory_references()?;
         Ok(schema)
@@ -245,6 +266,8 @@ impl PreparedContract {
         let items = ABIItem::select_contract_items(items, declaration, false);
         let runtime_items = ABIItem::select_contract_items(items.clone(), declaration, is_filter);
         let infos = ABIItem::extract_event_names_and_signatures_from_abi(runtime_items)?;
+        let name = declaration.before_modify_name_if_filter_readonly().into_owned();
+        let schema_name = generate_indexer_contract_schema_name(indexer_name, &name);
         let mut layouts = Vec::with_capacity(infos.len());
         for info in infos {
             let stores_raw = declaration.stores_raw_events(&info.name);
@@ -263,14 +286,17 @@ impl PreparedContract {
             } else {
                 RollbackEventSource::default()
             };
-            layouts.push((info, columns, source));
+            let raw_table =
+                stores_raw.then(|| format!("{schema_name}.{}", camel_to_snake(&info.name)));
+            let checkpoint_table = generate_internal_event_table_name(&schema_name, &info.name);
+            layouts.push((info, columns, source, raw_table, checkpoint_table));
         }
         // Keep the original names and their storage collision in diagnostics,
         // even when Alloy would reject the same ABI's syntax first. Each layout
         // is frozen above and only its decoder is attached below.
         let abi: JsonAbi = serde_json::from_str(abi_text).map_err(ReadAbiError::from)?;
         let mut events = Vec::with_capacity(layouts.len());
-        for (info, columns, source) in layouts {
+        for (info, columns, source, raw_table, checkpoint_table) in layouts {
             let event = abi
                 .events
                 .get(&info.name)
@@ -282,7 +308,14 @@ impl PreparedContract {
                     ))
                 })?
                 .clone();
-            events.push(PreparedEvent { info, event, columns, source });
+            events.push(PreparedEvent {
+                info,
+                event,
+                columns,
+                source,
+                raw_table,
+                checkpoint_table,
+            });
         }
         let event_types = events
             .iter()
@@ -299,7 +332,6 @@ impl PreparedContract {
             })
             .collect::<HashMap<_, _>>();
         let mut declaration = declaration.clone();
-        let name = declaration.before_modify_name_if_filter_readonly().into_owned();
         let mut tables = Vec::new();
         if let Some(declarations) = declaration.tables.as_mut() {
             for table in declarations {
@@ -313,7 +345,7 @@ impl PreparedContract {
                 );
             }
         }
-        Ok(Self { declaration, name, events, tables: Arc::new(tables), abi, items })
+        Ok(Self { declaration, name, schema_name, events, tables: Arc::new(tables), abi, items })
     }
 }
 

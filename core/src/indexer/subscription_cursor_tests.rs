@@ -300,7 +300,7 @@ async fn postgres_restart_without_start_block_recovers_downtime_exactly_once() {
         .query(
             &format!(
                 "SELECT block_number::text FROM {} ORDER BY block_number",
-                fixture.params.sql_event_table_name
+                fixture.params.stored_table()
             ),
             &[],
         )

@@ -206,7 +206,7 @@ async fn postgres_arithmetic_recovery_resolves_missing_timestamp_by_matching_has
         .client
         .batch_execute(&format!(
             "UPDATE {} SET block_timestamp = NULL",
-            fixture.params.sql_event_table_name
+            fixture.params.stored_table()
         ))
         .await
         .unwrap();

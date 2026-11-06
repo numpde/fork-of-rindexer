@@ -75,7 +75,7 @@ async fn postgres_reorg_replaces_cached_view_state_without_restart() {
             fixture.params.tables[0].full_table_name.clone(),
             false,
             vec![DerivedTableRollbackOp::try_new(
-                fixture.params.sql_event_table_name.clone(),
+                fixture.params.stored_table().to_owned(),
                 vec![],
                 vec![DerivedColumnRollback::try_new(
                     "amount".to_string(),

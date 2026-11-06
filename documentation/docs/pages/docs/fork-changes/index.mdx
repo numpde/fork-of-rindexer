@@ -34,6 +34,20 @@ apply to its storage and configuration:
 These notes retain their existing URLs. Their place in this section identifies
 them as maintained fork documentation.
 
+## PostgreSQL storage ownership
+
+Startup checks generated contract schemas, raw tables and checkpoint names before
+schema synchronization, reset or creation. Each logical source must own its
+physical destination: for example, `Value16` and `Value_16` cannot both store
+rows in `value_16`. Separate subscriptions to one declared event may share raw
+history while retaining their own progress. Place custom tables in distinct
+destinations from raw or internal tables. The check also reserves explicitly
+named engine indexes and the ordinary primary-key index and serial sequence names
+of raw tables. PostgreSQL can shorten or number auxiliary names to fit its live
+catalog; startup does not predict those names. If an older configuration already mixed
+sources, review and rebuild affected history, derived rows, receipts and progress
+from a verified starting block; changing a declaration cannot separate old rows.
+
 ## Column names in custom tables
 
 Write event fields and custom-table columns by their **logical** names in the

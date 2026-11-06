@@ -1,6 +1,4 @@
-use crate::database::generate::{
-    generate_indexer_contract_schema_name, GenerateTablesForIndexerSqlError,
-};
+use crate::database::generate::GenerateTablesForIndexerSqlError;
 use crate::helpers::camel_to_snake;
 use crate::indexer::schema::PreparedSchema;
 use crate::PostgresClient;
@@ -86,17 +84,9 @@ pub async fn execute_prepared_migrations(
 
     for version in &unapplied {
         for prepared in schema.contracts().iter().chain(schema.native()) {
-            let contract = &prepared.declaration;
-            let schema_name = generate_indexer_contract_schema_name(&indexer.name, &prepared.name);
-            let raw_events = prepared
-                .events
-                .iter()
-                .filter(|event| contract.stores_raw_events(&event.info.name))
-                .map(|event| &event.info);
-
-            for event_info in raw_events {
-                let table_name = format!("{}.{}", schema_name, camel_to_snake(&event_info.name));
-                statements.push_str(&version.generate_table_migration_sql(&table_name));
+            for table_name in prepared.events.iter().filter_map(|event| event.raw_table.as_deref())
+            {
+                statements.push_str(&version.generate_table_migration_sql(table_name));
             }
         }
     }

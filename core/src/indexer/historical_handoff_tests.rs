@@ -90,7 +90,7 @@ async fn postgres_historical_live_handoff_replaces_the_committed_orphan_and_surv
     fixture.params.tables = Arc::new(vec![]);
     fixture.indexer.contracts[0].tables = None;
     phase(&fixture, false, true).await;
-    let query = format!("SELECT block_hash FROM {}", fixture.params.sql_event_table_name);
+    let query = format!("SELECT block_hash FROM {}", fixture.params.stored_table());
     assert_eq!(
         fixture.client.query_one(&query, &[]).await.unwrap().get::<_, String>(0),
         format!("{ORIGINAL:#x}")

@@ -341,7 +341,7 @@ async fn postgres_startup_keeps_admitted_schema_after_abi_file_disappears() {
     let after = fixture
         .client
         .query_one(
-            &format!("SELECT t.key_16::text, t.amount_32::text, e.block_number::text FROM {table} t JOIN {} e ON e.key_16::numeric=t.key_16", fixture.params.sql_event_table_name),
+            &format!("SELECT t.key_16::text, t.amount_32::text, e.block_number::text FROM {table} t JOIN {} e ON e.key_16::numeric=t.key_16", fixture.params.stored_table()),
             &[],
         )
         .await

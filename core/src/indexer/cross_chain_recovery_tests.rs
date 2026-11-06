@@ -113,7 +113,7 @@ async fn postgres_cross_chain_insert_rollback_preserves_other_network_rows() {
         ["10", "30"],
         "A's fork must not delete B's append-only row at an unrelated higher height"
     );
-    let surviving = fixture.client.query_one(&format!("SELECT (SELECT count(*) FROM {} WHERE network = 'other'), (SELECT count(*) FROM rindexer_internal.event_applications WHERE network = 'other')",fixture.params.sql_event_table_name),&[]).await.unwrap();
+    let surviving = fixture.client.query_one(&format!("SELECT (SELECT count(*) FROM {} WHERE network = 'other'), (SELECT count(*) FROM rindexer_internal.event_applications WHERE network = 'other')",fixture.params.stored_table()),&[]).await.unwrap();
     assert_eq!((surviving.get::<_, i64>(0), surviving.get::<_, i64>(1)), (1, 1));
     drop(callback);
     fixture.finish().await;
@@ -288,7 +288,7 @@ async fn remove_other_raw_timestamp(fixture: &Fixture) {
         .client
         .batch_execute(&format!(
             "UPDATE {} SET block_timestamp = NULL WHERE network = 'other'",
-            fixture.params.sql_event_table_name
+            fixture.params.stored_table()
         ))
         .await
         .unwrap();

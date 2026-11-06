@@ -28,6 +28,22 @@ use crate::{
     AsyncCsvAppender,
 };
 
+impl NoCodeCallbackParams {
+    pub(super) fn stored_table(&self) -> &str {
+        self.raw_table.as_deref().expect("fixture declares raw event storage")
+    }
+
+    pub(super) fn set_test_raw_table(&mut self, schema: &str) {
+        self.raw_table =
+            Some(format!("{schema}.{}", crate::helpers::camel_to_snake(&self.event_info.name)));
+        self.checkpoint_table =
+            crate::database::postgres::generate::generate_internal_event_table_name(
+                schema,
+                &self.event_info.name,
+            );
+    }
+}
+
 pub(super) fn params() -> NoCodeCallbackParams {
     let definition = json!({"name": "Value", "type": "event", "anonymous": false, "inputs": [{"name": "value", "type": "uint256", "indexed": false}]});
     let event_info =
@@ -42,12 +58,13 @@ pub(super) fn params() -> NoCodeCallbackParams {
         csv: None,
         postgres: None,
         clickhouse: None,
-        sql_event_table_name: String::new(),
+        raw_table: Some("input_tests_contract.value".into()),
+        checkpoint_table: "input_tests_contract_value".into(),
         sql_column_names,
         streams_clients: Arc::new(None),
         chat_clients: Arc::new(None),
         tables: Arc::new(vec![]),
-        store_raw_events: true,
+
         providers: Arc::new(Default::default()),
         constants: Arc::new(Default::default()),
         multicall_addresses: Arc::new(Default::default()),
@@ -176,7 +193,7 @@ async fn postgres_batch_checks(
     let corrected = event(&params, 2);
     let mut invalid = corrected.clone();
     truncate_data(&mut invalid);
-    let table = params.sql_event_table_name.clone();
+    let table = params.stored_table().to_owned();
     let callback = no_code_callback(Arc::new(params)).event_callback;
     let result = callback(vec![valid.clone(), invalid]).await;
     let rows: i64 = postgres.query_one(&format!("SELECT count(*) FROM {table}"), &[]).await?.get(0);
@@ -246,7 +263,7 @@ async fn postgres_decode_failure_keeps_rows_and_cursor_unchanged_until_corrected
     params.indexer_name = format!("input_{:032x}", rand::random::<u128>());
     let schema = generate_indexer_contract_schema_name(&params.indexer_name, &params.contract_name);
     let cursor = generate_internal_event_table_name(&schema, &params.event_info.name);
-    params.sql_event_table_name = format!("{schema}.value");
+    params.set_test_raw_table(&schema);
     params.postgres = Some(postgres.clone());
     let columns = generate_columns_with_data_types(&params.event_info.inputs).join(", ");
     // Only the ABI columns are under test; the fixed metadata shape matches event-table DDL.

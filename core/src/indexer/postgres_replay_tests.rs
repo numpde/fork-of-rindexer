@@ -92,10 +92,7 @@ async fn postgres_nested_tuple_callback_stores_rows_and_delivers_webhook_json() 
         }
         let row = fixture
             .client
-            .query_one(
-                &format!("SELECT value_inner_x FROM {}", fixture.params.sql_event_table_name),
-                &[],
-            )
+            .query_one(&format!("SELECT value_inner_x FROM {}", fixture.params.stored_table()), &[])
             .await
             .unwrap();
         assert_eq!(row.get::<_, String>(0), "7");
@@ -105,7 +102,7 @@ async fn postgres_nested_tuple_callback_stores_rows_and_delivers_webhook_json() 
                 .query_one(
                     &format!(
                         "SELECT value_label, \"after\" FROM {}",
-                        fixture.params.sql_event_table_name
+                        fixture.params.stored_table()
                     ),
                     &[],
                 )
@@ -234,7 +231,6 @@ impl Fixture {
         .unwrap();
         let mut fixture =
             Self::with_manifest(definition, NATIVE_TRANSFER_CONTRACT_NAME, manifest).await;
-        fixture.params.store_raw_events = true;
         fixture.params.atomic_safe_concurrency = false;
         fixture
     }
@@ -319,8 +315,7 @@ impl Fixture {
         params.indexer_name = manifest.name.clone();
         let schema =
             generate_indexer_contract_schema_name(&params.indexer_name, &params.contract_name);
-        params.sql_event_table_name =
-            format!("{schema}.{}", crate::helpers::camel_to_snake(&params.event_info.name));
+        params.set_test_raw_table(&schema);
         params.tables = Arc::new(
             Self::source_tables(&indexer, contract)
                 .iter()
@@ -395,7 +390,7 @@ impl Fixture {
         let cursor = generate_internal_event_table_name(&schema, &self.params.event_info.name);
         let count = self
             .client
-            .query_one(&format!("SELECT count(*) FROM {}", self.params.sql_event_table_name), &[])
+            .query_one(&format!("SELECT count(*) FROM {}", self.params.stored_table()), &[])
             .await
             .unwrap()
             .get(0);
@@ -1043,7 +1038,7 @@ async fn postgres_failed_write_rolls_back_receipts_with_all_effects() {
         .client
         .batch_execute(&format!(
             "ALTER TABLE {} ADD CONSTRAINT reject_second CHECK (value <> '2')",
-            fixture.params.sql_event_table_name
+            fixture.params.stored_table()
         ))
         .await
         .unwrap();
@@ -1058,7 +1053,7 @@ async fn postgres_failed_write_rolls_back_receipts_with_all_effects() {
         .client
         .batch_execute(&format!(
             "ALTER TABLE {} DROP CONSTRAINT reject_second",
-            fixture.params.sql_event_table_name
+            fixture.params.stored_table()
         ))
         .await
         .unwrap();
@@ -1091,7 +1086,7 @@ async fn postgres_duplicates_within_one_batch_apply_once() {
 #[tokio::test]
 async fn postgres_existing_untracked_history_requires_reviewed_migration() {
     let fixture = Fixture::new().await;
-    fixture.client.batch_execute(&format!("INSERT INTO {} (contract_address, value, tx_hash, block_number, block_hash, network, tx_index, log_index) VALUES ('0x{:040x}', '99', '0x{:064x}', 2, '0x{:064x}', 'ethereum', 0, '0')", fixture.params.sql_event_table_name, 0, 99, 99)).await.unwrap();
+    fixture.client.batch_execute(&format!("INSERT INTO {} (contract_address, value, tx_hash, block_number, block_hash, network, tx_index, log_index) VALUES ('0x{:040x}', '99', '0x{:064x}', 2, '0x{:064x}', 'ethereum', 0, '0')", fixture.params.stored_table(), 0, 99, 99)).await.unwrap();
     let callback = no_code_callback(Arc::new(fixture.params.clone())).event_callback;
     let outcome = callback(fixture.events(&[1, 2])).await;
     let position = fixture.position().await;
@@ -1171,7 +1166,7 @@ async fn assert_reorg_replay(kind: ReplayKind) {
             totals,
             false,
             vec![DerivedTableRollbackOp::try_new(
-                fixture.params.sql_event_table_name.clone(),
+                fixture.params.stored_table().to_owned(),
                 vec![],
                 vec![DerivedColumnRollback::try_new(
                     "amount".to_string(),

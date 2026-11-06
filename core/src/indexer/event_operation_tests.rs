@@ -435,7 +435,7 @@ async fn postgres_arithmetic_update_recovery_requires_support_or_startup_rejecti
     .await;
     if let Err(reason) = fixture.params.tables[0].table.definition().validate_reorg_operations() {
         assert!(reason.contains("arithmetic update") && reason.contains("reorg"), "{reason}");
-        let untouched = fixture.client.query_one(&format!("SELECT (SELECT count(*) FROM {}), (SELECT count(*) FROM {}), (SELECT count(*) FROM rindexer_internal.event_applications)", fixture.params.sql_event_table_name, fixture.params.tables[0].full_table_name), &[]).await.unwrap();
+        let untouched = fixture.client.query_one(&format!("SELECT (SELECT count(*) FROM {}), (SELECT count(*) FROM {}), (SELECT count(*) FROM rindexer_internal.event_applications)", fixture.params.stored_table(), fixture.params.tables[0].full_table_name), &[]).await.unwrap();
         assert_eq!(
             (untouched.get::<_, i64>(0), untouched.get::<_, i64>(1), untouched.get::<_, i64>(2)),
             (0, 0, 0),

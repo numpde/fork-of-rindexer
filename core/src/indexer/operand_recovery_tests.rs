@@ -261,7 +261,8 @@ async fn postgres_arithmetic_legacy_missing_operands_abort_before_recovery_mutat
         .client
         .batch_execute(&format!(
             "UPDATE {} SET items = '{{}}' WHERE block_number = 101; UPDATE {} SET amount = 27",
-            fixture.params.sql_event_table_name, fixture.params.tables[0].full_table_name
+            fixture.params.stored_table(),
+            fixture.params.tables[0].full_table_name
         ))
         .await
         .unwrap();
@@ -558,7 +559,7 @@ async fn postgres_arithmetic_public_recovery_requires_complete_type_metadata() {
                 fixture.params.tables[0].full_table_name.clone(),
                 false,
                 vec![DerivedTableRollbackOp::try_new(
-                    fixture.params.sql_event_table_name.clone(),
+                    fixture.params.stored_table().to_owned(),
                     vec![],
                     vec![DerivedColumnRollback::try_new(
                         "amount".into(),
@@ -630,7 +631,7 @@ async fn postgres_arithmetic_missing_json_array_key_cannot_become_an_empty_key()
             .client
             .batch_execute(&format!(
                 "UPDATE {} SET items = '{items}'::JSONB WHERE block_number = 101",
-                fixture.params.sql_event_table_name
+                fixture.params.stored_table()
             ))
             .await
             .unwrap();
@@ -680,7 +681,7 @@ async fn postgres_arithmetic_legacy_canonical_missing_keys_abort_before_recovery
         .unwrap();
         // The older canonical application used id's default 1. Reconstructing
         // keys from NULL after reverting a valid orphan would delete its row.
-        fixture.client.batch_execute(&format!("UPDATE {} SET items = '{{}}' WHERE network = '{canonical_network}' AND block_number = 99", fixture.params.sql_event_table_name)).await.unwrap();
+        fixture.client.batch_execute(&format!("UPDATE {} SET items = '{{}}' WHERE network = '{canonical_network}' AND block_number = 99", fixture.params.stored_table())).await.unwrap();
         let before = fixture.position().await;
         let result = super::recovery_boundary_tests::rollback(&fixture, 100, 100).await;
         let error = format!(
@@ -771,7 +772,7 @@ async fn postgres_column_identity_survives_forward_writes_and_rollback() {
     let state = format!(
         "SELECT e.key_16::text, to_jsonb(t)->>'key_16', to_jsonb(t)->>'amount_32', \
          t.rindexer_block_number::bigint FROM {} t JOIN {} e ON e.block_number=t.rindexer_block_number",
-        fixture.params.tables[0].full_table_name, fixture.params.sql_event_table_name
+        fixture.params.tables[0].full_table_name, fixture.params.stored_table()
     );
     let value = |r: tokio_postgres::Row| {
         (

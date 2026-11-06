@@ -174,7 +174,7 @@ async fn timestamp_recovery_case(hydrate: bool, threshold: u64) {
         .query(
             &format!(
                 "SELECT EXTRACT(EPOCH FROM block_timestamp)::bigint FROM {} ORDER BY block_number",
-                fixture.params.sql_event_table_name
+                fixture.params.stored_table()
             ),
             &[],
         )

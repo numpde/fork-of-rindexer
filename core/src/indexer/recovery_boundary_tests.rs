@@ -100,7 +100,7 @@ async fn uneven_subscription_rollback(operation: &str, action: &str) {
         .query_one(
             &format!(
                 "SELECT count(*), max(block_number)::text FROM {}",
-                fixture.params.sql_event_table_name
+                fixture.params.stored_table()
             ),
             &[],
         )

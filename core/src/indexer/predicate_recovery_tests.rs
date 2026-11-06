@@ -181,10 +181,7 @@ async fn postgres_string_predicates_require_equivalent_recovery_or_startup_refus
             assert!(error.contains("string") && error.contains("predicate"), "{error}");
             let raw: i64 = fixture
                 .client
-                .query_one(
-                    &format!("SELECT count(*) FROM {}", fixture.params.sql_event_table_name),
-                    &[],
-                )
+                .query_one(&format!("SELECT count(*) FROM {}", fixture.params.stored_table()), &[])
                 .await
                 .unwrap()
                 .get(0);
@@ -297,7 +294,7 @@ async fn postgres_legacy_string_or_untyped_predicates_fail_without_changing_hist
                 table.clone(),
                 false,
                 vec![DerivedTableRollbackOp::try_new(
-                    fixture.params.sql_event_table_name.clone(),
+                    fixture.params.stored_table().to_owned(),
                     vec![],
                     vec![DerivedColumnRollback::try_new(
                         "amount".into(),

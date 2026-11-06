@@ -5,9 +5,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::database::generate::generate_indexer_contract_schema_name;
+use crate::database::generate::generate_table_full_name;
 use crate::database::postgres::client::PostgresClient;
-use crate::helpers::camel_to_snake;
 use crate::indexer::schema::PreparedSchema;
 use crate::manifest::contract::{injected_columns, ResolvedTable, Table};
 use crate::manifest::core::Manifest;
@@ -282,13 +281,26 @@ pub async fn detect_schema_changes(
         .custom_table_groups()
         .flat_map(|(owner, tables)| {
             tables.iter().map(move |table| {
-                table.try_resolve_storage_columns().map(|resolved| (owner, table, resolved))
+                table.try_resolve_storage_columns().map(|resolved| {
+                    (
+                        generate_table_full_name(
+                            &manifest.name,
+                            owner,
+                            &table.name,
+                            table.database.as_deref(),
+                        ),
+                        table,
+                        resolved,
+                    )
+                })
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let tables: Vec<_> =
-        tables.iter().map(|(owner, table, resolved)| (*owner, *table, resolved)).collect();
-    detect_resolved_schema_changes(client, &manifest.name, &tables).await
+    let tables: Vec<_> = tables
+        .iter()
+        .map(|(target, table, resolved)| (target.as_str(), *table, resolved))
+        .collect();
+    detect_resolved_schema_changes(client, &tables).await
 }
 
 /// Compare catalogs against the frozen startup schema without resolving declarations again.
@@ -296,40 +308,42 @@ pub async fn detect_prepared_schema_changes(
     client: &PostgresClient,
     schema: &PreparedSchema,
 ) -> Result<Vec<SchemaChange>, String> {
+    schema.validate_postgres_identities().map_err(|error| error.to_string())?;
     let tables: Vec<_> = schema
         .contracts()
         .iter()
         .chain(schema.native())
         .flat_map(|contract| {
             contract.declaration.tables.iter().flatten().zip(contract.tables.iter()).map(
-                move |(declaration, runtime)| (contract.name.as_str(), declaration, &runtime.table),
+                |(declaration, runtime)| {
+                    (runtime.full_table_name.as_str(), declaration, &runtime.table)
+                },
             )
         })
         .collect();
-    detect_resolved_schema_changes(client, &schema.indexer().name, &tables).await
+    detect_resolved_schema_changes(client, &tables).await
 }
 
 async fn detect_resolved_schema_changes(
     client: &PostgresClient,
-    indexer_name: &str,
     tables: &[(&str, &Table, &ResolvedTable)],
 ) -> Result<Vec<SchemaChange>, String> {
     let mut changes = Vec::new();
-    for &(owner, declaration, resolved) in tables {
-        let default_schema = generate_indexer_contract_schema_name(indexer_name, owner);
+    for &(target, declaration, resolved) in tables {
         let table = resolved.definition();
-        let schema_name = table.database.as_deref().unwrap_or(&default_schema);
-        let table_name = camel_to_snake(&table.name);
-        let table_full_name = format!("{}.{}", schema_name, table_name);
+        let (schema_name, table_name) = target
+            .split_once('.')
+            .ok_or_else(|| format!("Invalid custom table destination {target:?}"))?;
+        let table_full_name = target.to_string();
 
         // Check if table exists
-        if !table_exists(client, schema_name, &table_name).await? {
+        if !table_exists(client, schema_name, table_name).await? {
             // Table doesn't exist yet, will be created normally
             continue;
         }
 
         // Get existing columns
-        let existing_columns = get_existing_columns(client, schema_name, &table_name).await?;
+        let existing_columns = get_existing_columns(client, schema_name, table_name).await?;
         let existing_col_names: HashSet<String> =
             existing_columns.iter().map(|c| c.name.clone()).collect();
         let existing_col_types: HashMap<String, String> =
@@ -400,7 +414,7 @@ async fn detect_resolved_schema_changes(
         }
 
         // Check for primary key changes
-        if let Some(current_pk) = get_primary_key_columns(client, schema_name, &table_name).await? {
+        if let Some(current_pk) = get_primary_key_columns(client, schema_name, table_name).await? {
             let expected_pk = get_expected_pk_columns(table);
 
             if current_pk.columns != expected_pk {

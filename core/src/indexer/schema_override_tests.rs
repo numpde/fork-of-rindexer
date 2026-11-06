@@ -38,7 +38,7 @@ async fn postgres_custom_schema_override_is_shared_by_startup_writes_and_schema_
         let mut params = fixture.params.clone();
         params.contract_name = contract.name.clone();
         let schema = generate_indexer_contract_schema_name(&indexer.name, &contract.name);
-        params.sql_event_table_name = format!("{schema}.value");
+        params.set_test_raw_table(&schema);
         params.tables = Arc::new(
             contract
                 .tables
@@ -139,7 +139,7 @@ async fn postgres_shared_target_recovery_requires_one_manifest_owner() {
         let mut params = fixture.params.clone();
         params.contract_name = contract.name.clone();
         let schema = generate_indexer_contract_schema_name(&indexer.name, &contract.name);
-        params.sql_event_table_name = format!("{schema}.value");
+        params.set_test_raw_table(&schema);
         params.tables = Arc::new(
             contract
                 .tables
