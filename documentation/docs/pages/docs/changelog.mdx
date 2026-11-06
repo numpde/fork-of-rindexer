@@ -2,6 +2,7 @@
 
 ### Breaking changes
 -------------------------------------------------
+- breaking: No-code cron operations with `if` or legacy `filter` conditions now fail manifest admission for contracts and enabled native-transfer tables. Historical and live cron previously ignored these guards and could mutate rows unconditionally. Remove the unsupported cron condition or express the guarded logic as an event operation; review previously affected scheduled rows before restarting.
 - breaking: PostgreSQL startup now rejects cron writers on reorg-recovered networks, including native-transfer tables with inherited networks and cross-chain tables whose scheduled writes share recovered event rows. Recovery cannot undo scheduled mutations; move cron rows to a non-recovered destination or remove the cron, and reconcile any existing affected state before restarting.
 - breaking: Rust callers building factory cron jobs with `CronScheduler::try_new` or `FactoryCronConfig` literals must use `CronScheduler::try_new_prepared(project.schema(), ...)` with a `PreparedProject`; static cron still accepts the manifest-only constructor. No-code startup already uses the prepared constructor.
 - breaking: PostgreSQL startup now rejects different sources that share a generated schema, raw table or checkpoint, and custom tables overlapping those relations. Choose distinct manifest names or destinations; if indexing already ran, reconcile raw history, derived rows, receipts and cursors before resuming.

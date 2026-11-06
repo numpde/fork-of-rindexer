@@ -277,6 +277,32 @@ fn validate_manifest(
             })?;
         }
     }
+    // Neither historical nor live cron evaluates operation conditions. Reject
+    // them before schema synchronization rather than performing the mutation
+    // unconditionally. This also covers enabled native-transfer tables.
+    for (owner, tables) in manifest.custom_table_groups() {
+        for table in tables {
+            for (cron_index, cron) in table.cron.iter().flatten().enumerate() {
+                for (operation_index, operation) in cron.operations.iter().enumerate() {
+                    let conditional_fields =
+                        match (operation.if_condition.as_ref(), operation.filter.as_ref()) {
+                            (Some(_), Some(_)) => "`if` and `filter`",
+                            (Some(_), None) => "`if`",
+                            (None, Some(_)) => "`filter`",
+                            (None, None) => continue,
+                        };
+                    return Err(ValidateManifestError::CustomIndexingValidationError(
+                        format!(
+                            "Table {owner}.{} cron[{cron_index}].operations[{operation_index}] declares {conditional_fields}, but historical and live cron do not evaluate operation conditions. Remove the cron condition; event operations can use conditions.",
+                            table.name
+                        ),
+                        owner.to_owned(),
+                    ));
+                }
+            }
+        }
+    }
+
     recovery_validation::validate(manifest, &contracts, prepared)?;
 
     for contract in &contracts {
