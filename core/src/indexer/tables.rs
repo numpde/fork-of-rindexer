@@ -3924,12 +3924,12 @@ pub(crate) async fn prepare_table_operations<'t>(
                             expanded_log_params.iter().find(|parameter| &parameter.name == field)
                         {
                             let kind = parameter.value.sol_type_name().as_deref().and_then(ColumnType::from_solidity_type).ok_or_else(|| format!("Cannot evaluate table guard: event field {field} has an unsupported SQL type"))?;
-                            match (&parameter.value, &operation.operation_type) {
-                                // Incoming integers are ABI values. A stored uint64 BIGINT, for
-                                // example, reinterprets u64::MAX as -1; guard comparisons must not.
-                                (DynSolValue::Uint(value, _), OperationType::Upsert) => EthereumSqlTypeWrapper::U256Numeric(*value),
-                                (DynSolValue::Int(value, _), OperationType::Upsert) => EthereumSqlTypeWrapper::I256Numeric(*value),
-                                (DynSolValue::Array(_) | DynSolValue::FixedArray(_) | DynSolValue::Tuple(_), OperationType::Upsert) => return Err(format!("Cannot evaluate UPSERT guard: incoming field {field} must be scalar")),
+                            match &parameter.value {
+                                // Compare the incoming ABI integer, independent of how a
+                                // destination column stores it (e.g. uint64 as signed BIGINT).
+                                DynSolValue::Uint(value, _) => EthereumSqlTypeWrapper::U256Numeric(*value),
+                                DynSolValue::Int(value, _) => EthereumSqlTypeWrapper::I256Numeric(*value),
+                                DynSolValue::Array(_) | DynSolValue::FixedArray(_) | DynSolValue::Tuple(_) if operation.operation_type == OperationType::Upsert => return Err(format!("Cannot evaluate UPSERT guard: incoming field {field} must be scalar")),
                                 _ => dyn_sol_value_to_wrapper(&parameter.value, &kind),
                             }
                         } else {

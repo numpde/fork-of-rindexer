@@ -82,6 +82,7 @@
 
 ### Bug fixes
 -------------------------------------------------
+- fix: PostgreSQL UPDATE and DELETE guards compare incoming ABI integers at full precision, including uint64 values above the signed BIGINT range. Stored column representations are unchanged; review previously skipped mutations when rebuilding history.
 - fix: factory-backed cron reads child addresses and birth blocks from the prepared discovery event, even when an ABI field shadows emitter metadata.
 - fix: reorg recovery rewinds PostgreSQL subscription checkpoints even when the event has no raw table; a missing required raw table still stops recovery without changing data or progress.
 - fix: `dependency_events` live indexing now validates RPC log identities against the observed canonical head, including connected header proofs for older logs. Inconsistent responses retry without callbacks or cursor advancement; batches containing removed logs invoke configured network recovery and are refetched in full. Providers must serve consistent headers, and previously committed orphaned or skipped history still needs reviewed recovery or rebuilding.
