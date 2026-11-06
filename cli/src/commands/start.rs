@@ -601,9 +601,10 @@ pub async fn start(
                     watch,
                 };
 
-                let _ = start_rindexer_no_code_prepared(details, prepared).await.map_err(|e| {
+                start_rindexer_no_code_prepared(details, prepared).await.map_err(|e| {
                     print_error_message(&format!("Error starting the server: {e}"));
-                });
+                    e
+                })?;
             }
         },
     }
