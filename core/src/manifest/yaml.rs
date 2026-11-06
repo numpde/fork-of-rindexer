@@ -26,6 +26,10 @@ use crate::{
 #[path = "recovery_validation.rs"]
 mod recovery_validation;
 
+#[cfg(test)]
+#[path = "cron_condition_tests.rs"]
+mod cron_condition_tests;
+
 pub const YAML_CONFIG_NAME: &str = "rindexer.yaml";
 
 /// Checks if a value string contains arithmetic operators indicating it's a computed expression.
