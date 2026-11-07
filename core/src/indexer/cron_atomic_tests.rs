@@ -8,11 +8,25 @@ use crate::database::postgres::client::TEST_DATABASE_URL_LOCK;
 use crate::database::postgres::generate::generate_internal_cron_table_name;
 use crate::indexer::postgres_test_wire::LostCommitResponse;
 use crate::provider::mock::MockChainProvider;
+use alloy::network::{AnyHeader, AnyRpcBlock, AnyRpcHeader};
+use alloy::rpc::types::{Block, BlockTransactions};
 use serde_json::json;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
+
+fn cron_test_header(number: u64) -> AnyRpcBlock {
+    AnyRpcBlock::new(
+        Block::new(
+            AnyRpcHeader::from_sealed(
+                AnyHeader { number, ..Default::default() }.seal(B256::repeat_byte(101)),
+            ),
+            BlockTransactions::Full(vec![]),
+        )
+        .into(),
+    )
+}
 
 struct Fixture {
     _container: Option<testcontainers::ContainerAsync<Postgres>>,
@@ -1131,5 +1145,129 @@ async fn nonsemantic_rpc_and_runtime_settings_preserve_schedule_identity() {
     fixture.scheduler(&manifest, 101).unwrap().run().await.expect("same effective schedule");
     assert_eq!(fixture.count().await, 1);
     assert_eq!(fixture.checkpoint().await, Some(101));
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn shutdown_interrupts_a_stalled_historical_rpc_before_any_write() {
+    let fixture = Fixture::new().await;
+    let mut value = serde_json::to_value(Fixture::manifest(101, 101)).unwrap();
+    value["contracts"][0]["tables"][0]["cron"][0]["operations"][0]["set"][0]["value"] =
+        json!(r#"$call($contract, "value() returns (uint256)")"#);
+    let manifest: Manifest = serde_json::from_value(value).unwrap();
+    fixture.bind(&manifest).await;
+    let provider: Arc<dyn ChainProvider> = Arc::new(
+        MockChainProvider::new(1)
+            .with_block_number(101)
+            .with_blocks(vec![cron_test_header(101)])
+            .with_eth_call_waiter(Arc::new(tokio::sync::Notify::new())),
+    );
+    let providers = Arc::new(HashMap::from([("test".to_string(), provider)]));
+    let scheduler =
+        CronScheduler::try_new(&manifest, Some(fixture.postgres.clone()), None, providers)
+            .expect("admitted schedule");
+
+    let running = tokio::spawn(async move { scheduler.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    crate::initiate_shutdown().await;
+    tokio::time::timeout(Duration::from_secs(2), running)
+        .await
+        .expect("shutdown must interrupt a stalled RPC preparation")
+        .expect("scheduler task joins")
+        .expect("deliberate shutdown is not a terminal cron error");
+    assert_eq!(fixture.count().await, 0);
+    assert_eq!(fixture.checkpoint().await, None);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn historical_cron_aborts_a_permanently_blocked_checkpoint_lock() {
+    let fixture = Fixture::new().await;
+    let mut blocker = fixture.postgres.raw_connection().await.expect("blocker connection");
+    let lock = blocker.transaction().await.expect("blocker transaction");
+    lock.query_one(
+        &format!(
+            "SELECT network FROM rindexer_internal.{} WHERE network = 'test' FOR UPDATE",
+            fixture.checkpoint
+        ),
+        &[],
+    )
+    .await
+    .expect("hold the real checkpoint lock");
+
+    let blocked = fixture.worker(101, 101);
+    let result = tokio::time::timeout(Duration::from_secs(9), blocked.run())
+        .await
+        .expect("a blocked checkpoint must not hang indefinitely")
+        .expect_err("permanently held checkpoint must exhaust its finite retry budget")
+        .to_string();
+    assert!(result.contains("lock") && result.contains("timeout"), "{result}");
+    assert_eq!(fixture.count().await, 0, "no effects while checkpoint is locked");
+    assert_eq!(fixture.checkpoint().await, None);
+    drop(lock);
+    drop(blocker);
+    fixture.worker(101, 101).run().await.expect("restart after lock release");
+    assert_eq!(fixture.count().await, 1);
+    assert_eq!(fixture.checkpoint().await, Some(101));
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn historical_cron_recovers_when_a_checkpoint_lock_is_released() {
+    let fixture = Fixture::new().await;
+    let mut blocker = fixture.postgres.raw_connection().await.expect("blocker connection");
+    let lock = blocker.transaction().await.expect("blocker transaction");
+    lock.query_one(
+        &format!(
+            "SELECT network FROM rindexer_internal.{} WHERE network = 'test' FOR UPDATE",
+            fixture.checkpoint
+        ),
+        &[],
+    )
+    .await
+    .expect("hold the checkpoint lock");
+
+    let worker = fixture.worker(101, 101);
+    let (result, _) = tokio::join!(
+        async { tokio::time::timeout(Duration::from_secs(9), worker.run()).await },
+        async {
+            tokio::time::sleep(Duration::from_millis(2600)).await;
+            drop(lock);
+        },
+    );
+    drop(blocker);
+    result.expect("bounded retry must settle").expect("lock release permits retry");
+    assert_eq!(fixture.count().await, 1, "effect is committed once");
+    assert_eq!(fixture.checkpoint().await, Some(101));
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn historical_cron_bounds_a_stalled_required_rpc_call_before_writing() {
+    let fixture = Fixture::new().await;
+    let mut value = serde_json::to_value(Fixture::manifest(101, 101)).unwrap();
+    value["contracts"][0]["tables"][0]["cron"][0]["operations"][0]["set"][0]["value"] =
+        json!(r#"$call($contract, "value() returns (uint256)")"#);
+    let manifest: Manifest = serde_json::from_value(value).unwrap();
+    fixture.bind(&manifest).await;
+    let provider: Arc<dyn ChainProvider> = Arc::new(
+        MockChainProvider::new(1)
+            .with_block_number(101)
+            .with_blocks(vec![cron_test_header(101)])
+            .with_eth_call_waiter(Arc::new(tokio::sync::Notify::new())),
+    );
+    let providers = Arc::new(HashMap::from([("test".to_string(), provider)]));
+    let mut scheduler =
+        CronScheduler::try_new(&manifest, Some(fixture.postgres.clone()), None, providers)
+            .expect("admitted schedule");
+    scheduler.tasks[0].prepare_timeout_for_test = Some(Duration::from_millis(100));
+    let result = tokio::time::timeout(Duration::from_secs(2), scheduler.run())
+        .await
+        .expect("a stalled RPC must terminate within its test deadline")
+        .expect_err("a required RPC timeout cannot certify a sampled block")
+        .to_string();
+    assert!(result.contains("RPC") && result.contains("timeout"), "{result}");
+    assert_eq!(fixture.count().await, 0);
+    assert_eq!(fixture.checkpoint().await, None);
     fixture.finish().await;
 }

@@ -262,6 +262,8 @@ pub struct CronTask {
     pub factory_config: Option<FactoryCronConfig>,
     #[cfg(test)]
     pub(super) batch_size_for_test: Option<usize>,
+    #[cfg(test)]
+    pub(super) prepare_timeout_for_test: Option<Duration>,
 }
 
 /// The cron scheduler manages and executes scheduled table operations.
@@ -582,6 +584,8 @@ impl CronScheduler {
                             factory_config,
                             #[cfg(test)]
                             batch_size_for_test: None,
+                            #[cfg(test)]
+                            prepare_timeout_for_test: None,
                         });
                     }
                 }

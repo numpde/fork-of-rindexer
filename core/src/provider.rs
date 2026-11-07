@@ -1071,6 +1071,7 @@ pub mod mock {
         panic_on_log_fetch: bool,
         log_rpc_error: Option<(i64, String)>,
         log_fetch_waiter: Option<Arc<tokio::sync::Notify>>,
+        eth_call_waiter: Option<Arc<tokio::sync::Notify>>,
         initial_log_successes: usize,
         log_fetches: std::sync::atomic::AtomicUsize,
         block_batches: Option<std::sync::Mutex<std::collections::VecDeque<Vec<AnyRpcBlock>>>>,
@@ -1092,6 +1093,7 @@ pub mod mock {
                 panic_on_log_fetch: false,
                 log_rpc_error: None,
                 log_fetch_waiter: None,
+                eth_call_waiter: None,
                 initial_log_successes: 0,
                 log_fetches: std::sync::atomic::AtomicUsize::new(0),
                 block_batches: None,
@@ -1114,6 +1116,12 @@ pub mod mock {
 
         /// Keep a read-only request pending until the test releases it or the
         /// caller drops its future during fetch-scope cancellation.
+        /// Block a required historical eth_call at the provider boundary.
+        pub fn with_eth_call_waiter(mut self, waiter: Arc<tokio::sync::Notify>) -> Self {
+            self.eth_call_waiter = Some(waiter);
+            self
+        }
+
         pub fn with_log_fetch_waiter(mut self, waiter: Arc<tokio::sync::Notify>) -> Self {
             self.log_fetch_waiter = Some(waiter);
             self
@@ -1324,7 +1332,25 @@ pub mod mock {
             _data: Bytes,
             _block_number: u64,
         ) -> Result<String, ProviderError> {
+            if let Some(waiter) = &self.eth_call_waiter {
+                waiter.notified().await;
+            }
             Ok(String::new())
+        }
+
+        async fn eth_call_at_hash(
+            &self,
+            _to: Address,
+            _data: Bytes,
+            block_hash: B256,
+        ) -> Result<String, ProviderError> {
+            if let Some(waiter) = &self.eth_call_waiter {
+                waiter.notified().await;
+                return Ok(String::new());
+            }
+            Err(ProviderError::CustomError(format!(
+                "Cannot query historical state at block {block_hash:#x}: this mock has no response"
+            )))
         }
 
         async fn eth_call_latest(
