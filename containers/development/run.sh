@@ -130,6 +130,11 @@ case "$1" in
       -p rindexer --lib --no-fail-fast --no-capture \
       -E 'test(/cron_clickhouse_tests::/)'
     ;;
+  cron-supervision)
+    exec timeout --signal=TERM --kill-after=20s 900s cargo nextest run --frozen \
+      -p rindexer --lib --no-fail-fast --no-capture \
+      -E 'test(/start_cron_failure_tests::/) | test(/cron_live_supervision_tests::/)'
+    ;;
   cron-atomic-compile)
     exec cargo nextest run --frozen -p rindexer --lib --no-run \
       -E 'test(/cron_atomic_tests::/)'

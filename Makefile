@@ -351,7 +351,7 @@ ci: rust/checks tests ## Validate the first container-development slice (not all
 
 .PHONY: tests/permanent-failures/docker tests/permanent-failures/postgres
 
-.PHONY: tests/cron-atomic/postgres tests/cron-clickhouse/fixture
+.PHONY: tests/cron-atomic/postgres tests/cron-clickhouse/fixture tests/cron-supervision/docker
 .PHONY: tests/postgres-replay/docker
 .PHONY: tests/reorg/docker
 tests/reorg/docker: tests/posture ## Check shared network rewinds, reorg validation and stale-work fencing offline
@@ -370,6 +370,10 @@ tests/cron-clickhouse/fixture: tests/posture ## Check historical cron ordering a
 	compose_profile_args=(--profile clickhouse)
 	$(compose) up -d --no-build --pull never --wait --wait-timeout 150 clickhouse
 	$(compose) run --rm --no-deps -T clickhouse-tests cron-clickhouse
+
+tests/cron-supervision/docker: tests/posture ## Check required-cron failure supervision and live retry exhaustion offline
+	@$(call offline_runner,$$dependency_image)
+	$(compose) run --rm --no-deps -T offline cron-supervision
 
 tests/cron-atomic/postgres: tests/posture ## Check atomic historical-cron checkpoints with the external PostgreSQL fixture
 	@$(call offline_runner,$$dependency_image)
