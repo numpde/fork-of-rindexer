@@ -180,9 +180,50 @@ pub async fn start_rindexer(details: StartDetails<'_>) -> Result<(), StartRindex
     start_rindexer_prepared(details, prepared).await
 }
 
+/// Preserve the existing bounded-cron wait as a single owner of the join
+/// result. The initial implementation waits after other runtime work, just
+/// like the previous bounded-only path; the supervision regression below
+/// demonstrates why that ordering is insufficient for persistent services.
+async fn await_required_cron_after_runtime<F>(
+    cron_handle: Option<tokio::task::JoinHandle<Result<(), String>>>,
+    runtime: F,
+) -> Result<(), StartRindexerError>
+where
+    F: std::future::Future<Output = Result<(), StartRindexerError>>,
+{
+    runtime.await?;
+    if let Some(handle) = cron_handle {
+        match handle.await {
+            Ok(Ok(())) => info!("Cron scheduler completed"),
+            Ok(Err(error)) => return Err(StartRindexerError::CronSchedulerFailed(error)),
+            Err(error) => {
+                return Err(StartRindexerError::CronSchedulerFailed(format!(
+                    "Cron scheduler task failed to join: {error}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Start a project using the snapshot already admitted by schema synchronization.
 #[allow(clippy::result_large_err, reason = "preserve existing error API")]
 pub async fn start_rindexer_prepared(
+    mut details: StartDetails<'_>,
+    prepared: PreparedProject,
+) -> Result<(), StartRindexerError> {
+    let cron_handle = details.cron_scheduler_handle.take();
+    await_required_cron_after_runtime(
+        cron_handle,
+        start_rindexer_prepared_inner(details, prepared),
+    )
+    .await
+}
+
+/// All server and indexer lifecycle work is the runtime future. Cron's
+/// JoinHandle is owned by the caller, not by one bounded branch within it.
+#[allow(clippy::result_large_err, reason = "preserve existing error API")]
+async fn start_rindexer_prepared_inner(
     details: StartDetails<'_>,
     prepared: PreparedProject,
 ) -> Result<(), StartRindexerError> {
@@ -441,22 +482,8 @@ pub async fn start_rindexer_prepared(
             }
 
             if graphql_server_handle.is_none() && !manifest.has_any_live_indexing() {
-                // In an indexer-only bounded run, the scheduler is part of the
-                // job's success condition. An inner Err is not a successful join.
-                if let Some(cron_handle) = details.cron_scheduler_handle {
-                    info!("Waiting for cron scheduler to complete...");
-                    match cron_handle.await {
-                        Ok(Ok(())) => info!("Cron scheduler completed"),
-                        Ok(Err(error)) => {
-                            return Err(StartRindexerError::CronSchedulerFailed(error));
-                        }
-                        Err(error) => {
-                            return Err(StartRindexerError::CronSchedulerFailed(format!(
-                                "Cron scheduler task failed to join: {error}"
-                            )));
-                        }
-                    }
-                }
+                // The outer owner waits for required cron after bounded runtime
+                // completion. Persistent services still expose its blind spot.
                 return Ok(());
             }
 
