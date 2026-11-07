@@ -24,7 +24,8 @@ use crate::indexer::last_synced::{
 use crate::indexer::schema::PreparedSchema;
 use crate::is_running;
 use crate::manifest::contract::{
-    parse_interval, ColumnType, Contract, FactoryDetailsYaml, ResolvedTable, TableCronMapping,
+    parse_interval, ColumnType, Contract, FactoryDetailsYaml, OperationType, ResolvedTable,
+    SetAction, TableCronMapping,
 };
 use crate::manifest::core::Manifest;
 use crate::provider::ChainProvider;
@@ -1026,7 +1027,7 @@ async fn run_historical_sync(
                         task,
                         postgres,
                         sync_config,
-                        &rows,
+                        rows,
                         expected_previous,
                         completed,
                     )
@@ -1142,6 +1143,41 @@ struct PreparedCronOperation {
     rows: Vec<TableRowData>,
 }
 
+/// Only statements whose aggregation preserves the stepwise result can
+/// combine multiple sampled blocks. Keep UPDATE/DELETE, mixed operations, and
+/// arithmetic with nullable/array columns on the ordered sequential path.
+fn can_bulk_historical_postgres(task: &CronTask) -> bool {
+    let [operation] = task.cron_entry.operations.as_slice() else {
+        return false;
+    };
+    match operation.operation_type {
+        OperationType::Insert => true,
+        OperationType::Upsert if !operation.set.is_empty() => {
+            if operation.set.iter().all(|column| column.action == SetAction::Set) {
+                // DISTINCT ON by the key, descending sequence: last assignment wins.
+                return true;
+            }
+            // SUM of deltas is equivalent for these scalar counter operations.
+            // Arrays and nullable columns use the stepwise path: the shared SQL
+            // aggregator picks MAX for arrays and NULL arithmetic is not additive.
+            let all_counters = operation.set.iter().all(|column| {
+                matches!(
+                    column.action,
+                    SetAction::Add
+                        | SetAction::Subtract
+                        | SetAction::Increment
+                        | SetAction::Decrement
+                )
+            });
+            all_counters
+                && task.table.columns().iter().all(|column| {
+                    !column.nullable && !matches!(column.resolved_type(), ColumnType::Array(_))
+                })
+        }
+        _ => false,
+    }
+}
+
 /// Whether the current attempt committed, or another writer advanced durable
 /// progress while its RPC values were being prepared.
 enum CronBatchOutcome {
@@ -1155,7 +1191,7 @@ async fn apply_postgres_historical_batch(
     task: &CronTask,
     postgres: &PostgresClient,
     sync: CronSyncConfig<'_>,
-    steps: &[PreparedCronOperation],
+    steps: Vec<PreparedCronOperation>,
     expected_previous: Option<u64>,
     completed: u64,
 ) -> Result<CronBatchOutcome, String> {
@@ -1182,30 +1218,49 @@ async fn apply_postgres_historical_batch(
             "Historical cron attempted to advance past checkpoint {durable:?} with completed block {completed}"
         ));
     }
-    // Each (block, operation) step reads the effects of all earlier steps.
-    // Any failure rolls the entire batch back, including preceding operations;
-    // progress advances only after every declared operation succeeds.
-    for step in steps {
-        if step.rows.is_empty() {
-            continue;
-        }
-        let operation = task.cron_entry.operations.get(step.operation_index).ok_or_else(|| {
-            format!("Historical cron operation {} is absent", step.operation_index)
-        })?;
-        super::tables::execute_postgres_cron_operation_in(
-            &transaction,
-            &task.full_table_name,
-            &task.table,
-            operation,
-            &step.rows,
-        )
-        .await
-        .map_err(|error| {
-            format!(
-                "Historical cron block {} operation {} failed: {error}",
-                step.block, step.operation_index
+    // One table statement per block is wasteful for eligible operations.
+    // Keep the same checkpoint transaction, but merge rows across this batch
+    // only when the existing PostgreSQL statement builder is equivalent to
+    // applying each sampled block in order.
+    if can_bulk_historical_postgres(task) {
+        let rows = steps.into_iter().flat_map(|step| step.rows).collect::<Vec<_>>();
+        if !rows.is_empty() {
+            super::tables::execute_postgres_cron_operation_in(
+                &transaction,
+                &task.full_table_name,
+                &task.table,
+                &task.cron_entry.operations[0],
+                &rows,
             )
-        })?;
+            .await
+            .map_err(|error| format!("Historical cron bulk operation failed: {error}"))?;
+        }
+    } else {
+        // Mixed operations and non-aggregatable mutation types retain strict
+        // block/declaration order. Later failure aborts earlier effects.
+        for step in steps {
+            if step.rows.is_empty() {
+                continue;
+            }
+            let operation =
+                task.cron_entry.operations.get(step.operation_index).ok_or_else(|| {
+                    format!("Historical cron operation {} is absent", step.operation_index)
+                })?;
+            super::tables::execute_postgres_cron_operation_in(
+                &transaction,
+                &task.full_table_name,
+                &task.table,
+                operation,
+                &step.rows,
+            )
+            .await
+            .map_err(|error| {
+                format!(
+                    "Historical cron block {} operation {} failed: {error}",
+                    step.block, step.operation_index
+                )
+            })?;
+        }
     }
     advance_postgres_cron_checkpoint(&transaction, sync, completed).await?;
 

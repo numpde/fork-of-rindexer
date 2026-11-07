@@ -8,9 +8,13 @@ ClickHouse, downstream publications or live cron.
 
 Historical batches prepare all required RPC inputs before writing. PostgreSQL
 then applies each scheduled block in ascending order and, within each block,
-executes `cron[].operations` in declaration order. All steps in a batch and its
-checkpoint commit together: a later operation failure rolls back preceding
-operations and progress. Replaying an already checkpointed block performs
+executes `cron[].operations` in declaration order. Single-operation INSERT
+backfills combine sampled rows into one batched COPY; eligible UPSERTs with
+only last-value assignments or non-null scalar counters also use a grouped
+statement. UPDATE, DELETE, mixed operations, and unsupported aggregation shapes
+retain the sequential path. Both paths keep the same PostgreSQL transaction.
+All effects in a batch and its checkpoint commit together: a later operation
+failure rolls back preceding operations and progress. Replaying an already checkpointed block performs
 no writes. ClickHouse follows declaration order but retains its existing
 non-transactional, best-effort checkpoint semantics.
 
