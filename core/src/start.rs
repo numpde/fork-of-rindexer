@@ -180,10 +180,27 @@ pub async fn start_rindexer(details: StartDetails<'_>) -> Result<(), StartRindex
     start_rindexer_prepared(details, prepared).await
 }
 
-/// Preserve the existing bounded-cron wait as a single owner of the join
-/// result. The initial implementation waits after other runtime work, just
-/// like the previous bounded-only path; the supervision regression below
-/// demonstrates why that ordering is insufficient for persistent services.
+/// Interpret both a terminal cron failure and a worker panic. Completion
+/// is success only when the scheduler actually returned Ok(()).
+fn required_cron_outcome(
+    joined: Result<Result<(), String>, tokio::task::JoinError>,
+) -> Result<(), StartRindexerError> {
+    match joined {
+        Ok(Ok(())) => {
+            info!("Cron scheduler completed");
+            Ok(())
+        }
+        Ok(Err(error)) => Err(StartRindexerError::CronSchedulerFailed(error)),
+        Err(error) => Err(StartRindexerError::CronSchedulerFailed(format!(
+            "Cron scheduler task failed to join: {error}"
+        ))),
+    }
+}
+
+/// Startup owns one required cron task, regardless of which other services
+/// continue running. Watch both lifetimes: cron may fail during historical
+/// indexing, live indexing or a persistent GraphQL server. Successful bounded
+/// cron completion simply retires its handle while the runtime keeps running.
 async fn await_required_cron_after_runtime<F>(
     cron_handle: Option<tokio::task::JoinHandle<Result<(), String>>>,
     runtime: F,
@@ -191,19 +208,25 @@ async fn await_required_cron_after_runtime<F>(
 where
     F: std::future::Future<Output = Result<(), StartRindexerError>>,
 {
-    runtime.await?;
-    if let Some(handle) = cron_handle {
-        match handle.await {
-            Ok(Ok(())) => info!("Cron scheduler completed"),
-            Ok(Err(error)) => return Err(StartRindexerError::CronSchedulerFailed(error)),
-            Err(error) => {
-                return Err(StartRindexerError::CronSchedulerFailed(format!(
-                    "Cron scheduler task failed to join: {error}"
-                )));
+    let Some(mut cron_handle) = cron_handle else {
+        return runtime.await;
+    };
+    tokio::pin!(runtime);
+    tokio::select! {
+        result = &mut cron_handle => {
+            required_cron_outcome(result)?;
+            runtime.await
+        }
+        result = &mut runtime => {
+            if let Err(error) = result {
+                // A failed startup must not abandon an independently spawned
+                // cron writer. Aborting the handle requests cancellation.
+                cron_handle.abort();
+                return Err(error);
             }
+            required_cron_outcome(cron_handle.await)
         }
     }
-    Ok(())
 }
 
 /// Start a project using the snapshot already admitted by schema synchronization.
@@ -213,11 +236,21 @@ pub async fn start_rindexer_prepared(
     prepared: PreparedProject,
 ) -> Result<(), StartRindexerError> {
     let cron_handle = details.cron_scheduler_handle.take();
-    await_required_cron_after_runtime(
+    // The existing shutdown and health owners already handle graceful
+    // cancellation and unhealthy readiness; do not create another registry.
+    let has_persistent_services = details.indexing_details.is_some()
+        || (details.graphql_details.enabled && prepared.manifest().storage.postgres_enabled());
+    let result = await_required_cron_after_runtime(
         cron_handle,
         start_rindexer_prepared_inner(details, prepared),
     )
-    .await
+    .await;
+    if has_persistent_services && matches!(&result, Err(StartRindexerError::CronSchedulerFailed(_))) {
+        mark_shutdown_started();
+        stop_graphql_server();
+        initiate_shutdown().await;
+    }
+    result
 }
 
 /// All server and indexer lifecycle work is the runtime future. Cron's
@@ -482,8 +515,8 @@ async fn start_rindexer_prepared_inner(
             }
 
             if graphql_server_handle.is_none() && !manifest.has_any_live_indexing() {
-                // The outer owner waits for required cron after bounded runtime
-                // completion. Persistent services still expose its blind spot.
+                // No persistent work remains. The outer supervisor still
+                // waits for a required bounded cron job before reporting success.
                 return Ok(());
             }
 

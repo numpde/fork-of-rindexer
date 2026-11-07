@@ -96,6 +96,22 @@ then be applied twice. Conversely, advancing progress without effects skips
 required work. If a transaction's commit reply is lost, the scheduler rereads
 locked durable progress rather than trusting the client response.
 
+## Runtime supervision
+
+Startup owns the required cron scheduler's task handle. It observes that
+handle concurrently with historical indexing, live indexing and GraphQL:
+a failed cron task or a worker panic terminates the startup operation with
+an error, requests coordinated shutdown, and makes health readiness fail.
+A bounded cron task that succeeds may finish while persistent services
+continue running. If startup fails first, it cancels its outstanding cron
+task rather than leaving an independent writer detached.
+
+Live cron retries a failed tick within its existing retry budget. Once
+that budget is exhausted, the worker returns a terminal error to the
+scheduler and startup supervisor rather than merely logging and running
+another tick. Deliberate shutdown remains a normal cancellation path.
+These lifecycle guarantees do not make live-cron writes atomic or replay-safe.
+
 ## Verification
 
 Run formatting, workspace Clippy and the PostgreSQL cron regressions. For

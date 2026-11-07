@@ -640,19 +640,19 @@ impl CronScheduler {
 /// Maximum number of retry attempts for failed cron operations.
 const MAX_RETRIES: u32 = 3;
 
-/// Current live-cron terminal behavior records exhausted retries but does not
-/// surface them to the scheduler. The paired regression requires propagation.
+/// The live cron task must return a terminal error after exhausting its
+/// bounded write retries, rather than remaining healthy until its next tick.
 fn report_exhausted_live_cron_retries(
     table: &str,
     network: &str,
     retries: u32,
     cause: &str,
 ) -> Result<(), String> {
-    error!(
-        "Cron task failed for table '{}' on network '{}' after {} retries: {}",
-        table, network, retries, cause
+    let message = format!(
+        "Cron task failed for table '{table}' on network '{network}' after {retries} retries: {cause}"
     );
-    Ok(())
+    error!("{message}");
+    Err(message)
 }
 
 /// Initial backoff delay for retries (doubles each attempt).
@@ -857,8 +857,7 @@ async fn run_cron_task(
     }
 
     // Live cron mode
-    run_live_cron_loop(&task, postgres, clickhouse, providers).await;
-    Ok(())
+    run_live_cron_loop(&task, postgres, clickhouse, providers).await
 }
 
 /// Run historical sync for a cron task using batched operations.
@@ -1790,7 +1789,7 @@ async fn run_live_cron_loop(
     postgres: Option<Arc<PostgresClient>>,
     clickhouse: Option<Arc<ClickhouseClient>>,
     providers: Arc<HashMap<String, Arc<dyn ChainProvider>>>,
-) {
+) -> Result<(), String> {
     loop {
         if !is_running() {
             debug!("Cron task for table '{}' stopping due to shutdown", task.table.name());
@@ -1832,7 +1831,7 @@ async fn run_live_cron_loop(
         while remaining > Duration::ZERO {
             if !is_running() {
                 debug!("Cron task for table '{}' stopping due to shutdown", task.table.name());
-                return;
+                return Ok(());
             }
 
             let sleep_time = remaining.min(sleep_chunk);
@@ -1917,7 +1916,7 @@ async fn run_live_cron_loop(
                         let mut backoff_remaining = backoff;
                         while backoff_remaining > Duration::ZERO {
                             if !is_running() {
-                                return;
+                                return Ok(());
                             }
                             let sleep_time = backoff_remaining.min(Duration::from_secs(1));
                             tokio::time::sleep(sleep_time).await;
@@ -1928,18 +1927,21 @@ async fn run_live_cron_loop(
             }
         }
 
-        // If we exhausted all retries, log the final error
+        // A deliberate shutdown is not a failed tick. A genuinely exhausted
+        // retry budget is terminal and must reach the owning supervisor.
+        if !is_running() {
+            return Ok(());
+        }
         if retry_count > MAX_RETRIES {
-            if let Some(e) = last_error {
-                let _ = report_exhausted_live_cron_retries(
-                    task.table.name(),
-                    &task.network,
-                    MAX_RETRIES,
-                    &e,
-                );
-            }
+            return report_exhausted_live_cron_retries(
+                task.table.name(),
+                &task.network,
+                MAX_RETRIES,
+                last_error.as_deref().unwrap_or("retry budget exhausted without a cause"),
+            );
         }
     }
+    Ok(())
 }
 
 /// Execute the cron operations for a task (for all addresses).
