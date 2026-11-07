@@ -6,6 +6,7 @@ mod progress;
 pub use progress::{IndexingEventProgressStatus, IndexingEventsProgressState};
 use serde::{Deserialize, Serialize};
 
+pub(crate) mod cron_identity;
 pub mod cron_scheduler;
 mod dependency;
 pub mod tables;

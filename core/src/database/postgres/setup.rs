@@ -4,7 +4,8 @@ use std::path::Path;
 use tracing::{debug, info};
 
 use crate::database::generate::{
-    drop_prepared_tables_sql, generate_prepared_tables_sql, GenerateTablesForIndexerSqlError,
+    drop_prepared_tables_sql, generate_prepared_tables_sql_with_network_ids,
+    GenerateTablesForIndexerSqlError,
 };
 use crate::database::postgres::migrations::execute_prepared_migrations;
 use crate::{
@@ -22,6 +23,141 @@ pub enum SetupPostgresError {
 
     #[error("Error creating tables for indexer: {0}")]
     GeneratingTables(#[from] GenerateTablesForIndexerSqlError),
+}
+
+/// Check persisted schedule identity before CREATE/ALTER, migration, or drop_each_run.
+/// A legacy checkpoint without a descriptor is not automatically promoted.
+async fn verify_existing_cron_certificates(
+    client: &PostgresClient,
+    manifest: &Manifest,
+    schema: &PreparedSchema,
+) -> Result<(), SetupPostgresError> {
+    use crate::database::postgres::generate::generate_internal_cron_table_name;
+    use crate::indexer::cron_identity::{identify, mismatch, CronIdentityInput};
+    let invalid = |error: String| {
+        SetupPostgresError::GeneratingTables(
+            GenerateTablesForIndexerSqlError::InvalidPreparedSchema(error),
+        )
+    };
+    for contract in schema.contracts().iter().chain(schema.native()) {
+        for runtime in contract.tables.iter() {
+            for (cron_index, cron) in runtime.table.cron_mappings().iter().enumerate() {
+                if cron.start_block.is_none() {
+                    continue;
+                }
+                let checkpoint = generate_internal_cron_table_name(
+                    &contract.schema_name,
+                    runtime.table.name(),
+                    cron_index,
+                );
+                let table = format!("rindexer_internal.{checkpoint}");
+                let exists = client
+                    .query_one("SELECT to_regclass($1)::TEXT AS relation", &[&table])
+                    .await?
+                    .get::<_, Option<String>>("relation")
+                    .is_some();
+                if !exists {
+                    // Only first-time initialization may create this table;
+                    // the DDL checks that no committed destination rows remain.
+                    continue;
+                }
+                let networks = cron.network.as_ref().map_or_else(
+                    || contract.declaration.details.iter().map(|d| d.network.as_str()).collect(),
+                    |network| vec![network.as_str()],
+                );
+                for network in networks {
+                    let chain_id = manifest
+                        .networks
+                        .iter()
+                        .find(|entry| entry.name == network)
+                        .ok_or_else(|| {
+                            invalid(format!("No chain identity for cron network {network}"))
+                        })?
+                        .chain_id;
+                    let detail = contract
+                        .declaration
+                        .details
+                        .iter()
+                        .find(|entry| entry.network == network)
+                        .ok_or_else(|| {
+                            invalid(format!("No contract source for cron network {network}"))
+                        })?;
+                    let address = detail
+                        .address
+                        .as_ref()
+                        .and_then(|value| match value {
+                            alloy::rpc::types::ValueOrArray::Value(address) => Some(*address),
+                            _ => None,
+                        })
+                        .ok_or_else(|| {
+                            invalid(format!("No static address for cron network {network}"))
+                        })?;
+                    let requested = identify(CronIdentityInput {
+                        indexer: &manifest.name,
+                        contract: &contract.declaration.name,
+                        table: &runtime.table,
+                        destination: &runtime.full_table_name,
+                        cron_index,
+                        cron,
+                        network,
+                        address,
+                        chain_id: Some(chain_id),
+                    })
+                    .map_err(invalid)?;
+                    let query = format!(
+                        "SELECT protocol_version, schedule_fingerprint, schedule_descriptor \
+                         FROM {table} WHERE network = $1"
+                    );
+                    let row = client.query_one_or_none(&query, &[&network]).await.map_err(|error| {
+                        invalid(format!(
+                            "Cannot verify historical cron schedule identity for {table}/{network}: \
+                             {error}. An unsigned legacy checkpoint requires explicit \
+                             reconciliation or rebuilding with its destination"
+                        ))
+                    })?.ok_or_else(|| invalid(format!(
+                        "Cannot resume historical cron: missing checkpoint row {table}/{network}"
+                    )))?;
+                    let version: Option<i16> = row.try_get("protocol_version").map_err(|e| {
+                        invalid(format!(
+                            "Cannot decode checkpoint protocol for {table}/{network}: {e}"
+                        ))
+                    })?;
+                    let stored: Option<String> =
+                        row.try_get("schedule_fingerprint").map_err(|e| {
+                            invalid(format!(
+                                "Cannot decode cron fingerprint for {table}/{network}: {e}"
+                            ))
+                        })?;
+                    let descriptor: Option<String> =
+                        row.try_get("schedule_descriptor").map_err(|e| {
+                            invalid(format!(
+                                "Cannot decode cron descriptor for {table}/{network}: {e}"
+                            ))
+                        })?;
+                    if version != Some(2) || stored.is_none() || descriptor.is_none() {
+                        return Err(invalid(format!(
+                            "Cannot resume unsigned legacy cron checkpoint {table}/{network}: \
+                             protocol {version:?} has no certified schedule. Stop writers \
+                             and reconcile or rebuild effects and progress together"
+                        )));
+                    }
+                    if stored.as_deref() != Some(requested.fingerprint.as_str())
+                        || descriptor.as_deref() != Some(requested.descriptor.as_str())
+                    {
+                        let changed = descriptor
+                            .as_deref()
+                            .map(|stored| mismatch(stored, &requested))
+                            .unwrap_or_else(|| "missing descriptor".into());
+                        return Err(invalid(format!(
+                            "Historical cron schedule identity mismatch at {table}/{network}: {changed}. \
+                             No database changes have begun; reconcile or rebuild before resuming"
+                        )));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 pub async fn setup_postgres(
@@ -54,7 +190,13 @@ pub async fn setup_postgres_prepared(
     let disable_event_tables = manifest.storage.postgres_disable_create_tables();
     // Admit the complete prepared schema before even an explicitly configured
     // drop_each_run can delete existing storage.
-    let sql = generate_prepared_tables_sql(schema, disable_event_tables)?;
+    let chain_ids = manifest
+        .networks
+        .iter()
+        .map(|network| (network.name.clone(), network.chain_id))
+        .collect::<std::collections::HashMap<_, _>>();
+    let sql =
+        generate_prepared_tables_sql_with_network_ids(schema, disable_event_tables, &chain_ids)?;
     if manifest.storage.clickhouse_enabled()
         && schema.contracts().iter().chain(schema.native()).any(|contract| {
             contract.tables.iter().any(|runtime| {
@@ -76,6 +218,7 @@ pub async fn setup_postgres_prepared(
     }
 
     let client = PostgresClient::new().await?;
+    verify_existing_cron_certificates(&client, manifest, schema).await?;
 
     if manifest.storage.postgres_drop_each_run() {
         info!(

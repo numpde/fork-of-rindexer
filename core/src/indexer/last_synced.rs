@@ -16,6 +16,7 @@ use crate::database::postgres::generate::{
     generate_internal_cron_table_name, generate_internal_cron_table_name_no_shorten,
     generate_internal_event_table_name_no_shorten,
 };
+use crate::indexer::cron_identity::{self, CronIdentity};
 use crate::{
     database::{
         generate::generate_indexer_contract_schema_name,
@@ -509,6 +510,8 @@ pub struct CronSyncConfig<'a> {
     pub table_name: &'a str,
     pub cron_index: usize,
     pub network: &'a str,
+    /// Required for PostgreSQL; ClickHouse retains its separate protocol.
+    pub schedule_identity: Option<&'a CronIdentity>,
 }
 
 fn postgres_cron_table(config: CronSyncConfig<'_>) -> String {
@@ -520,15 +523,34 @@ fn read_versioned_cron_row(
     row: tokio_postgres::Row,
     table: &str,
     network: &str,
+    identity: &CronIdentity,
 ) -> Result<Option<u64>, String> {
     let version: Option<i16> = row
         .try_get("protocol_version")
         .map_err(|e| format!("Cannot decode cron protocol for {table}/{network}: {e}"))?;
-    if version != Some(1) {
+    if version != Some(2) {
         return Err(format!(
-            "Cron checkpoint {table}/{network} has uncertified legacy protocol \
-             {version:?}; stop writers and rebuild or explicitly reconcile destination \
-             rows and progress together before starting durable historical cron"
+            "Cron checkpoint {table}/{network} has uncertified legacy protocol {version:?}; \
+             the recorded computation has no verified schedule identity. Stop all writers and \
+             reconcile or rebuild destination and progress together"
+        ));
+    }
+    let fingerprint: Option<String> = row.try_get("schedule_fingerprint").map_err(|e| {
+        format!("Cannot decode cron schedule certificate for {table}/{network}: {e}")
+    })?;
+    let descriptor: Option<String> = row.try_get("schedule_descriptor").map_err(|e| {
+        format!("Cannot decode cron schedule descriptor for {table}/{network}: {e}")
+    })?;
+    if fingerprint.as_deref() != Some(identity.fingerprint.as_str())
+        || descriptor.as_deref() != Some(identity.descriptor.as_str())
+    {
+        let reason = descriptor
+            .as_deref()
+            .map(|stored| cron_identity::mismatch(stored, identity))
+            .unwrap_or_else(|| "missing schedule descriptor".into());
+        return Err(format!(
+            "Historical cron schedule identity mismatch at {table}/{network}: {reason}; \
+             stop writers and reconcile or rebuild destination and checkpoint together"
         ));
     }
     let value: Option<String> = row
@@ -548,7 +570,8 @@ pub async fn get_last_synced_cron_block(config: CronSyncConfig<'_>) -> Result<Op
     if let Some(postgres) = config.postgres {
         let table = postgres_cron_table(config);
         let query = format!(
-            "SELECT protocol_version, last_synced_block::TEXT AS last_synced_block \
+            "SELECT protocol_version, schedule_fingerprint, schedule_descriptor, \
+             last_synced_block::TEXT AS last_synced_block \
              FROM rindexer_internal.{table} WHERE network = $1"
         );
         let row = postgres
@@ -558,7 +581,10 @@ pub async fn get_last_synced_cron_block(config: CronSyncConfig<'_>) -> Result<Op
             .ok_or_else(|| {
                 format!("Cron checkpoint row missing from {table} for network {}", config.network)
             })?;
-        return read_versioned_cron_row(row, &table, config.network)
+        let identity = config.schedule_identity.ok_or_else(|| {
+            format!("Cannot read historical cron checkpoint {table}: missing schedule identity")
+        })?;
+        return read_versioned_cron_row(row, &table, config.network, identity)
             .map(|block| block.map(U64::from));
     }
 
@@ -598,7 +624,8 @@ pub async fn lock_postgres_cron_checkpoint(
 ) -> Result<Option<u64>, String> {
     let table = postgres_cron_table(config);
     let query = format!(
-        "SELECT protocol_version, last_synced_block::TEXT AS last_synced_block \
+        "SELECT protocol_version, schedule_fingerprint, schedule_descriptor, \
+         last_synced_block::TEXT AS last_synced_block \
          FROM rindexer_internal.{table} WHERE network = $1 FOR UPDATE"
     );
     let row = transaction
@@ -608,7 +635,10 @@ pub async fn lock_postgres_cron_checkpoint(
         .ok_or_else(|| {
             format!("Cron checkpoint row missing from {table} for network {}", config.network)
         })?;
-    read_versioned_cron_row(row, &table, config.network)
+    let identity = config.schedule_identity.ok_or_else(|| {
+        format!("Cannot lock historical cron checkpoint {table}: missing schedule identity")
+    })?;
+    read_versioned_cron_row(row, &table, config.network, identity)
 }
 
 /// Advance inside the caller-owned PostgreSQL transaction after every
@@ -621,16 +651,23 @@ pub async fn advance_postgres_cron_checkpoint(
     let table = postgres_cron_table(config);
     let query = format!(
         "UPDATE rindexer_internal.{table} SET last_synced_block = $1 \
-         WHERE network = $2 AND protocol_version = 1"
+         WHERE network = $2 AND protocol_version = 2 \
+           AND schedule_fingerprint = $3 AND schedule_descriptor = $4"
     );
-    let value = EthereumSqlTypeWrapper::U64(to_block);
-    let affected = transaction.execute(&query, &[&value, &config.network]).await.map_err(|e| {
-        format!(
-            "Cannot advance cron checkpoint {table}/{}: {}",
-            config.network,
-            pg_error_to_string(&e)
-        )
+    let identity = config.schedule_identity.ok_or_else(|| {
+        format!("Cannot advance historical cron checkpoint {table}: missing schedule identity")
     })?;
+    let value = EthereumSqlTypeWrapper::U64(to_block);
+    let affected = transaction
+        .execute(&query, &[&value, &config.network, &identity.fingerprint, &identity.descriptor])
+        .await
+        .map_err(|e| {
+            format!(
+                "Cannot advance cron checkpoint {table}/{}: {}",
+                config.network,
+                pg_error_to_string(&e)
+            )
+        })?;
     if affected != 1 {
         return Err(format!(
             "Cron checkpoint {table}/{} updated {affected} rows, expected exactly one",

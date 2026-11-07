@@ -3,9 +3,7 @@
 //! admin database when provided, or a native Testcontainers PostgreSQL.
 //! Each test creates a fresh database and exercises the actual scheduler.
 use super::*;
-use crate::database::generate::{
-    generate_indexer_contract_schema_name, generate_tables_for_indexer_sql,
-};
+use crate::database::generate::generate_indexer_contract_schema_name;
 use crate::database::postgres::client::TEST_DATABASE_URL_LOCK;
 use crate::database::postgres::generate::generate_internal_cron_table_name;
 use crate::indexer::postgres_test_wire::LostCommitResponse;
@@ -80,6 +78,9 @@ impl Fixture {
         let schema = generate_indexer_contract_schema_name("CronDurability", "Token");
         let table = format!("{schema}.samples");
         let checkpoint = generate_internal_cron_table_name(&schema, "samples", 0);
+        let identity = Self::identity_for(&Self::manifest(101, 101));
+        let fingerprint_sql = identity.fingerprint.replace('\'', "''");
+        let descriptor_sql = identity.descriptor.replace('\'', "''");
         postgres
             .batch_execute(&format!(
                 "CREATE SCHEMA IF NOT EXISTS {schema};
@@ -98,11 +99,14 @@ impl Fixture {
                  CREATE TABLE rindexer_internal.{checkpoint} (
                      network TEXT PRIMARY KEY,
                      last_synced_block NUMERIC,
-                     protocol_version SMALLINT
+                     protocol_version SMALLINT,
+                     schedule_fingerprint TEXT,
+                     schedule_descriptor TEXT
                  );
                  INSERT INTO rindexer_internal.{checkpoint}
-                     (network, last_synced_block, protocol_version)
-                 VALUES ('test', NULL, 1);"
+                     (network, last_synced_block, protocol_version,
+                      schedule_fingerprint, schedule_descriptor)
+                 VALUES ('test', NULL, 2, '{fingerprint_sql}', '{descriptor_sql}');"
             ))
             .await
             .expect("fixture schema");
@@ -116,6 +120,55 @@ impl Fixture {
             table,
             checkpoint,
         }
+    }
+
+    fn identity_for(manifest: &Manifest) -> crate::indexer::cron_identity::CronIdentity {
+        let indexer = manifest.to_indexer();
+        let contract = &indexer.contracts[0];
+        let table = crate::indexer::tables::TableRuntime::try_new(
+            &contract.tables.as_ref().unwrap()[0],
+            &indexer.name,
+            &contract.name,
+        )
+        .expect("resolve test table");
+        let cron = &table.table.cron_mappings()[0];
+        let address = contract.details[0]
+            .address
+            .as_ref()
+            .and_then(|source| match source {
+                alloy::rpc::types::ValueOrArray::Value(value) => Some(*value),
+                _ => None,
+            })
+            .unwrap();
+        crate::indexer::cron_identity::identify(crate::indexer::cron_identity::CronIdentityInput {
+            indexer: &indexer.name,
+            contract: &contract.name,
+            table: &table.table,
+            destination: &table.full_table_name,
+            cron_index: 0,
+            cron,
+            network: "test",
+            address,
+            chain_id: Some(1),
+        })
+        .expect("test schedule descriptor")
+    }
+
+    async fn bind(&self, manifest: &Manifest) {
+        let identity = Self::identity_for(manifest);
+        self.postgres.execute(
+            &format!(
+                "UPDATE rindexer_internal.{} SET protocol_version = 2,                  schedule_fingerprint = $1, schedule_descriptor = $2 WHERE network = 'test'",
+                self.checkpoint
+            ),
+            &[&identity.fingerprint, &identity.descriptor],
+        ).await.expect("bind explicit test schedule");
+    }
+
+    fn one_block_scheduler(&self, manifest: &Manifest, end: u64) -> CronScheduler {
+        let mut scheduler = self.scheduler(manifest, end).expect("one-block reference");
+        scheduler.tasks[0].batch_size_for_test = Some(1);
+        scheduler
     }
 
     fn manifest(start: u64, end: u64) -> Manifest {
@@ -259,8 +312,14 @@ impl Fixture {
     /// Drive the actual startup DDL generator and execute it again on restart.
     async fn production_setup(&self, start: u64, end: u64) -> Result<(), String> {
         let indexer = Self::manifest(start, end).to_indexer();
-        let ddl = generate_tables_for_indexer_sql(self._directory.path(), &indexer, false)
-            .map_err(|error| error.to_string())?;
+        let chains = std::collections::HashMap::from([("test".to_owned(), 1)]);
+        let schema =
+            crate::indexer::schema::PreparedSchema::try_new(self._directory.path(), &indexer)
+                .map_err(|error| error.to_string())?;
+        let ddl = crate::database::generate::generate_prepared_tables_sql_with_network_ids(
+            &schema, false, &chains,
+        )
+        .map_err(|error| error.to_string())?;
         self.postgres.batch_execute(ddl.as_str()).await.map_err(|error| error.to_string())
     }
 
@@ -366,6 +425,7 @@ async fn fresh_single_operation_is_applied() {
 #[tokio::test]
 async fn checkpoint_failure_rolls_back_every_staged_insert() {
     let fixture = Fixture::new().await;
+    fixture.bind(&Fixture::manifest(100, 101)).await;
     fixture.seed(Some(100)).await;
     fixture
         .postgres
@@ -388,6 +448,7 @@ async fn checkpoint_failure_rolls_back_every_staged_insert() {
 #[tokio::test]
 async fn completed_sample_is_not_replayed_on_resume() {
     let fixture = Fixture::new().await;
+    fixture.bind(&Fixture::manifest(101, 102)).await;
     fixture.seed(Some(101)).await;
     fixture.worker(101, 102).run().await.expect("resume beyond block 101");
     assert_eq!(fixture.count().await, 1, "only block 102 is new");
@@ -398,6 +459,7 @@ async fn completed_sample_is_not_replayed_on_resume() {
 #[tokio::test]
 async fn completed_block_zero_is_not_a_fresh_schedule() {
     let fixture = Fixture::new().await;
+    fixture.bind(&Fixture::manifest(0, 0)).await;
     fixture.seed(Some(0)).await;
     fixture.worker(0, 0).run().await.expect("zero was already completed");
     assert_eq!(fixture.count().await, 0);
@@ -448,6 +510,7 @@ async fn database_read_failure_is_not_interpreted_as_fresh() {
 #[tokio::test]
 async fn legacy_checkpoint_cannot_certify_existing_progress() {
     let fixture = Fixture::new().await;
+    fixture.bind(&Fixture::manifest(100, 101)).await;
     fixture.seed(Some(100)).await;
     fixture
         .postgres
@@ -467,6 +530,7 @@ async fn legacy_checkpoint_cannot_certify_existing_progress() {
 #[tokio::test]
 async fn fractional_checkpoint_is_not_an_unstarted_schedule() {
     let fixture = Fixture::new().await;
+    fixture.bind(&Fixture::manifest(100, 101)).await;
     fixture
         .postgres
         .batch_execute(&format!(
@@ -670,6 +734,9 @@ async fn cross_chain_historical_cron_requires_a_separate_design() {
 async fn additive_upsert_rollback_and_restart_preserve_the_single_delta() {
     let fixture = Fixture::new().await;
     fixture.use_additive_table().await;
+    let manifest = Fixture::additive_manifest();
+    // Certificate setup must precede the intentionally failing UPDATE trigger.
+    fixture.bind(&manifest).await;
     fixture
         .postgres
         .batch_execute(&format!(
@@ -681,7 +748,6 @@ async fn additive_upsert_rollback_and_restart_preserve_the_single_delta() {
         ))
         .await
         .expect("install failure after arithmetic effects are staged");
-    let manifest = Fixture::additive_manifest();
     let error = fixture
         .scheduler(&manifest, 101)
         .expect("single-operation additive cron is supported")
@@ -723,6 +789,7 @@ async fn multiple_operations_follow_declared_order_for_each_sample() {
         {"type":"upsert", "set":[{"column":"amount", "action":"add", "value":"7"}]}
     ]);
     let manifest: Manifest = serde_json::from_value(manifest).unwrap();
+    fixture.bind(&manifest).await;
     fixture
         .scheduler(&manifest, 102)
         .expect("multiple operations must be admitted")
@@ -746,6 +813,7 @@ async fn failure_in_later_cron_operation_rolls_back_the_whole_sample() {
         {"type":"upsert", "set":[{"column":"amount", "action":"add", "value":"7"}]}
     ]);
     let manifest: Manifest = serde_json::from_value(manifest).unwrap();
+    fixture.bind(&manifest).await;
     fixture
         .postgres
         .batch_execute(&format!(
@@ -815,13 +883,14 @@ async fn lost_commit_reply_is_reconciled_without_replaying_the_sample() {
 async fn insert_backfill_matches_one_block_at_a_time_with_fewer_statements() {
     let bulk = Fixture::new().await;
     let reference = Fixture::new().await;
+    let manifest = Fixture::manifest(101, 108);
+    bulk.bind(&manifest).await;
+    reference.bind(&manifest).await;
     bulk.install_statement_counter().await;
     reference.install_statement_counter().await;
 
-    bulk.worker(101, 108).run().await.expect("bounded insertion");
-    for end in 101..=108 {
-        reference.worker(101, end).run().await.expect("reference one-block backfill");
-    }
+    bulk.scheduler(&manifest, 108).unwrap().run().await.expect("bounded insertion");
+    reference.one_block_scheduler(&manifest, 108).run().await.expect("one-block reference");
 
     assert_eq!(bulk.stored_rows().await, reference.stored_rows().await);
     assert_eq!(bulk.checkpoint().await, reference.checkpoint().await);
@@ -845,13 +914,11 @@ async fn repeated_key_arithmetic_upsert_matches_one_block_reference() {
     manifest["contracts"][0]["tables"][0]["columns"][0]["default"] = json!("5");
     manifest["contracts"][0]["tables"][0]["cron"][0]["end_block"] = json!("108");
     let bulk_manifest: Manifest = serde_json::from_value(manifest.clone()).unwrap();
+    bulk.bind(&bulk_manifest).await;
+    reference.bind(&bulk_manifest).await;
 
     bulk.scheduler(&bulk_manifest, 108).unwrap().run().await.expect("bulk arithmetic");
-    for end in 101..=108 {
-        manifest["contracts"][0]["tables"][0]["cron"][0]["end_block"] = json!(end.to_string());
-        let one: Manifest = serde_json::from_value(manifest.clone()).unwrap();
-        reference.scheduler(&one, end).unwrap().run().await.expect("one-block arithmetic");
-    }
+    reference.one_block_scheduler(&bulk_manifest, 108).run().await.expect("one-block arithmetic");
 
     assert_eq!(bulk.stored_rows().await, reference.stored_rows().await);
     assert_eq!(bulk.checkpoint().await, Some(108));
@@ -876,13 +943,11 @@ async fn latest_set_upsert_matches_one_block_reference() {
     cron["operations"][0]["set"][0]["action"] = json!("set");
     cron["operations"][0]["set"][0]["value"] = json!("3");
     let manifest: Manifest = serde_json::from_value(value.clone()).unwrap();
+    bulk.bind(&manifest).await;
+    reference.bind(&manifest).await;
 
     bulk.scheduler(&manifest, 108).unwrap().run().await.expect("bulk last-by-sequence");
-    for end in 101..=108 {
-        value["contracts"][0]["tables"][0]["cron"][0]["end_block"] = json!(end.to_string());
-        let one: Manifest = serde_json::from_value(value.clone()).unwrap();
-        reference.scheduler(&one, end).unwrap().run().await.expect("one-block set");
-    }
+    reference.one_block_scheduler(&manifest, 108).run().await.expect("one-block set");
 
     assert_eq!(bulk.stored_rows().await, reference.stored_rows().await);
     assert_eq!(bulk.amount().await.as_deref(), Some("3"));
@@ -895,6 +960,7 @@ async fn latest_set_upsert_matches_one_block_reference() {
 #[tokio::test]
 async fn batched_insert_checkpoint_failure_rolls_back_all_blocks() {
     let fixture = Fixture::new().await;
+    fixture.bind(&Fixture::manifest(101, 108)).await;
     fixture.install_statement_counter().await;
     fixture
         .postgres
@@ -962,10 +1028,7 @@ async fn changed_source_and_sample_grid_must_not_replay_under_old_progress() {
             .await
             .expect_err("changed source or sampling schedule cannot reuse a checkpoint")
             .to_string();
-        assert!(
-            error.contains("schedule") || error.contains("fingerprint"),
-            "{change}: {error}"
-        );
+        assert!(error.contains("schedule") || error.contains("fingerprint"), "{change}: {error}");
         assert_eq!(fixture.count().await, 1, "{change}: no replay");
         assert_eq!(fixture.checkpoint().await, Some(101), "{change}: no progress change");
         fixture.finish().await;
@@ -983,6 +1046,7 @@ async fn changed_operation_order_and_column_defaults_are_incompatible() {
             {"type":"upsert","set":[{"column":"amount","action":"add","value":"7"}]}
         ]);
         let manifest: Manifest = serde_json::from_value(original.clone()).unwrap();
+        fixture.bind(&manifest).await;
         fixture.scheduler(&manifest, 101).unwrap().run().await.unwrap();
         assert_eq!(fixture.amount().await.as_deref(), Some("10"));
         match change {

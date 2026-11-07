@@ -260,6 +260,8 @@ pub struct CronTask {
     pub indexer_name: String,
     /// Factory configuration (if contract uses factory indexing)
     pub factory_config: Option<FactoryCronConfig>,
+    #[cfg(test)]
+    pub(super) batch_size_for_test: Option<usize>,
 }
 
 /// The cron scheduler manages and executes scheduled table operations.
@@ -578,6 +580,8 @@ impl CronScheduler {
                             schedule: schedule.clone(),
                             indexer_name: indexer_name.to_string(),
                             factory_config,
+                            #[cfg(test)]
+                            batch_size_for_test: None,
                         });
                     }
                 }
@@ -927,6 +931,35 @@ async fn run_historical_sync(
         ));
     };
 
+    // The immutable prepared computation is checked both before a read and
+    // under the checkpoint's FOR UPDATE lock. Runtime endpoint settings do
+    // not enter the certificate; the provider's declared chain identity does.
+    let identity = postgres
+        .as_ref()
+        .map(|_| {
+            let source = providers.get(&task.network).ok_or_else(|| {
+                format!(
+                    "Historical cron {}.{} has no provider for schedule identity",
+                    task.contract_name,
+                    task.table.name()
+                )
+            })?;
+            crate::indexer::cron_identity::identify(
+                crate::indexer::cron_identity::CronIdentityInput {
+                    indexer: &task.indexer_name,
+                    contract: &task.contract_name,
+                    table: &task.table,
+                    destination: &task.full_table_name,
+                    cron_index: task.cron_index,
+                    cron: &task.cron_entry,
+                    network: &task.network,
+                    address: task.contract_address,
+                    chain_id: Some(source.chain().id()),
+                },
+            )
+        })
+        .transpose()?;
+
     // Get last synced block from database
     let sync_config = CronSyncConfig {
         postgres: &postgres,
@@ -936,6 +969,7 @@ async fn run_historical_sync(
         table_name: task.table.name(),
         cron_index: task.cron_index,
         network: &task.network,
+        schedule_identity: identity.as_ref(),
     };
 
     let last_synced = get_last_synced_cron_block(sync_config).await?;
@@ -988,6 +1022,8 @@ async fn run_historical_sync(
 
         // Collect blocks for this batch (batch size is dynamic based on rate limiting)
         let current_batch_size = rate_limiter.batch_size() as usize;
+        #[cfg(test)]
+        let current_batch_size = task.batch_size_for_test.unwrap_or(current_batch_size);
         let mut batch_blocks: Vec<u64> = Vec::with_capacity(current_batch_size);
         let mut block = current_block;
         while block <= end_block && batch_blocks.len() < current_batch_size {

@@ -37,12 +37,24 @@ checked across all prepared declarations, including schema overrides.
 Use stop-before-start upgrades and keep the sampled history stable; reorg recovery
 for cron effects is not supported.
 
-The checkpoint's existing physical name still depends on the numeric position of
-the cron entry in the manifest. Until semantic schedule fingerprints are implemented,
-**freeze the entire admitted schedule and its destination** across restarts. In
-particular, do not change its start/end blocks, interval, address, operation,
-table keys, or cron-entry ordering and assume old progress is reusable.
-A changed schedule requires reviewed reconciliation or a rebuild.
+## Schedule certificates (protocol version 2)
+
+Every new PostgreSQL historical-cron checkpoint is bound to a canonical JSON
+descriptor and its Keccak-256 fingerprint. The descriptor is built from the
+resolved table/physical columns and destination, chain ID, network, static
+source address, inclusive sampling start/end and normalized block interval,
+ordered operations/inputs, column defaults, nullability and table keys.
+Declaration order is significant. Unrelated YAML key ordering, RPC endpoint
+selection, view-call concurrency, logging and runtime batch size are not.
+
+Both startup and the scheduler verify the certificate. Startup rejects a
+mismatch **before** schema synchronization, migrations or `drop_each_run`.
+The writer verifies again under the checkpoint row lock, including after
+uncertain COMMIT. A mismatch reports the first differing descriptor field.
+Changing source, chain ID, grid, operation values/order or destination requires
+an independently reviewed migration or coordinated rebuild. The physical
+checkpoint name still uses the cron's numeric manifest position; renaming
+does not authorize reusing incompatible progress.
 
 ## Upgrade and recovery
 
@@ -58,16 +70,15 @@ A changed schedule requires reviewed reconciliation or a rebuild.
    migration, remove the *affected destination contents and checkpoint table
    together*, preserving a backup. Run normal schema setup against the now-empty
    destination to create the versioned checkpoint, initially
-   `last_synced_block = NULL` and `protocol_version = 1`. Replay from the
+   `last_synced_block = NULL` and `protocol_version = 2`, with a canonical schedule descriptor and fingerprint. Replay from the
    trusted declared start block, then verify rows and completed progress.
    Do not truncate a destination shared with other writers or networks.
 4. **Alternative: reconcile.** Independently verify the complete ordered
    historical operations against the stored rows and progress. Only a
-   schedule-specific reviewed migration may mark the progress as version 1.
-   There is no generic automatic conversion or “trust legacy checkpoint” flag.
+   schedule-specific reviewed migration may certify protocol version 2 with its matching descriptor and fingerprint.
+   Never stamp legacy progress from the current manifest alone: the historical computation must be proven independently. No automatic adoption flag exists.
 
-Version 1 distinguishes `NULL` (no sample committed) from `0` (block zero
-committed). A missing row is **not** `NULL`: setup and indexing refuse it. An
+Versions 1 and 2 distinguish `NULL` (no sample committed) from `0` (block zero committed). Version 1 is now uncertified because it lacks a schedule identity. A missing row is **not** `NULL`: setup and indexing refuse it. An
 existing checkpoint table is never automatically reseeded when a network row is
 missing, even if the destination currently appears empty. If the checkpoint
 table itself is missing, initialization is allowed only with an empty destination.
@@ -80,8 +91,7 @@ that a non-NULL checkpoint can be trusted. A newly added network similarly
 requires an explicit initialization or migration; a redeploy does not silently
 add a row.
 
-Never fix a missing checkpoint by inserting `NULL` or changing
-`protocol_version` alone. An additive operation or append-only insert could
+Never fix a missing checkpoint by inserting `NULL`, increasing `protocol_version` or copying a fingerprint from the current manifest alone. An additive operation or append-only insert could
 then be applied twice. Conversely, advancing progress without effects skips
 required work. If a transaction's commit reply is lost, the scheduler rereads
 locked durable progress rather than trusting the client response.

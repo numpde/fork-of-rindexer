@@ -168,71 +168,97 @@ fn generate_internal_event_table_sql<'a>(
 /// Generate SQL for internal cron sync state tracking tables.
 /// Creates a table per cron entry in each table to track the last synced block.
 fn generate_internal_cron_table_sql(
-    tables: &[Table],
-    schema_name: &str,
-    networks: Vec<&str>,
-) -> String {
+    indexer_name: &str,
+    prepared: &crate::indexer::schema::PreparedContract,
+    chain_ids: &std::collections::HashMap<String, u64>,
+) -> Result<String, GenerateTablesForIndexerSqlError> {
     let mut sql_statements = Vec::new();
-
-    for table in tables.iter().filter(|t| t.has_cron()) {
-        let cron_entries = table.cron.as_ref().unwrap();
-
-        for (cron_index, cron) in cron_entries.iter().enumerate() {
-            // Only generate for cron entries with start_block (historical sync)
+    let contract = &prepared.declaration;
+    for runtime in prepared.tables.iter() {
+        let table = runtime.table.definition();
+        for (cron_index, cron) in runtime.table.cron_mappings().iter().enumerate() {
             if cron.start_block.is_none() {
                 continue;
             }
-
             let internal_table_name =
-                generate_internal_cron_table_name(schema_name, &table.name, cron_index);
-
-            // Schema sync must never infer "never started" from a missing row
-            // in an existing checkpoint table. In particular, a crash or
-            // operator error may remove progress while destination effects survive.
-            let destination_schema = table.database.as_deref().unwrap_or(schema_name);
-            let destination = format!("{destination_schema}.{}", camel_to_snake(&table.name));
-
-            // Seed all declared networks only when the entire checkpoint table
-            // is first created. Adding a network later requires reconciliation.
-            let cron_networks: Vec<&str> = if let Some(network) = &cron.network {
-                vec![network.as_str()]
-            } else {
-                networks.clone()
-            };
+                generate_internal_cron_table_name(&prepared.schema_name, &table.name, cron_index);
+            let destination = &runtime.full_table_name;
+            let cron_networks = cron.network.as_ref().map_or_else(
+                || {
+                    contract
+                        .details
+                        .iter()
+                        .map(|detail| detail.network.as_str())
+                        .collect::<Vec<_>>()
+                },
+                |network| vec![network.as_str()],
+            );
             let cron_networks =
                 cron_networks.into_iter().collect::<std::collections::BTreeSet<_>>();
-            let first_seeds = cron_networks
-                .iter()
-                .map(|network| {
-                    let network = network.replace('\'', "''");
-                    format!(
-                        "INSERT INTO rindexer_internal.{internal_table_name} \
-                         (network, last_synced_block, protocol_version) \
-                         VALUES ('{network}', NULL, 1);"
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            let existing_checks = cron_networks
-                .iter()
-                .map(|network| {
-                    let network = network.replace('\'', "''");
-                    format!(
-                        "IF NOT EXISTS (SELECT 1 FROM rindexer_internal.{internal_table_name} \
-                         WHERE network = '{network}') THEN \
-                           RAISE EXCEPTION 'Cannot resume historical cron: missing checkpoint row \
-                           in rindexer_internal.{internal_table_name} for network %; \
-                           stop writers and reconcile destination rows with progress', '{network}'; \
-                         END IF;"
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-
-            // The destination lock also serializes concurrent initializers
-            // before they check whether this checkpoint table already exists.
-            // Refuse a newly created checkpoint if destination data survived
-            // deletion of the old checkpoint table.
+            let mut first_seeds = Vec::new();
+            let mut existing_checks = Vec::new();
+            for network in cron_networks {
+                // Encode manifest text before embedding it in a PL/pgSQL DO body.
+                // SQL quote escaping alone cannot protect the dollar-quote tag
+                // from a value containing "$cron_checkpoint$".
+                let network_sql = format!(
+                    "convert_from(decode('{}', 'hex'), 'UTF8')",
+                    hex::encode(network.as_bytes())
+                );
+                let detail = contract.details.iter().find(|detail| detail.network == network);
+                let address = detail
+                    .and_then(|detail| detail.address.as_ref())
+                    .and_then(|address| match address {
+                        alloy::rpc::types::ValueOrArray::Value(value) => Some(*value),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                let chain_id = chain_ids.get(network).copied();
+                // Pure schema generation remains usable for test-only factory
+                // declarations; production rejects these before touching the DB.
+                let identity = crate::indexer::cron_identity::identify(
+                    crate::indexer::cron_identity::CronIdentityInput {
+                        indexer: indexer_name,
+                        contract: &contract.name,
+                        table: &runtime.table,
+                        destination,
+                        cron_index,
+                        cron,
+                        network,
+                        address,
+                        chain_id,
+                    },
+                )
+                .map_err(GenerateTablesForIndexerSqlError::InvalidPreparedSchema)?;
+                let digest = identity.fingerprint.replace('\'', "''");
+                let descriptor = format!(
+                    "convert_from(decode('{}', 'hex'), 'UTF8')",
+                    hex::encode(identity.descriptor.as_bytes())
+                );
+                first_seeds.push(format!(
+                    "INSERT INTO rindexer_internal.{internal_table_name} \
+                     (network, last_synced_block, protocol_version, schedule_fingerprint, schedule_descriptor) \
+                     VALUES ({network_sql}, NULL, 2, '{digest}', {descriptor});"
+                ));
+                existing_checks.push(format!(
+                    "IF NOT EXISTS (
+                        SELECT 1 FROM rindexer_internal.{internal_table_name}
+                        WHERE network = {network_sql}
+                    ) THEN
+                        RAISE EXCEPTION 'Cannot resume historical cron: missing checkpoint row in rindexer_internal.{internal_table_name} for network %; stop writers and reconcile destination rows with progress', {network_sql};
+                    END IF;
+                    IF NOT EXISTS (
+                        SELECT 1 FROM rindexer_internal.{internal_table_name}
+                        WHERE network = {network_sql} AND protocol_version = 2
+                          AND schedule_fingerprint = '{digest}'
+                          AND schedule_descriptor = {descriptor}
+                    ) THEN
+                        RAISE EXCEPTION 'Cannot resume historical cron: schedule identity missing or changed in rindexer_internal.{internal_table_name} for network %; reconcile or rebuild checkpoint and effects together', {network_sql};
+                    END IF;"
+                ));
+            }
+            let first_seeds = first_seeds.join("\n");
+            let existing_checks = existing_checks.join("\n");
             sql_statements.push(format!(
                 r#"DO $cron_checkpoint$
                 BEGIN
@@ -244,12 +270,18 @@ fn generate_internal_cron_table_sql(
                         CREATE TABLE rindexer_internal.{internal_table_name} (
                             network TEXT PRIMARY KEY,
                             last_synced_block NUMERIC,
-                            protocol_version SMALLINT NOT NULL
+                            protocol_version SMALLINT NOT NULL,
+                            schedule_fingerprint TEXT NOT NULL,
+                            schedule_descriptor TEXT NOT NULL
                         );
                         {first_seeds}
                     ELSE
                         ALTER TABLE rindexer_internal.{internal_table_name}
                             ADD COLUMN IF NOT EXISTS protocol_version SMALLINT;
+                        ALTER TABLE rindexer_internal.{internal_table_name}
+                            ADD COLUMN IF NOT EXISTS schedule_fingerprint TEXT;
+                        ALTER TABLE rindexer_internal.{internal_table_name}
+                            ADD COLUMN IF NOT EXISTS schedule_descriptor TEXT;
                         {existing_checks}
                     END IF;
                 END
@@ -257,8 +289,7 @@ fn generate_internal_cron_table_sql(
             ));
         }
     }
-
-    sql_statements.join("\n")
+    Ok(sql_statements.join("\n"))
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -562,10 +593,25 @@ pub fn generate_tables_for_indexer_sql(
     generate_prepared_tables_sql(&schema, disable_event_tables)
 }
 
-/// Generate all PostgreSQL tables from the already validated startup schema.
+/// Test-only SQL inspection; production schema setup binds network chain IDs.
+#[cfg(test)]
 pub fn generate_prepared_tables_sql(
     schema: &PreparedSchema,
     disable_event_tables: bool,
+) -> Result<Code, GenerateTablesForIndexerSqlError> {
+    generate_prepared_tables_sql_with_network_ids(
+        schema,
+        disable_event_tables,
+        &std::collections::HashMap::new(),
+    )
+}
+
+/// Production uses manifest chain IDs; pure SQL inspection uses an unbound
+/// sentinel, which is not sufficient for runtime checkpoint admission.
+pub(crate) fn generate_prepared_tables_sql_with_network_ids(
+    schema: &PreparedSchema,
+    disable_event_tables: bool,
+    chain_ids: &std::collections::HashMap<String, u64>,
 ) -> Result<Code, GenerateTablesForIndexerSqlError> {
     schema.validate_postgres_identities()?;
     let indexer = schema.indexer();
@@ -617,9 +663,7 @@ pub fn generate_prepared_tables_sql(
             networks.clone(),
         ));
         sql.push_str(&generate_internal_factory_event_table_sql(&indexer.name, &factories));
-        if let Some(tables) = &contract.tables {
-            sql.push_str(&generate_internal_cron_table_sql(tables, schema_name, networks));
-        }
+        sql.push_str(&generate_internal_cron_table_sql(&indexer.name, prepared, chain_ids)?);
     }
 
     sql.push_str(&format!(
