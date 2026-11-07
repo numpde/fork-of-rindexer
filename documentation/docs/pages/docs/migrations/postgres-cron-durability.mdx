@@ -102,6 +102,34 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo nextest run -p rindexer --lib -E 'test(/cron_atomic_tests::/)'
 ```
 
+## ClickHouse fixture and failure semantics
+
+The ClickHouse historical-cron path is deliberately not part of the
+PostgreSQL atomicity guarantee. The existing dynamic ClickHouse UPDATE and
+UPSERT writer emits INSERTs into ReplacingMergeTree. It does **not** apply
+PostgreSQL-style `add` or `subtract` arithmetic to existing values. For a
+single sampled block, the real-server tests apply two `set` assignments to
+one logical key and read the resulting row with `FINAL`. A server-side
+constraint rejects the second assignment in a separate test: the first
+INSERT remains committed, while the historical progress table is unchanged.
+Retrying the failed sample can therefore repeat ClickHouse effects. DELETE
+uses ClickHouse mutation semantics and is not covered by these ordering tests.
+
+The rootless runner uses a private, disposable ClickHouse service on the
+existing Compose fixture network, without giving the test process a Docker
+socket. Select an **already local** immutable image ID or repository digest:
+
+```bash
+CLICKHOUSE_IMAGE=sha256:<64-hex-image-id> make tests/cron-clickhouse/fixture
+```
+
+The target compiles tests offline before starting ClickHouse, never pulls
+images, and tears down its project. It passes
+`RINDEXER_TEST_CLICKHOUSE_URL=http://clickhouse:8123` to tests, which
+create unique database and checkpoint names. Native executions without that
+variable use Testcontainers; an invalid supplied endpoint fails rather than
+silently falling back to Docker.
+
 The regression suite checks INSERT and arithmetic UPSERT behavior,
 checkpoint failure after staged effects, ordered multi-operation replay and
 rollback on a later operation, lost checkpoint or destination startup,

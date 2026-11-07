@@ -88,6 +88,7 @@
 ### Bug fixes
 -------------------------------------------------
 - fix: restore batched PostgreSQL historical cron writes for single-operation INSERT and qualified UPSERT schedules without changing ordered multi-operation semantics. Batched results and durable checkpoints are checked against one-block-at-a-time execution, including repeated keys and nonzero defaults; UPDATE/DELETE, mixed actions and unsafe array/nullable aggregation continue sequentially. The release benchmark against master remains separate.
+- fix: ClickHouse historical-cron tests now support the existing isolated, rootless fixture architecture instead of requiring a Docker socket in the test process. The tests demonstrate ordered replacement assignments and that a later server-side failure leaves earlier writes committed without advancing progress; unlike PostgreSQL, this path provides no transactional replay guarantee. The explicit immutable `CLICKHOUSE_IMAGE` must already be available locally and is never pulled.
 - fix: retain PostgreSQL server error details and SQLSTATE when historical-cron checkpoint updates fail.
 - fix: no-code `rindexer start all` now returns a nonzero exit status and the original error when PostgreSQL setup or indexer startup fails, matching `start indexer` so process supervisors can detect the failure.
 - fix: PostgreSQL UPDATE and DELETE guards compare incoming ABI integers at full precision, including uint64 values above the signed BIGINT range. Stored column representations are unchanged; review previously skipped mutations when rebuilding history.

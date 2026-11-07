@@ -20,7 +20,7 @@ struct CountRow {
 }
 
 struct Fixture {
-    _container: testcontainers::ContainerAsync<ClickHouseImage>,
+    _container: Option<testcontainers::ContainerAsync<ClickHouseImage>>,
     client: Arc<ClickhouseClient>,
     name: String,
     schema: String,
@@ -29,11 +29,27 @@ struct Fixture {
 
 impl Fixture {
     async fn new(reject_second: bool) -> Self {
-        let container =
-            ClickHouseImage::default().start().await.expect("start native ClickHouse fixture");
-        let host = container.get_host().await.expect("ClickHouse fixture host");
-        let port = container.get_host_port_ipv4(8123).await.expect("ClickHouse fixture port");
-        let url = format!("http://{host}:{port}");
+        // An explicit endpoint selects the rootless external fixture. Never
+        // silently fall back to Testcontainers after an invalid/unreachable URL.
+        let (url, container) = match std::env::var("RINDEXER_TEST_CLICKHOUSE_URL") {
+            Ok(url) => {
+                let parsed = url::Url::parse(&url).expect("valid external ClickHouse URL");
+                assert_eq!(parsed.scheme(), "http", "ClickHouse fixture must use HTTP");
+                assert!(parsed.host_str().is_some(), "ClickHouse fixture needs a host");
+                (url, None)
+            }
+            Err(std::env::VarError::NotPresent) => {
+                let container = ClickHouseImage::default()
+                    .start()
+                    .await
+                    .expect("start native ClickHouse fixture");
+                let host = container.get_host().await.expect("ClickHouse fixture host");
+                let port =
+                    container.get_host_port_ipv4(8123).await.expect("ClickHouse fixture port");
+                (format!("http://{host}:{port}"), Some(container))
+            }
+            Err(error) => panic!("Invalid RINDEXER_TEST_CLICKHOUSE_URL: {error}"),
+        };
         let settings = [
             ("CLICKHOUSE_URL", url.as_str()),
             ("CLICKHOUSE_USER", "default"),
@@ -44,7 +60,9 @@ impl Fixture {
         for (name, value) in &settings {
             std::env::set_var(name, value);
         }
-        let result = ClickhouseClient::new().await;
+        let result = tokio::time::timeout(Duration::from_secs(15), ClickhouseClient::new())
+            .await
+            .expect("ClickHouse fixture did not respond");
         for ((name, _), previous) in settings.iter().zip(original) {
             match previous {
                 Some(value) => std::env::set_var(name, value),

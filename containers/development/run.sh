@@ -120,6 +120,16 @@ case "$1" in
     exec timeout --signal=TERM --kill-after=20s 900s cargo nextest run --frozen \
       -p rindexer --lib --no-fail-fast --no-capture -E 'test(/view_call_(cache|reorg)_tests::/) | test(/^indexer::tables::tests::test_block_timestamp/)'
     ;;
+  cron-clickhouse-compile)
+    exec cargo nextest run --frozen -p rindexer --lib --no-run \
+      -E 'test(/cron_clickhouse_tests::/)'
+    ;;
+  cron-clickhouse)
+    : "${RINDEXER_TEST_CLICKHOUSE_URL:?missing explicit ClickHouse fixture}"
+    exec timeout --signal=TERM --kill-after=20s 900s cargo nextest run --frozen \
+      -p rindexer --lib --no-fail-fast --no-capture \
+      -E 'test(/cron_clickhouse_tests::/)'
+    ;;
   cron-atomic-compile)
     exec cargo nextest run --frozen -p rindexer --lib --no-run \
       -E 'test(/cron_atomic_tests::/)'
