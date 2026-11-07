@@ -913,3 +913,159 @@ async fn batched_insert_checkpoint_failure_rolls_back_all_blocks() {
     assert_eq!(fixture.checkpoint().await, None);
     fixture.finish().await;
 }
+
+#[tokio::test]
+async fn changed_operation_must_not_reuse_committed_cron_progress() {
+    let fixture = Fixture::new().await;
+    fixture.worker(101, 101).run().await.expect("commit original schedule");
+    let mut changed = serde_json::to_value(Fixture::manifest(101, 101)).unwrap();
+    changed["contracts"][0]["tables"][0]["cron"][0]["operations"][0]["set"][0]["value"] =
+        json!("9");
+    let manifest: Manifest = serde_json::from_value(changed).unwrap();
+    let error = fixture
+        .scheduler(&manifest, 101)
+        .unwrap()
+        .run()
+        .await
+        .expect_err("changed operation must not inherit the old checkpoint")
+        .to_string();
+    assert!(error.contains("schedule") || error.contains("fingerprint"), "{error}");
+    assert_eq!(fixture.count().await, 1, "old effects remain untouched");
+    assert_eq!(fixture.checkpoint().await, Some(101));
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn changed_source_and_sample_grid_must_not_replay_under_old_progress() {
+    for change in ["address", "interval", "end_block"] {
+        let fixture = Fixture::new().await;
+        fixture.worker(101, 101).run().await.expect("commit old schedule");
+        let mut changed = serde_json::to_value(Fixture::manifest(101, 101)).unwrap();
+        match change {
+            "address" => {
+                changed["contracts"][0]["details"][0]["address"] =
+                    json!("0x0000000000000000000000000000000000000002");
+            }
+            "interval" => {
+                changed["contracts"][0]["tables"][0]["cron"][0]["block_interval"] = json!("2");
+            }
+            "end_block" => {
+                changed["contracts"][0]["tables"][0]["cron"][0]["end_block"] = json!("102");
+            }
+            _ => unreachable!(),
+        }
+        let manifest: Manifest = serde_json::from_value(changed).unwrap();
+        let error = fixture
+            .scheduler(&manifest, 102)
+            .unwrap()
+            .run()
+            .await
+            .expect_err("changed source or sampling schedule cannot reuse a checkpoint")
+            .to_string();
+        assert!(
+            error.contains("schedule") || error.contains("fingerprint"),
+            "{change}: {error}"
+        );
+        assert_eq!(fixture.count().await, 1, "{change}: no replay");
+        assert_eq!(fixture.checkpoint().await, Some(101), "{change}: no progress change");
+        fixture.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn changed_operation_order_and_column_defaults_are_incompatible() {
+    for change in ["operation_order", "column_default"] {
+        let fixture = Fixture::new().await;
+        fixture.use_additive_table().await;
+        let mut original = serde_json::to_value(Fixture::additive_manifest()).unwrap();
+        original["contracts"][0]["tables"][0]["cron"][0]["operations"] = json!([
+            {"type":"upsert","set":[{"column":"amount","action":"set","value":"3"}]},
+            {"type":"upsert","set":[{"column":"amount","action":"add","value":"7"}]}
+        ]);
+        let manifest: Manifest = serde_json::from_value(original.clone()).unwrap();
+        fixture.scheduler(&manifest, 101).unwrap().run().await.unwrap();
+        assert_eq!(fixture.amount().await.as_deref(), Some("10"));
+        match change {
+            "operation_order" => {
+                original["contracts"][0]["tables"][0]["cron"][0]["operations"] = json!([
+                    {"type":"upsert","set":[{"column":"amount","action":"add","value":"7"}]},
+                    {"type":"upsert","set":[{"column":"amount","action":"set","value":"3"}]}
+                ]);
+            }
+            "column_default" => {
+                original["contracts"][0]["tables"][0]["columns"][0]["default"] = json!("5");
+            }
+            _ => unreachable!(),
+        }
+        let modified: Manifest = serde_json::from_value(original).unwrap();
+        let error = fixture
+            .scheduler(&modified, 101)
+            .unwrap()
+            .run()
+            .await
+            .expect_err("changed operations/schema cannot reuse certified progress")
+            .to_string();
+        assert!(error.contains("schedule") || error.contains("fingerprint"), "{change}: {error}");
+        assert_eq!(fixture.amount().await.as_deref(), Some("10"), "{change}: old effects");
+        assert_eq!(fixture.checkpoint().await, Some(101));
+        fixture.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn production_setup_rejects_incompatible_schedule_before_drop_each_run() {
+    let fixture = Fixture::new().await;
+    fixture.worker(101, 101).run().await.expect("commit old schedule");
+    let mut changed = serde_json::to_value(Fixture::manifest(101, 101)).unwrap();
+    changed["contracts"][0]["tables"][0]["cron"][0]["operations"][0]["set"][0]["value"] =
+        json!("9");
+    changed["storage"] = json!({"postgres": {"enabled": true, "drop_each_run": true}});
+    let manifest: Manifest = serde_json::from_value(changed).unwrap();
+    let error = fixture
+        .production_admission_error(&manifest)
+        .await
+        .expect_err("schedule drift must stop before any destructive setup");
+    assert!(error.contains("schedule") || error.contains("fingerprint"), "{error}");
+    assert_eq!(fixture.count().await, 1, "setup must not destroy old data");
+    assert_eq!(fixture.checkpoint().await, Some(101));
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn unsigned_v1_checkpoint_cannot_be_implicitly_adopted() {
+    let fixture = Fixture::new().await;
+    fixture.worker(101, 101).run().await.expect("commit old checkpoint");
+    fixture
+        .postgres
+        .batch_execute(&format!(
+            "UPDATE rindexer_internal.{} SET protocol_version = 1",
+            fixture.checkpoint
+        ))
+        .await
+        .unwrap();
+    let error = fixture
+        .production_setup(101, 101)
+        .await
+        .expect_err("unsigned version-1 progress must not be auto-certified");
+    assert!(
+        error.contains("legacy") || error.contains("schedule") || error.contains("version"),
+        "{error}"
+    );
+    assert_eq!(fixture.count().await, 1);
+    assert_eq!(fixture.checkpoint().await, Some(101));
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn nonsemantic_rpc_and_runtime_settings_preserve_schedule_identity() {
+    let fixture = Fixture::new().await;
+    fixture.worker(101, 101).run().await.expect("commit original schedule");
+    let mut value = serde_json::to_value(Fixture::manifest(101, 101)).unwrap();
+    value["networks"][0]["rpc"] = json!("http://127.0.0.1:9999");
+    value["config"]["max_concurrent_view_calls"] = json!(3);
+    let manifest: Manifest = serde_json::from_value(value).unwrap();
+    fixture.scheduler(&manifest, 101).unwrap().run().await.expect("same effective schedule");
+    assert_eq!(fixture.count().await, 1);
+    assert_eq!(fixture.checkpoint().await, Some(101));
+    fixture.finish().await;
+}
