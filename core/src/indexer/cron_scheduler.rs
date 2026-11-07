@@ -640,6 +640,21 @@ impl CronScheduler {
 /// Maximum number of retry attempts for failed cron operations.
 const MAX_RETRIES: u32 = 3;
 
+/// Current live-cron terminal behavior records exhausted retries but does not
+/// surface them to the scheduler. The paired regression requires propagation.
+fn report_exhausted_live_cron_retries(
+    table: &str,
+    network: &str,
+    retries: u32,
+    cause: &str,
+) -> Result<(), String> {
+    error!(
+        "Cron task failed for table '{}' on network '{}' after {} retries: {}",
+        table, network, retries, cause
+    );
+    Ok(())
+}
+
 /// Initial backoff delay for retries (doubles each attempt).
 const INITIAL_BACKOFF_SECS: u64 = 2;
 
@@ -1916,12 +1931,11 @@ async fn run_live_cron_loop(
         // If we exhausted all retries, log the final error
         if retry_count > MAX_RETRIES {
             if let Some(e) = last_error {
-                error!(
-                    "Cron task failed for table '{}' on network '{}' after {} retries: {}",
+                let _ = report_exhausted_live_cron_retries(
                     task.table.name(),
-                    task.network,
+                    &task.network,
                     MAX_RETRIES,
-                    e
+                    &e,
                 );
             }
         }
@@ -2491,3 +2505,7 @@ mod cron_atomic_tests;
 #[cfg(test)]
 #[path = "cron_clickhouse_tests.rs"]
 mod cron_clickhouse_tests;
+
+#[cfg(test)]
+#[path = "cron_live_supervision_tests.rs"]
+mod cron_live_supervision_tests;
