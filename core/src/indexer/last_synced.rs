@@ -616,12 +616,23 @@ pub async fn get_last_synced_cron_block(config: CronSyncConfig<'_>) -> Result<Op
     Ok(None)
 }
 
+/// The only retryable checkpoint-lock failure is PostgreSQL SQLSTATE 55P03,
+/// reported by the server for a lock_timeout before any table effects.
+/// Semantic identity, protocol and missing-row errors are never retryable.
+#[derive(Debug, thiserror::Error)]
+pub enum CronCheckpointLockError {
+    #[error("{0}")]
+    LockTimeout(String),
+    #[error("{0}")]
+    Permanent(String),
+}
+
 /// Lock the checkpoint BEFORE staging any table effects. Waiting on this row
 /// serializes both the decision to apply a prepared batch and its eventual commit.
 pub async fn lock_postgres_cron_checkpoint(
     transaction: &tokio_postgres::Transaction<'_>,
     config: CronSyncConfig<'_>,
-) -> Result<Option<u64>, String> {
+) -> Result<Option<u64>, CronCheckpointLockError> {
     let table = postgres_cron_table(config);
     let query = format!(
         "SELECT protocol_version, schedule_fingerprint, schedule_descriptor, \
@@ -631,14 +642,32 @@ pub async fn lock_postgres_cron_checkpoint(
     let row = transaction
         .query_opt(&query, &[&config.network])
         .await
-        .map_err(|e| format!("Cannot lock cron checkpoint {table}/{}: {e}", config.network))?
+        .map_err(|e| {
+            if e.as_db_error().is_some_and(|db| db.code().code() == "55P03") {
+                CronCheckpointLockError::LockTimeout(format!(
+                    "Cannot lock cron checkpoint {table}/{}: PostgreSQL lock timeout",
+                    config.network
+                ))
+            } else {
+                CronCheckpointLockError::Permanent(format!(
+                    "Cannot lock cron checkpoint {table}/{}: {e}",
+                    config.network
+                ))
+            }
+        })?
         .ok_or_else(|| {
-            format!("Cron checkpoint row missing from {table} for network {}", config.network)
+            CronCheckpointLockError::Permanent(format!(
+                "Cron checkpoint row missing from {table} for network {}",
+                config.network
+            ))
         })?;
     let identity = config.schedule_identity.ok_or_else(|| {
-        format!("Cannot lock historical cron checkpoint {table}: missing schedule identity")
+        CronCheckpointLockError::Permanent(format!(
+            "Cannot lock historical cron checkpoint {table}: missing schedule identity"
+        ))
     })?;
     read_versioned_cron_row(row, &table, config.network, identity)
+        .map_err(CronCheckpointLockError::Permanent)
 }
 
 /// Advance inside the caller-owned PostgreSQL transaction after every

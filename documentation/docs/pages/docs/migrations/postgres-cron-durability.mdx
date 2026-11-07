@@ -114,6 +114,31 @@ scheduler and startup supervisor rather than merely logging and running
 another tick. Deliberate shutdown remains a normal cancellation path.
 These lifecycle guarantees do not make live-cron writes atomic or replay-safe.
 
+## Bounded historical recovery
+
+Historical PostgreSQL cron retries only work whose effects have not begun:
+one expired required-RPC preparation is retried once, and checkpoint row
+lock timeouts (PostgreSQL SQLSTATE 55P03) are retried twice in separate
+transactions. An unchanged checkpoint lock can therefore fail predictably
+without writing. PostgreSQL transaction-local limits currently set a 2-second
+lock timeout and 30-second statement timeout; acquiring a database connection
+or reading progress has a separate 12-second deadline. These are code-defined
+bounded safeguards, not configurable global performance knobs.
+
+A commit acknowledgement that is lost or exceeds its 20-second deadline
+is **never** blindly retried. The scheduler drops the original connection,
+reconnects with bounded deadlines, and locks authoritative progress to
+reconcile the outcome. If reconciliation is unavailable or inconclusive,
+it exits with the original uncertainty and retains existing state for a
+reviewed restart. The same version-2 schedule certificate is checked under
+the lock. Unchanged progress is not evidence that an unverified write
+should be repeated while the original transaction may still be running.
+
+The existing shutdown flag interrupts stalled historical RPC preparation;
+no checkpoint is advanced for an incomplete sampled block. A permanent
+decoding, schedule or certificate error is not classified as transient.
+The supported guarantees do not extend to ClickHouse or live cron.
+
 ## Verification
 
 Run formatting, workspace Clippy and the PostgreSQL cron regressions. For

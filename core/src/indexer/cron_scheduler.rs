@@ -19,7 +19,7 @@ use crate::database::sql_type_wrapper::EthereumSqlTypeWrapper;
 use crate::event::read_factory_addresses_from_event;
 use crate::indexer::last_synced::{
     advance_postgres_cron_checkpoint, get_last_synced_cron_block, lock_postgres_cron_checkpoint,
-    update_last_synced_clickhouse_cron_block, CronSyncConfig,
+    update_last_synced_clickhouse_cron_block, CronCheckpointLockError, CronSyncConfig,
 };
 use crate::indexer::schema::PreparedSchema;
 use crate::is_running;
@@ -36,6 +36,23 @@ use super::tables::{TableRowData, TableRuntime, TxMetadata};
 // ============================================================================
 // Adaptive Rate Limiter - Scales both concurrency AND batch size
 // ============================================================================
+
+// Bounded historical-cron recovery. Retry only pre-effect lock acquisition
+// and preparation deadlines; uncertain COMMIT still requires reconciliation.
+const HISTORICAL_RPC_PREPARATION_TIMEOUT: Duration = Duration::from_secs(60);
+const HISTORICAL_RPC_PREPARATION_RETRIES: usize = 1;
+const HISTORICAL_CHECKPOINT_LOCK_RETRIES: usize = 2;
+const HISTORICAL_DB_CONNECTION_TIMEOUT: Duration = Duration::from_secs(12);
+const HISTORICAL_COMMIT_REPLY_TIMEOUT: Duration = Duration::from_secs(20);
+const HISTORICAL_RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The existing global shutdown state is the single owner of cancellation.
+/// There is no second cron shutdown flag or watch channel.
+async fn wait_for_historical_cron_shutdown() {
+    while is_running() {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
 
 /// Maximum concurrent RPC calls. Paid nodes handle 100+ easily.
 const MAX_RPC_CONCURRENCY: usize = 100;
@@ -990,7 +1007,12 @@ async fn run_historical_sync(
         schedule_identity: identity.as_ref(),
     };
 
-    let last_synced = get_last_synced_cron_block(sync_config).await?;
+    let last_synced = tokio::time::timeout(
+        HISTORICAL_DB_CONNECTION_TIMEOUT,
+        get_last_synced_cron_block(sync_config),
+    )
+    .await
+    .map_err(|_| "Historical cron checkpoint read timed out".to_string())??;
     if let Some(last) = last_synced {
         let block = last.to::<u64>();
         if block < start_block || !(block - start_block).is_multiple_of(block_interval) {
@@ -1062,15 +1084,51 @@ async fn run_historical_sync(
         // Track batch timing to detect rate limiting
         let batch_start_time = std::time::Instant::now();
 
-        // Resolve every required RPC input outside the database transaction.
-        let result = prepare_cron_operations_batch(
-            task,
-            providers.clone(),
-            &batch_blocks,
-            &addresses_with_blocks,
-            rate_limiter.clone(),
-        )
-        .await;
+        // Resolve every required RPC input outside any database transaction.
+        // Only an expired preparation deadline is retried; an ordinary
+        // decoding or configuration failure is permanent and propagates.
+        let preparation_timeout = HISTORICAL_RPC_PREPARATION_TIMEOUT;
+        #[cfg(test)]
+        let preparation_timeout = task.prepare_timeout_for_test.unwrap_or(preparation_timeout);
+        let mut attempt = 0;
+        let result = loop {
+            if !is_running() {
+                return Ok(false);
+            }
+            let prepared = tokio::select! {
+                _ = wait_for_historical_cron_shutdown() => return Ok(false),
+                result = tokio::time::timeout(
+                    preparation_timeout,
+                    prepare_cron_operations_batch(
+                        task,
+                        providers.clone(),
+                        &batch_blocks,
+                        &addresses_with_blocks,
+                        rate_limiter.clone(),
+                    ),
+                ) => result,
+            };
+            match prepared {
+                Ok(result) => break result,
+                Err(_) if attempt < HISTORICAL_RPC_PREPARATION_RETRIES => {
+                    attempt += 1;
+                    warn!(
+                        "Historical cron RPC preparation timeout for blocks {}-{}; retry {}",
+                        batch_start, batch_end, attempt
+                    );
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Err(_) => {
+                    return Err(format!(
+                        "Historical cron {}.{} on network {:?}: RPC timeout preparing blocks                          {batch_start}-{batch_end} after {} attempts",
+                        task.contract_name,
+                        task.table.name(),
+                        task.network,
+                        attempt + 1
+                    ));
+                }
+            }
+        };
 
         let batch_duration = batch_start_time.elapsed();
 
@@ -1090,6 +1148,7 @@ async fn run_historical_sync(
                         CronBatchOutcome::Committed => {
                             expected_previous = Some(completed);
                         }
+                        CronBatchOutcome::Interrupted => return Ok(false),
                         CronBatchOutcome::Replan(progress) => {
                             if let Some(last) = progress {
                                 let on_grid = last >= start_block
@@ -1237,6 +1296,7 @@ fn can_bulk_historical_postgres(task: &CronTask) -> bool {
 enum CronBatchOutcome {
     Committed,
     Replan(Option<u64>),
+    Interrupted,
 }
 
 /// One transaction owns the checkpoint decision and all table effects.
@@ -1249,10 +1309,50 @@ async fn apply_postgres_historical_batch(
     expected_previous: Option<u64>,
     completed: u64,
 ) -> Result<CronBatchOutcome, String> {
-    let mut connection = postgres.raw_connection().await.map_err(|e| e.to_string())?;
-    let transaction =
-        connection.transaction().await.map_err(|e| format!("Cannot begin cron batch: {e}"))?;
-    let durable = lock_postgres_cron_checkpoint(&transaction, sync).await?;
+    let mut connection =
+        tokio::time::timeout(HISTORICAL_DB_CONNECTION_TIMEOUT, postgres.raw_connection())
+            .await
+            .map_err(|_| "Historical cron connection acquisition timed out".to_string())?
+            .map_err(|e| e.to_string())?;
+
+    // Each failed lock attempt is a separate transaction. PostgreSQL aborts
+    // a transaction after lock_timeout, so never retry the same transaction.
+    // No destination effect can precede this lock.
+    let (transaction, durable) = {
+        let mut attempt = 0;
+        loop {
+            if !is_running() {
+                return Ok(CronBatchOutcome::Interrupted);
+            }
+            let transaction =
+                tokio::time::timeout(HISTORICAL_DB_CONNECTION_TIMEOUT, connection.transaction())
+                    .await
+                    .map_err(|_| "Historical cron BEGIN timed out".to_string())?
+                    .map_err(|e| format!("Cannot begin cron batch: {e}"))?;
+            transaction
+                .batch_execute("SET LOCAL lock_timeout = '2s'; SET LOCAL statement_timeout = '30s'")
+                .await
+                .map_err(|e| format!("Cannot configure cron transaction limits: {e}"))?;
+            let locked = tokio::time::timeout(
+                HISTORICAL_DB_CONNECTION_TIMEOUT,
+                lock_postgres_cron_checkpoint(&transaction, sync),
+            )
+            .await
+            .map_err(|_| "Historical cron checkpoint lock wait timed out".to_string())?;
+            match locked {
+                Ok(progress) => break (transaction, progress),
+                Err(CronCheckpointLockError::LockTimeout(error))
+                    if attempt < HISTORICAL_CHECKPOINT_LOCK_RETRIES =>
+                {
+                    attempt += 1;
+                    debug!("Retrying pre-effect cron checkpoint lock ({attempt}): {error}");
+                    drop(transaction);
+                    tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+    };
     if durable != expected_previous {
         if matches!((expected_previous, durable), (Some(_), None))
             || matches!(
@@ -1318,38 +1418,58 @@ async fn apply_postgres_historical_batch(
     }
     advance_postgres_cron_checkpoint(&transaction, sync, completed).await?;
 
-    // Commit may succeed even when its reply never reaches this client.
-    match transaction.commit().await {
-        Ok(()) => Ok(CronBatchOutcome::Committed),
-        Err(commit_error) => {
-            drop(connection);
-            // Locking the same row waits for the original transaction to
-            // settle before declaring whether the progress committed.
-            let mut recovery = postgres.raw_connection().await.map_err(|error| {
+    // A commit timeout is an *uncertain* outcome, not a retry signal.
+    // Drop the original connection and reconcile the certified checkpoint
+    // before claiming success or leaving the job for an operator/restart.
+    let commit_error =
+        match tokio::time::timeout(HISTORICAL_COMMIT_REPLY_TIMEOUT, transaction.commit()).await {
+            Ok(Ok(())) => return Ok(CronBatchOutcome::Committed),
+            Ok(Err(error)) => error.to_string(),
+            Err(_) => "COMMIT acknowledgement timed out".to_string(),
+        };
+    drop(connection);
+    // Locking the same row waits for the original transaction to
+    // settle before declaring whether the progress committed.
+    let mut recovery =
+        tokio::time::timeout(HISTORICAL_RECONCILIATION_TIMEOUT, postgres.raw_connection())
+            .await
+            .map_err(|_| {
+                format!("Cron COMMIT outcome unknown ({commit_error}); reconnect timed out")
+            })?
+            .map_err(|error| {
                 format!("Cron COMMIT outcome unknown ({commit_error}); cannot reconnect: {error}")
             })?;
-            let reconciliation = recovery.transaction().await.map_err(|error| {
-                format!("Cron COMMIT outcome unknown ({commit_error}); cannot start reconciliation: {error}")
-            })?;
-            let actual =
-                lock_postgres_cron_checkpoint(&reconciliation, sync).await.map_err(|error| {
-                    format!(
-                        "Cron COMMIT outcome unknown ({commit_error}); cannot reconcile: {error}"
-                    )
-                })?;
-            drop(reconciliation);
-            if matches!(actual, Some(block) if block >= completed) {
-                info!(
-                    "Historical cron COMMIT reply lost, but checkpoint confirms block {completed}"
-                );
-                Ok(CronBatchOutcome::Committed)
-            } else {
-                Err(format!(
-                    "Cron COMMIT outcome unknown ({commit_error}); durable checkpoint {actual:?} \
-                     does not certify completed block {completed}; aborting for safe restart"
-                ))
-            }
-        }
+    let reconciliation_result =
+        tokio::time::timeout(HISTORICAL_RECONCILIATION_TIMEOUT, recovery.transaction()).await;
+    let reconciliation = reconciliation_result
+        .map_err(|_| {
+            format!("Cron COMMIT outcome unknown ({commit_error}); reconciliation BEGIN timed out")
+        })?
+        .map_err(|error| {
+            format!(
+            "Cron COMMIT outcome unknown ({commit_error}); cannot start reconciliation: {error}"
+        )
+        })?;
+    let actual = tokio::time::timeout(
+        HISTORICAL_RECONCILIATION_TIMEOUT,
+        lock_postgres_cron_checkpoint(&reconciliation, sync),
+    )
+    .await
+    .map_err(|_| {
+        format!("Cron COMMIT outcome unknown ({commit_error}); reconciliation lock timed out")
+    })?
+    .map_err(|error| {
+        format!("Cron COMMIT outcome unknown ({commit_error}); cannot reconcile: {error}")
+    })?;
+    drop(reconciliation);
+    if matches!(actual, Some(block) if block >= completed) {
+        info!("Historical cron COMMIT reply lost, but checkpoint confirms block {completed}");
+        Ok(CronBatchOutcome::Committed)
+    } else {
+        Err(format!(
+            "Cron COMMIT outcome unknown ({commit_error}); durable checkpoint {actual:?} \
+             does not certify completed block {completed}; aborting for safe restart"
+        ))
     }
 }
 
