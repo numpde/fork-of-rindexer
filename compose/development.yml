@@ -66,6 +66,39 @@ services:
       CARGO_TERM_COLOR: never
       RINDEXER_TEST_POSTGRES_URL: postgresql://postgres:postgres@postgres:5432/rindexer_fixture_admin
     networks: [fixtures]
+  clickhouse-tests:
+    <<: *runner
+    profiles: [clickhouse]
+    environment:
+      CARGO_TERM_COLOR: never
+      RINDEXER_TEST_CLICKHOUSE_URL: http://clickhouse:8123
+    networks: [fixtures]
+  clickhouse:
+    # No default pull. The Make target requires a locally present immutable ID.
+    image: ${CLICKHOUSE_IMAGE:-rindexer-unconfigured-clickhouse:local}
+    profiles: [clickhouse]
+    pull_policy: never
+    platform: linux/amd64
+    user: '101:101'
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 512
+    mem_limit: 2g
+    cpus: 2
+    environment:
+      CLICKHOUSE_SKIP_USER_SETUP: '1'
+    tmpfs:
+      - /var/lib/clickhouse:rw,nosuid,nodev,mode=1777,size=1024m
+      - /var/log/clickhouse-server:rw,nosuid,nodev,mode=1777,size=128m
+      - /run:rw,nosuid,nodev,mode=1777,size=16m
+      - /tmp:rw,nosuid,nodev,mode=1777,size=128m
+    networks: [fixtures]
+    healthcheck:
+      test: [CMD-SHELL, "clickhouse-client --host 127.0.0.1 --query 'SELECT 1' | grep -qx 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
   postgres:
     image: ${POSTGRES_IMAGE:?missing pinned PostgreSQL image}
     pull_policy: never

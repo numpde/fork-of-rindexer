@@ -351,12 +351,25 @@ ci: rust/checks tests ## Validate the first container-development slice (not all
 
 .PHONY: tests/permanent-failures/docker tests/permanent-failures/postgres
 
-.PHONY: tests/cron-atomic/postgres
+.PHONY: tests/cron-atomic/postgres tests/cron-clickhouse/fixture
 .PHONY: tests/postgres-replay/docker
 .PHONY: tests/reorg/docker
 tests/reorg/docker: tests/posture ## Check shared network rewinds, reorg validation and stale-work fencing offline
 	@$(call offline_runner,$$dependency_image)
 	$(compose) run --rm --no-deps -T offline reorg
+
+tests/cron-clickhouse/fixture: tests/posture ## Check historical cron ordering and partial failures against an isolated local ClickHouse image
+	@$(call offline_runner,$$dependency_image)
+	if ! [[ "$${CLICKHOUSE_IMAGE:-}" =~ ^(sha256:[a-f0-9]{64}|[^[:space:]]+@sha256:[a-f0-9]{64})$$ ]]; then
+	  echo 'Set CLICKHOUSE_IMAGE to a local sha256 image ID or immutable repo digest.' >&2; exit 2
+	fi
+	if ! docker image inspect "$$CLICKHOUSE_IMAGE" >/dev/null; then
+	  echo 'ClickHouse image not available locally; no pull is performed.' >&2; exit 2
+	fi
+	$(compose) run --rm --no-deps -T offline cron-clickhouse-compile
+	compose_profile_args=(--profile clickhouse)
+	$(compose) up -d --no-build --pull never --wait --wait-timeout 150 clickhouse
+	$(compose) run --rm --no-deps -T clickhouse-tests cron-clickhouse
 
 tests/cron-atomic/postgres: tests/posture ## Check atomic historical-cron checkpoints with the external PostgreSQL fixture
 	@$(call offline_runner,$$dependency_image)

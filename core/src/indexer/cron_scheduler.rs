@@ -24,7 +24,8 @@ use crate::indexer::last_synced::{
 use crate::indexer::schema::PreparedSchema;
 use crate::is_running;
 use crate::manifest::contract::{
-    parse_interval, ColumnType, Contract, FactoryDetailsYaml, ResolvedTable, TableCronMapping,
+    parse_interval, ColumnType, Contract, FactoryDetailsYaml, OperationType, ResolvedTable,
+    SetAction, TableCronMapping,
 };
 use crate::manifest::core::Manifest;
 use crate::provider::ChainProvider;
@@ -325,9 +326,9 @@ pub(crate) fn validate_postgres_cron_targets<'a>(
                         "{context}: a fixed end_block is required until live cron is durable"
                     ));
                 }
-                if entry.operations.len() != 1 {
+                if entry.operations.is_empty() {
                     return Err(format!(
-                        "{context}: exactly one operation is supported until ordered multi-operation batches are implemented"
+                        "{context}: at least one operation is required for durable historical cron"
                     ));
                 }
                 let uses_synthetic_metadata = entry.operations.iter().any(|operation| {
@@ -1026,7 +1027,7 @@ async fn run_historical_sync(
                         task,
                         postgres,
                         sync_config,
-                        &rows,
+                        rows,
                         expected_previous,
                         completed,
                     )
@@ -1059,19 +1060,26 @@ async fn run_historical_sync(
                 } else {
                     // ClickHouse retains its previous best-effort checkpoint
                     // protocol, outside the PostgreSQL transaction guarantee.
-                    if !rows.is_empty() {
-                        let Some(operation) = task.cron_entry.operations.first() else {
-                            return Err("Historical cron has no declared operation".into());
-                        };
-                        if let Some(clickhouse) = &clickhouse {
+                    if let Some(clickhouse) = &clickhouse {
+                        for step in &rows {
+                            if step.rows.is_empty() {
+                                continue;
+                            }
+                            let operation = &task.cron_entry.operations[step.operation_index];
                             super::tables::execute_clickhouse_operation_internal(
                                 clickhouse,
                                 &task.full_table_name,
                                 &task.table,
                                 operation,
-                                &rows,
+                                &step.rows,
                             )
-                            .await?;
+                            .await
+                            .map_err(|error| {
+                                format!(
+                                    "Historical ClickHouse cron block {} operation {} failed: {error}",
+                                    step.block, step.operation_index
+                                )
+                            })?;
                         }
                     }
                     update_last_synced_clickhouse_cron_block(sync_config, U64::from(completed))
@@ -1127,6 +1135,49 @@ async fn run_historical_sync(
     Ok(true)
 }
 
+/// One declared operation at one historical block. RPC preparation may run in
+/// parallel, but the database consumes these steps in block and declaration order.
+struct PreparedCronOperation {
+    block: u64,
+    operation_index: usize,
+    rows: Vec<TableRowData>,
+}
+
+/// Only statements whose aggregation preserves the stepwise result can
+/// combine multiple sampled blocks. Keep UPDATE/DELETE, mixed operations, and
+/// arithmetic with nullable/array columns on the ordered sequential path.
+fn can_bulk_historical_postgres(task: &CronTask) -> bool {
+    let [operation] = task.cron_entry.operations.as_slice() else {
+        return false;
+    };
+    match operation.operation_type {
+        OperationType::Insert => true,
+        OperationType::Upsert if !operation.set.is_empty() => {
+            if operation.set.iter().all(|column| column.action == SetAction::Set) {
+                // DISTINCT ON by the key, descending sequence: last assignment wins.
+                return true;
+            }
+            // SUM of deltas is equivalent for these scalar counter operations.
+            // Arrays and nullable columns use the stepwise path: the shared SQL
+            // aggregator picks MAX for arrays and NULL arithmetic is not additive.
+            let all_counters = operation.set.iter().all(|column| {
+                matches!(
+                    column.action,
+                    SetAction::Add
+                        | SetAction::Subtract
+                        | SetAction::Increment
+                        | SetAction::Decrement
+                )
+            });
+            all_counters
+                && task.table.columns().iter().all(|column| {
+                    !column.nullable && !matches!(column.resolved_type(), ColumnType::Array(_))
+                })
+        }
+        _ => false,
+    }
+}
+
 /// Whether the current attempt committed, or another writer advanced durable
 /// progress while its RPC values were being prepared.
 enum CronBatchOutcome {
@@ -1140,13 +1191,10 @@ async fn apply_postgres_historical_batch(
     task: &CronTask,
     postgres: &PostgresClient,
     sync: CronSyncConfig<'_>,
-    rows: &[TableRowData],
+    steps: Vec<PreparedCronOperation>,
     expected_previous: Option<u64>,
     completed: u64,
 ) -> Result<CronBatchOutcome, String> {
-    let [operation] = task.cron_entry.operations.as_slice() else {
-        return Err("Durable historical cron requires exactly one operation".into());
-    };
     let mut connection = postgres.raw_connection().await.map_err(|e| e.to_string())?;
     let transaction =
         connection.transaction().await.map_err(|e| format!("Cannot begin cron batch: {e}"))?;
@@ -1170,15 +1218,49 @@ async fn apply_postgres_historical_batch(
             "Historical cron attempted to advance past checkpoint {durable:?} with completed block {completed}"
         ));
     }
-    if !rows.is_empty() {
-        super::tables::execute_postgres_cron_operation_in(
-            &transaction,
-            &task.full_table_name,
-            &task.table,
-            operation,
-            rows,
-        )
-        .await?;
+    // One table statement per block is wasteful for eligible operations.
+    // Keep the same checkpoint transaction, but merge rows across this batch
+    // only when the existing PostgreSQL statement builder is equivalent to
+    // applying each sampled block in order.
+    if can_bulk_historical_postgres(task) {
+        let rows = steps.into_iter().flat_map(|step| step.rows).collect::<Vec<_>>();
+        if !rows.is_empty() {
+            super::tables::execute_postgres_cron_operation_in(
+                &transaction,
+                &task.full_table_name,
+                &task.table,
+                &task.cron_entry.operations[0],
+                &rows,
+            )
+            .await
+            .map_err(|error| format!("Historical cron bulk operation failed: {error}"))?;
+        }
+    } else {
+        // Mixed operations and non-aggregatable mutation types retain strict
+        // block/declaration order. Later failure aborts earlier effects.
+        for step in steps {
+            if step.rows.is_empty() {
+                continue;
+            }
+            let operation =
+                task.cron_entry.operations.get(step.operation_index).ok_or_else(|| {
+                    format!("Historical cron operation {} is absent", step.operation_index)
+                })?;
+            super::tables::execute_postgres_cron_operation_in(
+                &transaction,
+                &task.full_table_name,
+                &task.table,
+                operation,
+                &step.rows,
+            )
+            .await
+            .map_err(|error| {
+                format!(
+                    "Historical cron block {} operation {} failed: {error}",
+                    step.block, step.operation_index
+                )
+            })?;
+        }
     }
     advance_postgres_cron_checkpoint(&transaction, sync, completed).await?;
 
@@ -1230,9 +1312,12 @@ async fn prepare_cron_operations_batch(
     blocks: &[u64],
     addresses_with_blocks: &HashMap<Address, u64>,
     rate_limiter: Arc<AdaptiveRateLimiter>,
-) -> Result<Option<(u64, Vec<TableRowData>)>, String> {
+) -> Result<Option<(u64, Vec<PreparedCronOperation>)>, String> {
     use futures::stream::{FuturesUnordered, StreamExt};
 
+    if task.cron_entry.operations.is_empty() {
+        return Err("Historical cron has no declared operation".into());
+    }
     if blocks.is_empty() || addresses_with_blocks.is_empty() {
         return Ok(None);
     }
@@ -1390,7 +1475,7 @@ async fn prepare_cron_operations_batch(
         return Ok(None);
     }
 
-    // Step 3: Build all rows using cached results (one row per block per address)
+    // Step 3: Prepare one ordered step per (block, declared operation).
     let cache = call_cache.read().await;
 
     // Log cache stats for debugging
@@ -1429,14 +1514,20 @@ async fn prepare_cron_operations_batch(
         }
     }
 
-    let mut all_rows: Vec<TableRowData> =
-        Vec::with_capacity(blocks.len() * addresses_with_blocks.len());
+    let mut steps = Vec::with_capacity(blocks.len() * task.cron_entry.operations.len());
     let mut last_successful_block: Option<u64> = None;
 
     for &block_number in blocks {
         if !is_running() {
             return Ok(None);
         }
+        let mut block_steps = (0..task.cron_entry.operations.len())
+            .map(|operation_index| PreparedCronOperation {
+                block: block_number,
+                operation_index,
+                rows: Vec::with_capacity(addresses_with_blocks.len()),
+            })
+            .collect::<Vec<_>>();
 
         for (&contract_address, &birth_block) in addresses_with_blocks {
             // Skip if this block is before the contract was created
@@ -1454,7 +1545,7 @@ async fn prepare_cron_operations_batch(
                 tx_index: 0,
             };
 
-            for operation in &task.cron_entry.operations {
+            for (operation_index, operation) in task.cron_entry.operations.iter().enumerate() {
                 let mut columns: HashMap<String, EthereumSqlTypeWrapper> = HashMap::new();
 
                 // Add where clause columns
@@ -1578,16 +1669,19 @@ async fn prepare_cron_operations_batch(
                     EthereumSqlTypeWrapper::Address(contract_address),
                 );
 
-                all_rows.push(TableRowData { columns, network: task.network.clone() });
+                block_steps[operation_index]
+                    .rows
+                    .push(TableRowData { columns, network: task.network.clone() });
             }
         }
 
+        steps.extend(block_steps);
         last_successful_block = Some(block_number);
     }
 
     drop(cache); // Release the read lock
 
-    Ok(last_successful_block.map(|block| (block, all_rows)))
+    Ok(last_successful_block.map(|block| (block, steps)))
 }
 
 #[cfg(test)]
@@ -1606,15 +1700,18 @@ async fn execute_cron_operations_batch(
     let Some((completed, rows)) = prepared else {
         return Ok(None);
     };
-    if !rows.is_empty() {
-        let operation = &task.cron_entry.operations[0];
+    for step in &rows {
+        if step.rows.is_empty() {
+            continue;
+        }
+        let operation = &task.cron_entry.operations[step.operation_index];
         if let Some(postgres) = &postgres {
             super::tables::execute_postgres_operation_internal(
                 postgres,
                 &task.full_table_name,
                 &task.table,
                 operation,
-                &rows,
+                &step.rows,
                 None,
             )
             .await?;
@@ -1625,7 +1722,7 @@ async fn execute_cron_operations_batch(
                 &task.full_table_name,
                 &task.table,
                 operation,
-                &rows,
+                &step.rows,
             )
             .await?;
         }
@@ -1634,7 +1731,7 @@ async fn execute_cron_operations_batch(
 }
 
 // Note: Prefetching is handled by the VIEW_CALL_CACHE in extract_cron_value
-// The batch processing collects rows and writes them in one database operation
+// Historical preparation preserves block and operation boundaries for ordered writes.
 
 /// Run live cron loop for a task.
 async fn run_live_cron_loop(
@@ -2354,3 +2451,7 @@ mod cron_historical_failure_tests;
 #[cfg(test)]
 #[path = "cron_atomic_tests.rs"]
 mod cron_atomic_tests;
+
+#[cfg(test)]
+#[path = "cron_clickhouse_tests.rs"]
+mod cron_clickhouse_tests;

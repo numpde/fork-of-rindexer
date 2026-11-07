@@ -6,10 +6,27 @@ versioned protocol and the *same unchanged schedule*. The guarantee applies to
 committed PostgreSQL table effects, not RPC request counts, chain reorganizations,
 ClickHouse, downstream publications or live cron.
 
+Historical batches prepare all required RPC inputs before writing. PostgreSQL
+then applies each scheduled block in ascending order and, within each block,
+executes `cron[].operations` in declaration order. Single-operation INSERT
+backfills combine sampled rows into one batched COPY; eligible UPSERTs with
+only last-value assignments or non-null scalar counters also use a grouped
+statement. UPDATE, DELETE, mixed operations, and unsupported aggregation shapes
+retain the sequential path. Both paths keep the same PostgreSQL transaction.
+All effects in a batch and its checkpoint commit together: a later operation
+failure rolls back preceding operations and progress. Replaying an already checkpointed block performs
+no writes. ClickHouse follows declaration order but retains its existing
+non-transactional, best-effort checkpoint semantics.
+
+For existing ClickHouse historical schedules with multiple operations, this
+changes forward behavior: earlier versions applied the first operation to every
+prepared row. Stop writers and review affected rows and progress before resuming;
+reconcile or rebuild them as appropriate for the schedule.
+
 ## Supported deployment
 
 The initial durable profile admits **one PostgreSQL destination** with one
-historical cron entry, **one declared operation**, **one nonzero static address**,
+historical cron entry, **one or more declared operations**, **one nonzero static address**,
 an explicit `start_block` and fixed inclusive `end_block`. It rejects mixed
 PostgreSQL/ClickHouse writes, factory contracts, static address arrays,
 duplicate contract `details` for one network, `cross_chain: true`, and
@@ -85,9 +102,38 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo nextest run -p rindexer --lib -E 'test(/cron_atomic_tests::/)'
 ```
 
+## ClickHouse fixture and failure semantics
+
+The ClickHouse historical-cron path is deliberately not part of the
+PostgreSQL atomicity guarantee. The existing dynamic ClickHouse UPDATE and
+UPSERT writer emits INSERTs into ReplacingMergeTree. It does **not** apply
+PostgreSQL-style `add` or `subtract` arithmetic to existing values. For a
+single sampled block, the real-server tests apply two `set` assignments to
+one logical key and read the resulting row with `FINAL`. A server-side
+constraint rejects the second assignment in a separate test: the first
+INSERT remains committed, while the historical progress table is unchanged.
+Retrying the failed sample can therefore repeat ClickHouse effects. DELETE
+uses ClickHouse mutation semantics and is not covered by these ordering tests.
+
+The rootless runner uses a private, disposable ClickHouse service on the
+existing Compose fixture network, without giving the test process a Docker
+socket. Select an **already local** immutable image ID or repository digest:
+
+```bash
+CLICKHOUSE_IMAGE=sha256:<64-hex-image-id> make tests/cron-clickhouse/fixture
+```
+
+The target compiles tests offline before starting ClickHouse, never pulls
+images, and tears down its project. It passes
+`RINDEXER_TEST_CLICKHOUSE_URL=http://clickhouse:8123` to tests, which
+create unique database and checkpoint names. Native executions without that
+variable use Testcontainers; an invalid supplied endpoint fails rather than
+silently falling back to Docker.
+
 The regression suite checks INSERT and arithmetic UPSERT behavior,
-checkpoint failure after staged effects, lost checkpoint or destination
-startup, completed block zero, legacy rejection, conflicting destination
+checkpoint failure after staged effects, ordered multi-operation replay and
+rollback on a later operation, lost checkpoint or destination startup,
+completed block zero, legacy rejection, conflicting destination
 ownership, duplicate network details, concurrent attempts, and a
 real PostgreSQL COMMIT acknowledgement suppressed by the shared wire fault
 proxy. These checks do not replace production-image qualification with an

@@ -264,6 +264,49 @@ impl Fixture {
         self.postgres.batch_execute(ddl.as_str()).await.map_err(|error| error.to_string())
     }
 
+    async fn install_statement_counter(&self) {
+        self.postgres
+            .batch_execute(&format!(
+                "CREATE TABLE rindexer_internal.cron_write_count (id BIGSERIAL PRIMARY KEY);
+                 CREATE FUNCTION rindexer_internal.count_cron_writes() RETURNS trigger
+                 LANGUAGE plpgsql AS $cron_count$ BEGIN
+                     INSERT INTO rindexer_internal.cron_write_count DEFAULT VALUES;
+                     RETURN NULL;
+                 END $cron_count$;
+                 CREATE TRIGGER count_cron_writes AFTER INSERT ON {}
+                 FOR EACH STATEMENT EXECUTE FUNCTION rindexer_internal.count_cron_writes();",
+                self.table
+            ))
+            .await
+            .expect("install statement-level write counter");
+    }
+
+    async fn write_statements(&self) -> i64 {
+        self.postgres
+            .query_one("SELECT COUNT(*) FROM rindexer_internal.cron_write_count", &[])
+            .await
+            .expect("count destination statements")
+            .get(0)
+    }
+
+    async fn stored_rows(&self) -> Vec<(String, String, String, String)> {
+        self.postgres
+            .query(
+                &format!(
+                    "SELECT network::TEXT, amount::TEXT, rindexer_block_number::TEXT,
+                     rindexer_sequence_id::TEXT FROM {} ORDER BY network, rindexer_block_number,
+                     rindexer_sequence_id, amount",
+                    self.table
+                ),
+                &[],
+            )
+            .await
+            .expect("read complete destination state")
+            .iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
+            .collect()
+    }
+
     async fn finish(self) {
         let Self { postgres, admin, database, .. } = self;
         drop(postgres);
@@ -669,6 +712,78 @@ async fn additive_upsert_rollback_and_restart_preserve_the_single_delta() {
 }
 
 #[tokio::test]
+async fn multiple_operations_follow_declared_order_for_each_sample() {
+    let fixture = Fixture::new().await;
+    fixture.use_additive_table().await;
+    let mut manifest = serde_json::to_value(Fixture::additive_manifest()).unwrap();
+    let cron = &mut manifest["contracts"][0]["tables"][0]["cron"][0];
+    cron["end_block"] = json!("102");
+    cron["operations"] = json!([
+        {"type":"upsert", "set":[{"column":"amount", "action":"set", "value":"3"}]},
+        {"type":"upsert", "set":[{"column":"amount", "action":"add", "value":"7"}]}
+    ]);
+    let manifest: Manifest = serde_json::from_value(manifest).unwrap();
+    fixture
+        .scheduler(&manifest, 102)
+        .expect("multiple operations must be admitted")
+        .run()
+        .await
+        .unwrap();
+    assert_eq!(fixture.amount().await.as_deref(), Some("10"));
+    assert_eq!(fixture.checkpoint().await, Some(102));
+    fixture.scheduler(&manifest, 102).unwrap().run().await.unwrap();
+    assert_eq!(fixture.amount().await.as_deref(), Some("10"));
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn failure_in_later_cron_operation_rolls_back_the_whole_sample() {
+    let fixture = Fixture::new().await;
+    fixture.use_additive_table().await;
+    let mut manifest = serde_json::to_value(Fixture::additive_manifest()).unwrap();
+    manifest["contracts"][0]["tables"][0]["cron"][0]["operations"] = json!([
+        {"type":"upsert", "set":[{"column":"amount", "action":"set", "value":"3"}]},
+        {"type":"upsert", "set":[{"column":"amount", "action":"add", "value":"7"}]}
+    ]);
+    let manifest: Manifest = serde_json::from_value(manifest).unwrap();
+    fixture
+        .postgres
+        .batch_execute(&format!(
+            "CREATE FUNCTION rindexer_internal.reject_second_cron_operation() RETURNS trigger
+             LANGUAGE plpgsql AS $cron_fault$ BEGIN RAISE EXCEPTION 'injected second operation failure'; END $cron_fault$;
+             CREATE TRIGGER reject_second_cron_operation BEFORE UPDATE ON {}
+             FOR EACH ROW EXECUTE FUNCTION rindexer_internal.reject_second_cron_operation();",
+            fixture.table
+        ))
+        .await
+        .expect("install fault on the second operation");
+    let error = fixture
+        .scheduler(&manifest, 101)
+        .unwrap()
+        .run()
+        .await
+        .expect_err("failure in a later operation must abort the entire sample")
+        .to_string();
+    assert!(
+        error.contains("injected second operation failure") && error.contains("operation 1"),
+        "wrong failure boundary: {error}"
+    );
+    assert_eq!(fixture.amount().await, None, "the first operation must roll back");
+    assert_eq!(fixture.checkpoint().await, None, "the sample cannot be certified");
+    fixture
+        .postgres
+        .batch_execute(&format!("DROP TRIGGER reject_second_cron_operation ON {}", fixture.table))
+        .await
+        .expect("remove second-operation fault");
+    fixture.scheduler(&manifest, 101).unwrap().run().await.expect("retry entire sample");
+    assert_eq!(fixture.amount().await.as_deref(), Some("10"));
+    assert_eq!(fixture.checkpoint().await, Some(101));
+    fixture.scheduler(&manifest, 101).unwrap().run().await.expect("replay");
+    assert_eq!(fixture.amount().await.as_deref(), Some("10"), "replay cannot double-apply");
+    fixture.finish().await;
+}
+
+#[tokio::test]
 async fn lost_commit_reply_is_reconciled_without_replaying_the_sample() {
     let fixture = Fixture::new().await;
     let proxy = LostCommitResponse::start(&fixture.url).await;
@@ -693,5 +808,108 @@ async fn lost_commit_reply_is_reconciled_without_replaying_the_sample() {
     assert_eq!(fixture.count().await, 1, "replay must not duplicate committed effects");
     drop(injected);
     proxy.stop().await;
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn insert_backfill_matches_one_block_at_a_time_with_fewer_statements() {
+    let bulk = Fixture::new().await;
+    let reference = Fixture::new().await;
+    bulk.install_statement_counter().await;
+    reference.install_statement_counter().await;
+
+    bulk.worker(101, 108).run().await.expect("bounded insertion");
+    for end in 101..=108 {
+        reference.worker(101, end).run().await.expect("reference one-block backfill");
+    }
+
+    assert_eq!(bulk.stored_rows().await, reference.stored_rows().await);
+    assert_eq!(bulk.checkpoint().await, reference.checkpoint().await);
+    assert_eq!(bulk.checkpoint().await, Some(108));
+    assert_eq!(bulk.count().await, 8);
+    assert_eq!(bulk.write_statements().await, 1, "multi-block COPY must use one statement");
+    assert_eq!(reference.write_statements().await, 8);
+    bulk.finish().await;
+    reference.finish().await;
+}
+
+#[tokio::test]
+async fn repeated_key_arithmetic_upsert_matches_one_block_reference() {
+    let bulk = Fixture::new().await;
+    let reference = Fixture::new().await;
+    bulk.use_additive_table().await;
+    reference.use_additive_table().await;
+    bulk.install_statement_counter().await;
+    reference.install_statement_counter().await;
+    let mut manifest = serde_json::to_value(Fixture::additive_manifest()).unwrap();
+    manifest["contracts"][0]["tables"][0]["columns"][0]["default"] = json!("5");
+    manifest["contracts"][0]["tables"][0]["cron"][0]["end_block"] = json!("108");
+    let bulk_manifest: Manifest = serde_json::from_value(manifest.clone()).unwrap();
+
+    bulk.scheduler(&bulk_manifest, 108).unwrap().run().await.expect("bulk arithmetic");
+    for end in 101..=108 {
+        manifest["contracts"][0]["tables"][0]["cron"][0]["end_block"] = json!(end.to_string());
+        let one: Manifest = serde_json::from_value(manifest.clone()).unwrap();
+        reference.scheduler(&one, end).unwrap().run().await.expect("one-block arithmetic");
+    }
+
+    assert_eq!(bulk.stored_rows().await, reference.stored_rows().await);
+    assert_eq!(bulk.checkpoint().await, Some(108));
+    assert_eq!(reference.checkpoint().await, Some(108));
+    assert_eq!(bulk.amount().await.as_deref(), Some("61"), "default + eight deltas");
+    assert_eq!(bulk.write_statements().await, 1, "one keyed SQL upsert for eight deltas");
+    assert_eq!(reference.write_statements().await, 8);
+    bulk.finish().await;
+    reference.finish().await;
+}
+
+#[tokio::test]
+async fn latest_set_upsert_matches_one_block_reference() {
+    let bulk = Fixture::new().await;
+    let reference = Fixture::new().await;
+    bulk.use_additive_table().await;
+    reference.use_additive_table().await;
+    bulk.install_statement_counter().await;
+    let mut value = serde_json::to_value(Fixture::additive_manifest()).unwrap();
+    let cron = &mut value["contracts"][0]["tables"][0]["cron"][0];
+    cron["end_block"] = json!("108");
+    cron["operations"][0]["set"][0]["action"] = json!("set");
+    cron["operations"][0]["set"][0]["value"] = json!("3");
+    let manifest: Manifest = serde_json::from_value(value.clone()).unwrap();
+
+    bulk.scheduler(&manifest, 108).unwrap().run().await.expect("bulk last-by-sequence");
+    for end in 101..=108 {
+        value["contracts"][0]["tables"][0]["cron"][0]["end_block"] = json!(end.to_string());
+        let one: Manifest = serde_json::from_value(value.clone()).unwrap();
+        reference.scheduler(&one, end).unwrap().run().await.expect("one-block set");
+    }
+
+    assert_eq!(bulk.stored_rows().await, reference.stored_rows().await);
+    assert_eq!(bulk.amount().await.as_deref(), Some("3"));
+    assert_eq!(bulk.checkpoint().await, Some(108));
+    assert_eq!(bulk.write_statements().await, 1, "latest-value upsert is one SQL statement");
+    bulk.finish().await;
+    reference.finish().await;
+}
+
+#[tokio::test]
+async fn batched_insert_checkpoint_failure_rolls_back_all_blocks() {
+    let fixture = Fixture::new().await;
+    fixture.install_statement_counter().await;
+    fixture
+        .postgres
+        .batch_execute(&format!(
+            "CREATE FUNCTION rindexer_internal.reject_bulk_cron_checkpoint() RETURNS trigger
+             LANGUAGE plpgsql AS $reject_bulk$ BEGIN RAISE EXCEPTION 'reject bulk checkpoint'; END $reject_bulk$;
+             CREATE TRIGGER reject_bulk_checkpoint BEFORE UPDATE ON rindexer_internal.{}
+             FOR EACH ROW EXECUTE FUNCTION rindexer_internal.reject_bulk_cron_checkpoint();",
+            fixture.checkpoint
+        ))
+        .await
+        .unwrap();
+    assert!(fixture.worker(101, 108).run().await.is_err());
+    assert_eq!(fixture.count().await, 0);
+    assert_eq!(fixture.write_statements().await, 0, "statement audit also rolls back");
+    assert_eq!(fixture.checkpoint().await, None);
     fixture.finish().await;
 }
