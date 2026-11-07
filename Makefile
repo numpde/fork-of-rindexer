@@ -574,6 +574,10 @@ runtime/image/build: tests/posture ## Build the minimal PostgreSQL CLI image off
 runtime/lifecycle/checks: ## Check an explicit runtime image through backfill, restart, reorg and health on disposable rootless fixtures
 	@python3 -B containers/runtime/lifecycle.py
 
+.PHONY: runtime/cron-lifecycle/checks
+runtime/cron-lifecycle/checks: ## Check a real historical eth_call through the actual runtime image, durable progress and restart
+	@python3 -B containers/runtime/lifecycle.py --scenario cron
+
 .PHONY: runtime/checks
 runtime/checks: runtime/launcher/checks ## Check the rendered single-host PostgreSQL deployment without starting services
 	@python3 -B containers/runtime/test.py

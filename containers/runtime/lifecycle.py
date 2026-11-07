@@ -21,6 +21,9 @@ import urllib.error
 import urllib.request
 
 ROOT = Path(__file__).resolve().parents[2]
+
+if sys.argv[1:]:
+    raise SystemExit('Unsupported runtime lifecycle scenario: ' + ' '.join(sys.argv[1:]))
 FIXTURE = ROOT / 'containers/runtime/fixtures/lifecycle'
 ABI = FIXTURE / 'abis/funded.json'
 

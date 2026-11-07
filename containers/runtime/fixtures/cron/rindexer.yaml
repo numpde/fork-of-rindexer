@@ -1,0 +1,32 @@
+name: CronLifecycle
+project_type: no-code
+networks:
+  - name: lifecycle
+    chain_id: ${CHAIN_ID}
+    rpc: ${RPC_HTTP_URL}
+storage:
+  postgres:
+    enabled: true
+    drop_each_run: false
+contracts:
+  - name: State
+    abi: ./abis/state.json
+    details:
+      - network: lifecycle
+        address: ${CONTRACT_ADDRESS}
+        end_block: '3'
+    tables:
+      - name: samples
+        columns:
+          - name: amount
+            type: uint256
+        cron:
+          - start_block: '1'
+            end_block: '3'
+            block_interval: '1'
+            operations:
+              - type: insert
+                set:
+                  - column: amount
+                    action: set
+                    value: '$call($contract, "value() returns (uint256)")'
