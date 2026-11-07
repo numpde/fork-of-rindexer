@@ -40,6 +40,22 @@ runtime image, use the self-contained lifecycle check:
 make MAKE_TIMEOUT=8m runtime/lifecycle/checks RINDEXER_IMAGE=sha256:...
 ```
 
+For the bounded PostgreSQL **historical-cron** profile, an independent
+scenario in the *same lifecycle driver* exercises real historical `eth_call`
+results: a local Anvil contract changes storage over three blocks, and the
+production image must persist the corresponding sampled values, protocol-2
+schedule certificate and checkpoint. PostgreSQL and the exact indexer image
+are restarted; no values may be duplicated or skipped.
+
+```bash
+make MAKE_TIMEOUT=12m runtime/cron-lifecycle/checks RINDEXER_IMAGE=sha256:...
+```
+
+Both targets use the existing rootless Compose owner, immutable local images,
+disposable resources, bounded operations and teardown. Neither test uses a
+public RPC endpoint. The cron test does not claim continuous live-cron
+durability, factory completeness or reorg rollback.
+
 It requires a local rootless Docker context (`rootless` by default; override with
 `RINDEXER_DOCKER_CONTEXT`) and the pinned PostgreSQL/Anvil images already present.
 It never builds or pulls, reads no sibling checkout, and uses the minimal `Funded`

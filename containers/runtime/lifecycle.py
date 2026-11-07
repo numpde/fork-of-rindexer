@@ -22,10 +22,16 @@ import urllib.request
 
 ROOT = Path(__file__).resolve().parents[2]
 
-if sys.argv[1:]:
+if not sys.argv[1:]:
+    scenario = 'events'
+elif sys.argv[1:] == ['--scenario', 'cron']:
+    scenario = 'cron'
+else:
     raise SystemExit('Unsupported runtime lifecycle scenario: ' + ' '.join(sys.argv[1:]))
-FIXTURE = ROOT / 'containers/runtime/fixtures/lifecycle'
-ABI = FIXTURE / 'abis/funded.json'
+FIXTURE = ROOT / 'containers/runtime/fixtures' / (
+    'cron' if scenario == 'cron' else 'lifecycle'
+)
+ABI = FIXTURE / 'abis' / ('state.json' if scenario == 'cron' else 'funded.json')
 
 
 def run(args, *, env=None, timeout=90):
@@ -77,17 +83,20 @@ for pin in [pins['POSTGRES_IMAGE'], anvil_image]:
 abi_bytes = ABI.read_bytes()
 abi = json.loads(abi_bytes)
 abi = abi.get('abi', abi) if isinstance(abi, dict) else abi
-funded = [item for item in abi if item.get('type') == 'event' and item.get('name') == 'Funded']
-assert len(funded) == 1
-assert [(item['name'], item['type'], item['indexed']) for item in funded[0]['inputs']] == [
-    ('customer', 'address', True), ('channelId', 'uint256', True), ('amount', 'uint256', False)]
+if scenario == 'events':
+    funded = [item for item in abi if item.get('type') == 'event' and item.get('name') == 'Funded']
+    assert len(funded) == 1
+    assert [(item['name'], item['type'], item['indexed']) for item in funded[0]['inputs']] == [
+        ('customer', 'address', True), ('channelId', 'uint256', True), ('amount', 'uint256', False)]
+else:
+    assert abi == [], 'cron fixture resolves an inline view-call signature'
 
 scratch = Path(tempfile.mkdtemp(prefix='rindexer-runtime-lifecycle-'))
 project = 'rindexer-lifecycle-' + secrets.token_hex(8)
 project_dir = scratch / 'project'
 project_dir.mkdir()
 (project_dir / 'abis').mkdir()
-for relative in ['rindexer.yaml', 'abis/funded.json']:
+for relative in ['rindexer.yaml', 'abis/state.json' if scenario == 'cron' else 'abis/funded.json']:
     shutil.copyfile(FIXTURE / relative, project_dir / relative)
 
 env = dict(engine_env, COMPOSE_DISABLE_ENV_FILE='1', POSTGRES_IMAGE=pins['POSTGRES_IMAGE'],
@@ -215,8 +224,11 @@ def await_state(label, blocks, total, orphan_count):
 
 
 proof = {'revision':revision, 'image':image, 'fixture_project':project,
+         'scenario': scenario,
          'fixture_abi_sha256':hashlib.sha256(abi_bytes).hexdigest(),
-         'fixture':'Funded event emitter; no payment business logic', 'phases':[]}
+         'fixture': ('real historical eth_call with storage-changing transactions' if scenario == 'cron'
+                     else 'Funded event emitter; no payment business logic'),
+         'phases':[]}
 started = False
 try:
     rendered = json.loads(compose_run('config', '--format', 'json'))
@@ -235,36 +247,153 @@ try:
     compose_run('up','-d','--no-build','--pull','never','--wait','--wait-timeout','90','postgres','anvil',timeout=100)
     postgres_id = service_id('postgres')
     anvil_id = service_id('anvil')
-    customer = rpc('eth_accounts',[])[0].lower()
-    topic = rpc('web3_sha3',['0x'+b'Funded(address,uint256,uint256)'.hex()])
-    assert re.fullmatch(r'0x[a-f0-9]{64}',topic), topic
-    # The emitter reads three calldata words, puts amount in log data, and uses
-    # customer/channel as indexed topics. It holds no payment state and transfers no funds.
-    code = '0x6040356000526020356000357f'+topic[2:]+'60206000a300'
-    rpc('anvil_setCode',[env['CONTRACT_ADDRESS'],code])
-    first = 10**20+7
-    replacement = 3*10**20+13
-    _, first_block = send(first)
-    compose_run('up','-d','--no-build','--pull','never','indexer')
-    indexer_id = service_id('indexer')
-    live = json.loads(run(docker + ['inspect',indexer_id],env=env))[0]
-    assert live['Image'] == image
-    assert live['Config']['User'] == '65532:65532'
-    assert all(m['RW'] is False for m in live['Mounts'] if m['Destination']=='/project')
-    health_url = health_endpoint()
-    await_state('historical_backfill',[first_block],first,0)
-    compose_run('stop','--timeout','10','indexer',timeout=25)
-    orphan, orphan_block = send(2*10**20+11)
-    compose_run('start','indexer')
-    health_url = health_endpoint()
-    await_state('downtime_restart',[first_block,orphan_block],first+2*10**20+11,1)
-    rpc('anvil_reorg',[1,[]])
-    _, replacement_block = send(replacement)
-    await_state('controlled_reorg',[first_block,replacement_block],first+replacement,0)
-    compose_run('stop','--timeout','10','indexer',timeout=25)
-    compose_run('start','indexer')
-    health_url = health_endpoint()
-    await_state('stable_restart',[first_block,replacement_block],first+replacement,0)
+    if scenario == 'events':
+        customer = rpc('eth_accounts',[])[0].lower()
+        topic = rpc('web3_sha3',['0x'+b'Funded(address,uint256,uint256)'.hex()])
+        assert re.fullmatch(r'0x[a-f0-9]{64}',topic), topic
+        # The emitter reads three calldata words, puts amount in log data, and uses
+        # customer/channel as indexed topics. It holds no payment state and transfers no funds.
+        code = '0x6040356000526020356000357f'+topic[2:]+'60206000a300'
+        rpc('anvil_setCode',[env['CONTRACT_ADDRESS'],code])
+        first = 10**20+7
+        replacement = 3*10**20+13
+        _, first_block = send(first)
+        compose_run('up','-d','--no-build','--pull','never','indexer')
+        indexer_id = service_id('indexer')
+        live = json.loads(run(docker + ['inspect',indexer_id],env=env))[0]
+        assert live['Image'] == image
+        assert live['Config']['User'] == '65532:65532'
+        assert all(m['RW'] is False for m in live['Mounts'] if m['Destination']=='/project')
+        health_url = health_endpoint()
+        await_state('historical_backfill',[first_block],first,0)
+        compose_run('stop','--timeout','10','indexer',timeout=25)
+        orphan, orphan_block = send(2*10**20+11)
+        compose_run('start','indexer')
+        health_url = health_endpoint()
+        await_state('downtime_restart',[first_block,orphan_block],first+2*10**20+11,1)
+        rpc('anvil_reorg',[1,[]])
+        _, replacement_block = send(replacement)
+        await_state('controlled_reorg',[first_block,replacement_block],first+replacement,0)
+        compose_run('stop','--timeout','10','indexer',timeout=25)
+        compose_run('start','indexer')
+        health_url = health_endpoint()
+        await_state('stable_restart',[first_block,replacement_block],first+replacement,0)
+    else:
+
+        # The fixture contract treats exactly four calldata bytes as the view
+        # selector; a 32-byte transaction stores its value in slot zero.
+        # Getter: SLOAD(0) -> uint256. Setter: SSTORE(0, calldata[0]).
+        code = '0x36600414600e57600035600055005b60005460005260206000f3'
+        assert bytes.fromhex(code[2:])[14] == 0x5b, 'EVM jump target must be JUMPDEST'
+        rpc('anvil_setCode', [env['CONTRACT_ADDRESS'], code])
+        account = rpc('eth_accounts', [])[0].lower()
+        signature = rpc('web3_sha3', ['0x' + b'value()'.hex()])
+        assert re.fullmatch(r'0x[a-fA-F0-9]{64}', signature), signature
+        selector = signature[:10]
+
+        historical = []
+        for expected in [3, 7, 11]:
+            tx = rpc('eth_sendTransaction', [{
+                'from': account, 'to': env['CONTRACT_ADDRESS'],
+                'data': '0x' + f'{expected:064x}', 'gas': '0x186a0'
+            }])
+            receipt = None
+            for _ in range(30):
+                receipt = rpc('eth_getTransactionReceipt', [tx])
+                if receipt is not None:
+                    break
+                time.sleep(0.2)
+            assert receipt is not None and int(receipt['status'], 16) == 1, receipt
+            block = int(receipt['blockNumber'], 16)
+            historical.append((block, expected))
+        assert [block for block, _ in historical] == [1, 2, 3], historical
+
+        # Verify the actual RPC state source before relying on the indexer.
+        for block, expected in historical:
+            call = rpc('eth_call', [
+                {'to': env['CONTRACT_ADDRESS'], 'data': selector}, hex(block)
+            ])
+            assert isinstance(call, str) and int(call, 16) == expected, (block, call, expected)
+        proof['phases'].append({'phase': 'historical_rpc', 'values': historical})
+
+        def cron_state():
+            sql = """SELECT json_build_object(
+               'rows', (SELECT coalesce(json_agg(
+                   json_build_array(rindexer_block_number, amount::text)
+                   ORDER BY rindexer_block_number), '[]'::json)
+                   FROM cron_lifecycle_state.samples),
+               'checkpoint', (SELECT last_synced_block::bigint
+                   FROM rindexer_internal.cron_lifecycle_state_samples_cron_0
+                   WHERE network = 'lifecycle'),
+               'protocol', (SELECT protocol_version
+                   FROM rindexer_internal.cron_lifecycle_state_samples_cron_0
+                   WHERE network = 'lifecycle'),
+               'fingerprint', (SELECT schedule_fingerprint
+                   FROM rindexer_internal.cron_lifecycle_state_samples_cron_0
+                   WHERE network = 'lifecycle'),
+               'descriptor', (SELECT schedule_descriptor
+                   FROM rindexer_internal.cron_lifecycle_state_samples_cron_0
+                   WHERE network = 'lifecycle')
+             )::text"""
+            raw = run(docker + [
+                'exec', postgres_id, 'psql', '-X', '-A', '-t',
+                '-U', 'rindexer', '-d', 'rindexer',
+                '-v', 'ON_ERROR_STOP=1', '-c', sql
+            ], env=env, timeout=10)
+            return json.loads(raw)
+
+        def await_cron_exit():
+            deadline = time.monotonic() + 90
+            while time.monotonic() < deadline:
+                state = json.loads(run(docker + ['inspect', indexer_id], env=env))[0]['State']
+                if state['Status'] == 'exited':
+                    assert state['ExitCode'] == 0, {
+                        'state': state,
+                        'logs': compose_run('logs', '--no-color', '--tail', '80', 'indexer')
+                    }
+                    return
+                assert state['Status'] in {'running', 'created'}, state
+                time.sleep(0.4)
+            raise AssertionError('Bounded historical cron image did not terminate')
+
+        compose_run('up', '-d', '--no-build', '--pull', 'never', 'indexer')
+        indexer_id = service_id('indexer')
+        container = json.loads(run(docker + ['inspect', indexer_id], env=env))[0]
+        assert container['Image'] == image
+        assert container['Config']['User'] == '65532:65532'
+        assert all(m['RW'] is False for m in container['Mounts'] if m['Destination'] == '/project')
+        await_cron_exit()
+        first = cron_state()
+        assert first['rows'] == [[1, '3'], [2, '7'], [3, '11']], first
+        assert first['checkpoint'] == 3 and first['protocol'] == 2, first
+        assert isinstance(first['fingerprint'], str) and first['fingerprint'].startswith('0x'), first
+        descriptor = json.loads(first['descriptor'])
+        assert descriptor['chain_id'] == 31337 and descriptor['sampling'] == {
+            'start': 1, 'end': 3, 'interval': 1
+        }, descriptor
+        assert descriptor['operations'][0]['set'][0]['value'] == (
+            '$call($contract, "value() returns (uint256)")'
+        ), descriptor
+        proof['phases'].append({'phase': 'historical_cron', 'rows': first['rows'],
+                                'checkpoint': first['checkpoint'],
+                                'fingerprint': first['fingerprint']})
+        print(json.dumps(proof['phases'][-1]), flush=True)
+
+        # Exercise the persistence boundary: restart PostgreSQL while the
+        # bounded image is stopped, then run the *same* image again. No
+        # sample may be replayed and the stored certificate must be unchanged.
+        compose_run('restart', 'postgres', timeout=90)
+        compose_run('up', '-d', '--no-build', '--pull', 'never',
+                    '--wait', '--wait-timeout', '90', 'postgres', timeout=100)
+        compose_run('start', 'indexer')
+        await_cron_exit()
+        after = cron_state()
+        assert after == first, {'before': first, 'after_restart': after}
+        proof['phases'].append({'phase': 'postgres_and_image_restart',
+                                'rows': after['rows'],
+                                'checkpoint': after['checkpoint'],
+                                'fingerprint': after['fingerprint']})
+        print(json.dumps(proof['phases'][-1]), flush=True)
 finally:
     failed = sys.exc_info()[0] is not None
     for signum in [signal.SIGINT, signal.SIGTERM]:
