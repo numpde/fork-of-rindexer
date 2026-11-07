@@ -2451,3 +2451,7 @@ mod cron_historical_failure_tests;
 #[cfg(test)]
 #[path = "cron_atomic_tests.rs"]
 mod cron_atomic_tests;
+
+#[cfg(test)]
+#[path = "cron_clickhouse_tests.rs"]
+mod cron_clickhouse_tests;
