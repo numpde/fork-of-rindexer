@@ -1359,3 +1359,116 @@ async fn direct_ddl_rejects_missing_certificate_column_without_adopting_legacy_d
     assert_eq!(restored, 0, "rejected DDL must not add placeholder certificate fields");
     fixture.finish().await;
 }
+
+
+#[tokio::test]
+async fn global_delete_without_user_columns_is_applied_before_checkpoint() {
+    let fixture = Fixture::new().await;
+    fixture.use_additive_table().await;
+    let mut source = serde_json::to_value(Fixture::additive_manifest()).unwrap();
+    source["contracts"][0]["tables"][0]["cron"][0]["operations"] = json!([
+        {"type": "upsert", "set": [{"column": "amount", "action": "set", "value": "7"}]},
+        {"type": "delete"}
+    ]);
+    let manifest: Manifest = serde_json::from_value(source).unwrap();
+    fixture.bind(&manifest).await;
+
+    // An unrelated network must not be removed by the implicit network key.
+    fixture
+        .postgres
+        .batch_execute(&format!(
+            "INSERT INTO {} (network, amount, rindexer_block_number,
+             rindexer_tx_hash, rindexer_block_hash, rindexer_contract_address,
+             rindexer_sequence_id) VALUES ('other', 99, 0,
+             repeat('0', 66), repeat('0', 66), repeat('0', 42), 0)",
+            fixture.table
+        ))
+        .await
+        .expect("seed unrelated network");
+
+    for attempt in 0..2 {
+        fixture
+            .scheduler(&manifest, 101)
+            .expect("admit global upsert and delete")
+            .run()
+            .await
+            .expect("complete certified sample or replay");
+        let remaining: i64 = fixture
+            .postgres
+            .query_one(
+                &format!("SELECT COUNT(*)::BIGINT FROM {} WHERE network = 'test'", fixture.table),
+                &[],
+            )
+            .await
+            .expect("count target network rows")
+            .get(0);
+        assert_eq!(remaining, 0, "attempt {attempt}: the declared delete must apply");
+        let unrelated: String = fixture
+            .postgres
+            .query_one(
+                &format!("SELECT amount::TEXT FROM {} WHERE network = 'other'", fixture.table),
+                &[],
+            )
+            .await
+            .expect("inspect unrelated network")
+            .get(0);
+        assert_eq!(unrelated, "99", "attempt {attempt}: preserve unrelated network");
+        assert_eq!(fixture.checkpoint().await, Some(101));
+    }
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn failing_global_delete_rolls_back_preceding_upsert_and_checkpoint() {
+    let fixture = Fixture::new().await;
+    fixture.use_additive_table().await;
+    let mut source = serde_json::to_value(Fixture::additive_manifest()).unwrap();
+    source["contracts"][0]["tables"][0]["cron"][0]["operations"] = json!([
+        {"type": "upsert", "set": [{"column": "amount", "action": "set", "value": "7"}]},
+        {"type": "delete"}
+    ]);
+    let manifest: Manifest = serde_json::from_value(source).unwrap();
+    fixture.bind(&manifest).await;
+
+    fixture
+        .postgres
+        .batch_execute(&format!(
+            "CREATE FUNCTION rindexer_internal.reject_global_delete() RETURNS trigger
+             LANGUAGE plpgsql AS $delete_fault$ BEGIN
+                 RAISE EXCEPTION 'injected global delete failure';
+             END $delete_fault$;
+             CREATE TRIGGER reject_global_delete BEFORE DELETE ON {}
+             FOR EACH ROW EXECUTE FUNCTION rindexer_internal.reject_global_delete();",
+            fixture.table
+        ))
+        .await
+        .expect("install failure at the DELETE statement");
+    let error = fixture
+        .scheduler(&manifest, 101)
+        .expect("admit global upsert and delete")
+        .run()
+        .await
+        .expect_err("a failed delete must abort the whole sampled transaction")
+        .to_string();
+    assert!(
+        error.contains("delete failure") && error.contains("operation 1"),
+        "propagate the failing operation and cause: {error}"
+    );
+    assert_eq!(fixture.amount().await, None, "prior upsert must roll back");
+    assert_eq!(fixture.checkpoint().await, None, "failed sample cannot be certified");
+
+    fixture
+        .postgres
+        .batch_execute(&format!("DROP TRIGGER reject_global_delete ON {}", fixture.table))
+        .await
+        .expect("remove fault");
+    fixture
+        .scheduler(&manifest, 101)
+        .expect("same schedule remains admitted")
+        .run()
+        .await
+        .expect("retry the whole sample after fault removal");
+    assert_eq!(fixture.amount().await, None, "DELETE follows the replayed upsert");
+    assert_eq!(fixture.checkpoint().await, Some(101));
+    fixture.finish().await;
+}
