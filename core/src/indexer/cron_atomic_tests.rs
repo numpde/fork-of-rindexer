@@ -324,7 +324,7 @@ impl Fixture {
     }
 
     /// Drive the actual startup DDL generator and execute it again on restart.
-    async fn production_setup(&self, start: u64, end: u64) -> Result<(), String> {
+    async fn apply_generated_ddl(&self, start: u64, end: u64) -> Result<(), String> {
         let indexer = Self::manifest(start, end).to_indexer();
         let chains = std::collections::HashMap::from([("test".to_owned(), 1)]);
         let schema =
@@ -575,7 +575,7 @@ async fn production_startup_refuses_to_reseed_deleted_checkpoint_after_committed
         .await
         .expect("delete checkpoint after acknowledged commit");
     let error = fixture
-        .production_setup(101, 101)
+        .apply_generated_ddl(101, 101)
         .await
         .expect_err("production schema sync must refuse a missing checkpoint row");
     assert!(
@@ -601,7 +601,7 @@ async fn production_startup_refuses_to_recreate_lost_checkpoint_table_with_survi
         .await
         .expect("simulate lost checkpoint table");
     let error = fixture
-        .production_setup(101, 101)
+        .apply_generated_ddl(101, 101)
         .await
         .expect_err("surviving rows must prevent checkpoint-table initialization");
     assert!(
@@ -622,13 +622,13 @@ async fn new_empty_destination_can_initialize_its_checkpoint_once() {
         .batch_execute(&format!("DROP TABLE rindexer_internal.{}", fixture.checkpoint))
         .await
         .expect("start before first initialization");
-    fixture.production_setup(101, 101).await.expect("initial setup is permitted");
+    fixture.apply_generated_ddl(101, 101).await.expect("initial setup is permitted");
     assert_eq!(fixture.checkpoint().await, None);
-    fixture.production_setup(101, 101).await.expect("repeat setup remains idempotent");
+    fixture.apply_generated_ddl(101, 101).await.expect("repeat setup remains idempotent");
     fixture.worker(101, 101).run().await.expect("apply first sample");
     assert_eq!(fixture.count().await, 1);
     assert_eq!(fixture.checkpoint().await, Some(101));
-    fixture.production_setup(101, 101).await.expect("resume setup after commit");
+    fixture.apply_generated_ddl(101, 101).await.expect("resume setup after commit");
     assert_eq!(fixture.count().await, 1);
     assert_eq!(fixture.checkpoint().await, Some(101));
     fixture.finish().await;
@@ -646,7 +646,7 @@ async fn existing_checkpoint_table_is_not_reseeded_even_if_destination_is_empty(
         .await
         .expect("delete unstarted progress");
     let error = fixture
-        .production_setup(101, 101)
+        .apply_generated_ddl(101, 101)
         .await
         .expect_err("existing checkpoint storage cannot acquire a fresh network row");
     assert!(
@@ -669,7 +669,7 @@ async fn production_startup_refuses_missing_destination_with_surviving_checkpoin
         .await
         .expect("simulate lost destination");
     let error = fixture
-        .production_setup(101, 101)
+        .apply_generated_ddl(101, 101)
         .await
         .expect_err("startup must not recreate a lost destination with completed progress");
     assert!(
@@ -1122,7 +1122,7 @@ async fn unsigned_v1_checkpoint_cannot_be_implicitly_adopted() {
         .await
         .unwrap();
     let error = fixture
-        .production_setup(101, 101)
+        .apply_generated_ddl(101, 101)
         .await
         .expect_err("unsigned version-1 progress must not be auto-certified");
     assert!(
@@ -1269,5 +1269,61 @@ async fn historical_cron_bounds_a_stalled_required_rpc_call_before_writing() {
     assert!(result.contains("RPC") && result.contains("timeout"), "{result}");
     assert_eq!(fixture.count().await, 0);
     assert_eq!(fixture.checkpoint().await, None);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn corrupted_certificates_refuse_startup_and_replay_without_mutating_rows() {
+    for (case, change) in [
+        ("unsupported protocol", "SET protocol_version = 3"),
+        ("different fingerprint", "SET schedule_fingerprint = '0xdeadbeef'"),
+        ("different descriptor", "SET schedule_descriptor = '{}'"),
+        ("missing descriptor", "SET schedule_descriptor = NULL"),
+    ] {
+        let fixture = Fixture::new().await;
+        fixture.worker(101, 101).run().await.expect("commit the certified sample");
+        fixture
+            .postgres
+            .batch_execute(&format!(
+                "UPDATE rindexer_internal.{} {change} WHERE network = 'test'",
+                fixture.checkpoint
+            ))
+            .await
+            .expect("corrupt the stored certificate");
+        let mut input = serde_json::to_value(Fixture::manifest(101, 101)).unwrap();
+        input["storage"] = json!({"postgres": {"enabled": true, "drop_each_run": true}});
+        let manifest: Manifest = serde_json::from_value(input).unwrap();
+
+        let startup = fixture.production_admission_error(&manifest).await;
+        assert!(startup.is_err(), "{case}: startup must fail before drop_each_run");
+        let replay = fixture.worker(101, 101).run().await;
+        assert!(replay.is_err(), "{case}: runtime must reject the same certificate");
+        assert_eq!(fixture.count().await, 1, "{case}: preserve committed effects");
+        assert_eq!(fixture.checkpoint().await, Some(101), "{case}: preserve progress");
+        fixture.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn missing_certificate_column_refuses_destructive_startup_without_replaying() {
+    let fixture = Fixture::new().await;
+    fixture.worker(101, 101).run().await.expect("commit the certified sample");
+    fixture
+        .postgres
+        .batch_execute(&format!(
+            "ALTER TABLE rindexer_internal.{} DROP COLUMN schedule_descriptor",
+            fixture.checkpoint
+        ))
+        .await
+        .expect("simulate an incomplete legacy checkpoint schema");
+    let mut input = serde_json::to_value(Fixture::manifest(101, 101)).unwrap();
+    input["storage"] = json!({"postgres": {"enabled": true, "drop_each_run": true}});
+    let manifest: Manifest = serde_json::from_value(input).unwrap();
+
+    let startup = fixture.production_admission_error(&manifest).await;
+    assert!(startup.is_err(), "missing certificate column must block startup");
+    assert!(fixture.worker(101, 101).run().await.is_err(), "runtime must not replay");
+    assert_eq!(fixture.count().await, 1, "existing effects must survive startup rejection");
+    assert_eq!(fixture.checkpoint().await, Some(101));
     fixture.finish().await;
 }

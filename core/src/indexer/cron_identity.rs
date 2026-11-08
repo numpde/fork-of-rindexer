@@ -153,3 +153,31 @@ pub(crate) fn mismatch(stored: &str, expected: &CronIdentity) -> String {
         _ => "recorded schedule descriptor is unreadable".into(),
     }
 }
+
+#[cfg(test)]
+mod characterization_tests {
+    use super::{canonical, mismatch, CronIdentity};
+    use serde_json::json;
+
+    #[test]
+    fn canonical_descriptor_order_is_stable_at_nested_boundaries() {
+        let document = json!({
+            "z": 5,
+            "list": [{"b": 3, "a": 2}],
+            "a": {"omega": 1, "alpha": "q"}
+        });
+        let actual = serde_json::to_string(&canonical(document)).unwrap();
+        assert_eq!(actual, r#"{"a":{"alpha":"q","omega":1},"list":[{"a":2,"b":3}],"z":5}"#);
+    }
+
+    #[test]
+    fn certificate_mismatch_identifies_the_first_changed_nested_field() {
+        let expected = CronIdentity {
+            fingerprint: String::new(),
+            descriptor: r#"{"operations":[{"value":"new"}],"sampling":{"start":1}}"#.into(),
+        };
+        let changed =
+            mismatch(r#"{"operations":[{"value":"old"}],"sampling":{"start":1}}"#, &expected);
+        assert!(changed.contains("operations[0].value"), "{changed}");
+    }
+}
