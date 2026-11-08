@@ -43,6 +43,16 @@ pub(crate) fn postgres_catalog_identifier(identifier: &str) -> &str {
     &identifier[..end]
 }
 
+/// PostgreSQL folds each unquoted relation-name component separately, then
+/// stores at most 63 UTF-8 bytes. Share this normalization across admission.
+pub(crate) fn postgres_catalog_key(qualified: &str) -> String {
+    qualified
+        .split('.')
+        .map(|component| postgres_catalog_identifier(component).to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
 pub fn camel_to_snake(s: &str) -> String {
     camel_to_snake_advanced(s, false)
 }
@@ -287,5 +297,15 @@ mod tests {
     #[test]
     fn test_multiple_underscores() {
         assert_eq!(to_pascal_case("user__profile___update"), "UserProfileUpdate");
+    }
+    #[test]
+    fn postgres_catalog_key_normalizes_each_component_without_cutting_utf8() {
+        assert_eq!(postgres_catalog_key("MySchema.Records"), "myschema.records");
+        let long = format!("{}.{}", "A".repeat(64), "B".repeat(64));
+        assert_eq!(postgres_catalog_key(&long), format!("{}.{}", "a".repeat(63), "b".repeat(63)));
+        assert_eq!(
+            postgres_catalog_key(&format!("Schema.{}X", "é".repeat(32))),
+            format!("schema.{}", "é".repeat(31))
+        );
     }
 }

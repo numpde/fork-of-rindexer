@@ -8,7 +8,7 @@ use crate::{
             generate_internal_cron_table_name, GenerateInternalFactoryEventTableNameParams,
         },
     },
-    helpers::{camel_to_snake, postgres_catalog_identifier},
+    helpers::{camel_to_snake, postgres_catalog_key},
 };
 use std::collections::HashMap;
 
@@ -16,18 +16,10 @@ use std::collections::HashMap;
 struct Owners(HashMap<String, String>);
 
 impl Owners {
-    fn catalog_key(name: &str) -> String {
-        name.to_ascii_lowercase()
-            .split('.')
-            .map(postgres_catalog_identifier)
-            .collect::<Vec<_>>()
-            .join(".")
-    }
-
     fn claim(&mut self, name: &str, owner: String) -> Result<(), String> {
         // DDL uses bare schema/table identifiers. PostgreSQL folds ASCII case
         // and clips each component (not the entire qualified name) in its catalog.
-        let key = Self::catalog_key(name);
+        let key = postgres_catalog_key(name);
         match self.0.entry(key) {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(owner);
@@ -166,7 +158,7 @@ impl PreparedSchema {
         for contract in self.contracts().iter().chain(self.native()) {
             for runtime in contract.tables.iter() {
                 let name = &runtime.full_table_name;
-                let key = Owners::catalog_key(name);
+                let key = postgres_catalog_key(name);
                 if let Some(owner) = relations.0.get(&key) {
                     return Err(format!(
                         "PostgreSQL storage collision at '{key}': {owner} and custom table {}::{}. Choose distinct storage destinations.",

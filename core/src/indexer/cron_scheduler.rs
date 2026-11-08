@@ -304,12 +304,7 @@ pub(crate) fn validate_postgres_cron_targets<'a>(
         for runtime in runtimes {
             let table = runtime.table.definition();
             let historical = table.cron.iter().flatten().any(|entry| entry.start_block.is_some());
-            let destination = runtime
-                .full_table_name
-                .split('.')
-                .map(|part| crate::helpers::postgres_catalog_identifier(part).to_ascii_lowercase())
-                .collect::<Vec<_>>()
-                .join(".");
+            let destination = crate::helpers::postgres_catalog_key(&runtime.full_table_name);
             let owner = format!("{}::{}", contract.name, table.name);
             if let Some((other, other_historical)) = destinations.get(&destination) {
                 if historical || *other_historical {
