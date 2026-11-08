@@ -2299,44 +2299,18 @@ async fn extract_cron_value(
         .await;
     }
 
-    // Handle $contract - contract address
-    if value_ref == "$contract" {
-        return Some(EthereumSqlTypeWrapper::Address(*contract_address));
+    // Local values have one interpreter in both the historical preparer and
+    // the live async path. Unknown references retain the async diagnostic;
+    // missing timestamp metadata remains a normal absent value.
+    let value = extract_cron_value_sync(value_ref, tx_metadata, contract_address, column_type);
+    if value.is_none()
+        && value_ref.starts_with('$')
+        && value_ref != "$rindexer_timestamp"
+        && value_ref != "$rindexer_block_timestamp"
+    {
+        warn!("Unknown cron value reference: {}", value_ref);
     }
-
-    // Handle $rindexer_* built-ins
-    if let Some(field_name) = value_ref.strip_prefix('$') {
-        return match field_name {
-            "rindexer_block_number" => {
-                Some(EthereumSqlTypeWrapper::U64BigInt(tx_metadata.block_number))
-            }
-            "rindexer_block_timestamp" | "rindexer_timestamp" => {
-                if let Some(ts) = tx_metadata.block_timestamp {
-                    if let Some(dt) = DateTime::from_timestamp(ts.to::<i64>(), 0) {
-                        return Some(EthereumSqlTypeWrapper::DateTime(dt.with_timezone(&Utc)));
-                    }
-                }
-                None
-            }
-            "rindexer_tx_hash" => {
-                Some(EthereumSqlTypeWrapper::StringChar(format!("{:?}", tx_metadata.tx_hash)))
-            }
-            "rindexer_block_hash" => {
-                Some(EthereumSqlTypeWrapper::StringChar(format!("{:?}", tx_metadata.block_hash)))
-            }
-            "rindexer_contract_address" => {
-                Some(EthereumSqlTypeWrapper::Address(tx_metadata.contract_address))
-            }
-            _ => {
-                // Unknown $ reference - this shouldn't happen after validation
-                warn!("Unknown cron value reference: {}", value_ref);
-                None
-            }
-        };
-    }
-
-    // Handle literal values
-    super::tables::parse_literal_value_for_column(value_ref, column_type)
+    value
 }
 
 /// Extract value for cron operations synchronously (no RPC calls).
@@ -2393,6 +2367,61 @@ fn extract_cron_value_sync(
 
     // Handle literal values
     super::tables::parse_literal_value_for_column(value_ref, column_type)
+}
+
+#[cfg(test)]
+mod cron_local_value_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn local_values_use_the_same_interpreter_for_sync_and_async_cron() {
+        let address = Address::repeat_byte(0x41);
+        let metadata = TxMetadata {
+            block_number: 101,
+            block_timestamp: Some(U256::from(1_700_000_000_u64)),
+            tx_hash: B256::ZERO,
+            block_hash: B256::ZERO,
+            contract_address: address,
+            log_index: U256::ZERO,
+            tx_index: 0,
+        };
+        for (reference, column_type) in [
+            ("$contract", ColumnType::Address),
+            ("$rindexer_block_number", ColumnType::Uint64),
+            ("$rindexer_timestamp", ColumnType::Timestamp),
+            ("$rindexer_tx_hash", ColumnType::String),
+            ("$rindexer_block_hash", ColumnType::String),
+            ("$rindexer_contract_address", ColumnType::Address),
+            ("42", ColumnType::Uint64),
+            ("$unknown_reference", ColumnType::String),
+        ] {
+            let synchronous = extract_cron_value_sync(reference, &metadata, &address, &column_type);
+            let asynchronous =
+                extract_cron_value(reference, &metadata, &address, &column_type, None, "test")
+                    .await;
+            assert_eq!(
+                synchronous.is_some(),
+                asynchronous.is_some(),
+                "{reference}: both paths must accept or reject the same value"
+            );
+        }
+        assert!(matches!(
+            extract_cron_value(
+                "$rindexer_block_number",
+                &metadata,
+                &address,
+                &ColumnType::Uint64,
+                None,
+                "test",
+            )
+            .await,
+            Some(EthereumSqlTypeWrapper::U64BigInt(101))
+        ));
+        assert!(matches!(
+            extract_cron_value_sync("$contract", &metadata, &address, &ColumnType::Address),
+            Some(EthereumSqlTypeWrapper::Address(value)) if value == address
+        ));
+    }
 }
 
 /// Check if any tables in the manifest have cron triggers.
