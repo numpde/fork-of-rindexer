@@ -17,6 +17,7 @@ mod fetch_logs;
 pub use fetch_logs::FetchLogsResult;
 mod heartbeat;
 mod last_synced;
+pub(crate) use last_synced::verify_versioned_cron_certificate;
 pub mod native_transfer;
 pub mod no_code;
 pub mod reorg;

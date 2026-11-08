@@ -154,6 +154,30 @@ pub(crate) fn mismatch(stored: &str, expected: &CronIdentity) -> String {
     }
 }
 
+const CERTIFICATE_PROTOCOL: i16 = 2;
+
+/// The persisted computation must agree byte-for-byte with the expected one.
+/// Decoding a PostgreSQL row and parsing its progress remain the caller's job.
+pub(crate) fn verify_record(
+    version: Option<i16>,
+    fingerprint: Option<&str>,
+    descriptor: Option<&str>,
+    expected: &CronIdentity,
+) -> Result<(), String> {
+    if version != Some(CERTIFICATE_PROTOCOL) {
+        return Err(format!(
+            "uncertified legacy cron protocol {version:?}; the recorded computation has no verified schedule identity"
+        ));
+    }
+    let (Some(fingerprint), Some(descriptor)) = (fingerprint, descriptor) else {
+        return Err("missing schedule certificate for protocol 2".into());
+    };
+    if fingerprint != expected.fingerprint.as_str() || descriptor != expected.descriptor.as_str() {
+        return Err(format!("schedule identity mismatch: {}", mismatch(descriptor, expected)));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod characterization_tests {
     use super::{canonical, mismatch, CronIdentity};
@@ -179,5 +203,33 @@ mod characterization_tests {
         let changed =
             mismatch(r#"{"operations":[{"value":"old"}],"sampling":{"start":1}}"#, &expected);
         assert!(changed.contains("operations[0].value"), "{changed}");
+    }
+
+    #[test]
+    fn protocol_and_schedule_comparison_rejects_incompatible_records() {
+        let expected = CronIdentity {
+            fingerprint: "0xabc".into(),
+            descriptor: r#"{"source":"original"}"#.into(),
+        };
+        assert!(super::verify_record(
+            Some(2),
+            Some("0xabc"),
+            Some(&expected.descriptor),
+            &expected
+        )
+        .is_ok());
+        for (version, fingerprint, descriptor) in [
+            (Some(1), Some("0xabc"), Some(expected.descriptor.as_str())),
+            (None, Some("0xabc"), Some(expected.descriptor.as_str())),
+            (Some(2), None, Some(expected.descriptor.as_str())),
+            (Some(2), Some("0xabc"), None),
+            (Some(2), Some("0xdef"), Some(expected.descriptor.as_str())),
+            (Some(2), Some("0xabc"), Some(r#"{"source":"changed"}"#)),
+        ] {
+            assert!(
+                super::verify_record(version, fingerprint, descriptor, &expected).is_err(),
+                "must reject protocol {version:?} and inconsistent certificate"
+            );
+        }
     }
 }

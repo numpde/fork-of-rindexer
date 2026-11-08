@@ -519,40 +519,35 @@ fn postgres_cron_table(config: CronSyncConfig<'_>) -> String {
     generate_internal_cron_table_name(&schema, config.table_name, config.cron_index)
 }
 
+/// Decode and validate the certificate from any PostgreSQL checkpoint row.
+/// Setup and the locked/runtime reader select these same three fields.
+pub(crate) fn verify_versioned_cron_certificate(
+    row: &tokio_postgres::Row,
+    identity: &CronIdentity,
+) -> Result<(), String> {
+    let version: Option<i16> =
+        row.try_get("protocol_version").map_err(|e| format!("Cannot decode cron protocol: {e}"))?;
+    let fingerprint: Option<String> = row
+        .try_get("schedule_fingerprint")
+        .map_err(|e| format!("Cannot decode cron schedule fingerprint: {e}"))?;
+    let descriptor: Option<String> = row
+        .try_get("schedule_descriptor")
+        .map_err(|e| format!("Cannot decode cron schedule descriptor: {e}"))?;
+    cron_identity::verify_record(version, fingerprint.as_deref(), descriptor.as_deref(), identity)
+}
+
 fn read_versioned_cron_row(
     row: tokio_postgres::Row,
     table: &str,
     network: &str,
     identity: &CronIdentity,
 ) -> Result<Option<u64>, String> {
-    let version: Option<i16> = row
-        .try_get("protocol_version")
-        .map_err(|e| format!("Cannot decode cron protocol for {table}/{network}: {e}"))?;
-    if version != Some(2) {
-        return Err(format!(
-            "Cron checkpoint {table}/{network} has uncertified legacy protocol {version:?}; \
-             the recorded computation has no verified schedule identity. Stop all writers and \
-             reconcile or rebuild destination and progress together"
-        ));
-    }
-    let fingerprint: Option<String> = row.try_get("schedule_fingerprint").map_err(|e| {
-        format!("Cannot decode cron schedule certificate for {table}/{network}: {e}")
+    verify_versioned_cron_certificate(&row, identity).map_err(|reason| {
+        format!(
+            "Historical cron checkpoint {table}/{network}: {reason}; \
+             stop writers and reconcile or rebuild destination and progress together"
+        )
     })?;
-    let descriptor: Option<String> = row.try_get("schedule_descriptor").map_err(|e| {
-        format!("Cannot decode cron schedule descriptor for {table}/{network}: {e}")
-    })?;
-    if fingerprint.as_deref() != Some(identity.fingerprint.as_str())
-        || descriptor.as_deref() != Some(identity.descriptor.as_str())
-    {
-        let reason = descriptor
-            .as_deref()
-            .map(|stored| cron_identity::mismatch(stored, identity))
-            .unwrap_or_else(|| "missing schedule descriptor".into());
-        return Err(format!(
-            "Historical cron schedule identity mismatch at {table}/{network}: {reason}; \
-             stop writers and reconcile or rebuild destination and checkpoint together"
-        ));
-    }
     let value: Option<String> = row
         .try_get("last_synced_block")
         .map_err(|e| format!("Cannot decode cron progress for {table}/{network}: {e}"))?;

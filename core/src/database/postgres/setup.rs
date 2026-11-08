@@ -33,7 +33,8 @@ async fn verify_existing_cron_certificates(
     schema: &PreparedSchema,
 ) -> Result<(), SetupPostgresError> {
     use crate::database::postgres::generate::generate_internal_cron_table_name;
-    use crate::indexer::cron_identity::{identify, mismatch, CronIdentityInput};
+    use crate::indexer::cron_identity::{identify, CronIdentityInput};
+    use crate::indexer::verify_versioned_cron_certificate;
     let invalid = |error: String| {
         SetupPostgresError::GeneratingTables(
             GenerateTablesForIndexerSqlError::InvalidPreparedSchema(error),
@@ -117,42 +118,13 @@ async fn verify_existing_cron_certificates(
                     })?.ok_or_else(|| invalid(format!(
                         "Cannot resume historical cron: missing checkpoint row {table}/{network}"
                     )))?;
-                    let version: Option<i16> = row.try_get("protocol_version").map_err(|e| {
+                    verify_versioned_cron_certificate(&row, &requested).map_err(|reason| {
                         invalid(format!(
-                            "Cannot decode checkpoint protocol for {table}/{network}: {e}"
+                            "Cannot resume historical cron checkpoint {table}/{network}: \
+                             {reason}. No database changes have begun; stop writers \
+                             and reconcile or rebuild before resuming"
                         ))
                     })?;
-                    let stored: Option<String> =
-                        row.try_get("schedule_fingerprint").map_err(|e| {
-                            invalid(format!(
-                                "Cannot decode cron fingerprint for {table}/{network}: {e}"
-                            ))
-                        })?;
-                    let descriptor: Option<String> =
-                        row.try_get("schedule_descriptor").map_err(|e| {
-                            invalid(format!(
-                                "Cannot decode cron descriptor for {table}/{network}: {e}"
-                            ))
-                        })?;
-                    if version != Some(2) || stored.is_none() || descriptor.is_none() {
-                        return Err(invalid(format!(
-                            "Cannot resume unsigned legacy cron checkpoint {table}/{network}: \
-                             protocol {version:?} has no certified schedule. Stop writers \
-                             and reconcile or rebuild effects and progress together"
-                        )));
-                    }
-                    if stored.as_deref() != Some(requested.fingerprint.as_str())
-                        || descriptor.as_deref() != Some(requested.descriptor.as_str())
-                    {
-                        let changed = descriptor
-                            .as_deref()
-                            .map(|stored| mismatch(stored, &requested))
-                            .unwrap_or_else(|| "missing descriptor".into());
-                        return Err(invalid(format!(
-                            "Historical cron schedule identity mismatch at {table}/{network}: {changed}. \
-                             No database changes have begun; reconcile or rebuild before resuming"
-                        )));
-                    }
                 }
             }
         }
