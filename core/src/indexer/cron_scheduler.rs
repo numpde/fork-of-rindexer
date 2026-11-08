@@ -1793,7 +1793,13 @@ async fn prepare_cron_operations_batch(
                         columns.keys().collect::<Vec<_>>(),
                     ));
                 }
-                if columns.is_empty() {
+                // A global DELETE can have no explicit where/set columns.
+                // Its network key is implicit; the operation must still run
+                // inside the checkpoint transaction.
+                if columns.is_empty()
+                    && !(task.table.definition().global
+                        && operation.operation_type == OperationType::Delete)
+                {
                     debug!(
                         "No user columns for cron operation at block {} address {:?} - skipping",
                         block_number, contract_address
