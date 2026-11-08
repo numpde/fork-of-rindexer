@@ -63,9 +63,11 @@ does not authorize reusing incompatible progress.
    checkpoint table and other applicable state before making changes.
 2. Inspect the destination and its
    `rindexer_internal.<generated_schema>_<table>_cron_<index>` checkpoint.
-   Historical checkpoints from older binaries were not committed atomically with
-   their effects. A positive number does not prove completeness; zero was also
-   used to mean “not started.” Neither value can be promoted automatically.
+   Pre-atomic checkpoints may disagree with the destination effects. Later
+   protocol-1 checkpoints committed effects and progress atomically but did not
+   certify the effective schedule. Earlier zero-valued progress could also mean
+   “not started.” Neither state can be promoted automatically: the previous
+   computation and its effects must be established independently.
 3. **Preferred: rebuild.** In a controlled maintenance transaction or offline
    migration, remove the *affected destination contents and checkpoint table
    together*, preserving a backup. Run normal schema setup against the now-empty

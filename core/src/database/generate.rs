@@ -276,12 +276,6 @@ fn generate_internal_cron_table_sql(
                         );
                         {first_seeds}
                     ELSE
-                        ALTER TABLE rindexer_internal.{internal_table_name}
-                            ADD COLUMN IF NOT EXISTS protocol_version SMALLINT;
-                        ALTER TABLE rindexer_internal.{internal_table_name}
-                            ADD COLUMN IF NOT EXISTS schedule_fingerprint TEXT;
-                        ALTER TABLE rindexer_internal.{internal_table_name}
-                            ADD COLUMN IF NOT EXISTS schedule_descriptor TEXT;
                         {existing_checks}
                     END IF;
                 END

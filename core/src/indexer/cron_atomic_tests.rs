@@ -1327,3 +1327,35 @@ async fn missing_certificate_column_refuses_destructive_startup_without_replayin
     assert_eq!(fixture.checkpoint().await, Some(101));
     fixture.finish().await;
 }
+
+#[tokio::test]
+async fn direct_ddl_rejects_missing_certificate_column_without_adopting_legacy_data() {
+    let fixture = Fixture::new().await;
+    fixture.worker(101, 101).run().await.expect("commit original effects");
+    fixture
+        .postgres
+        .batch_execute(&format!(
+            "ALTER TABLE rindexer_internal.{} DROP COLUMN schedule_descriptor",
+            fixture.checkpoint
+        ))
+        .await
+        .expect("simulate a checkpoint with an older column layout");
+
+    let result = fixture.apply_generated_ddl(101, 101).await;
+    assert!(result.is_err(), "generated DDL must not adopt legacy checkpoint state");
+    assert_eq!(fixture.count().await, 1, "no effects may be erased");
+    assert_eq!(fixture.checkpoint().await, Some(101), "no progress may be changed");
+    let restored = fixture
+        .postgres
+        .query_one(
+            "SELECT COUNT(*)::BIGINT FROM information_schema.columns \
+             WHERE table_schema = 'rindexer_internal' AND table_name = $1 \
+             AND column_name = 'schedule_descriptor'",
+            &[&fixture.checkpoint],
+        )
+        .await
+        .expect("inspect checkpoint schema")
+        .get::<_, i64>(0);
+    assert_eq!(restored, 0, "rejected DDL must not add placeholder certificate fields");
+    fixture.finish().await;
+}
